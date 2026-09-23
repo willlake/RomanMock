@@ -73,7 +73,7 @@ def cmd_select(args):
     from .pipeline import RomanMockPipeline
 
     pipe = RomanMockPipeline.from_yaml(args.config)
-    outputs = pipe.build_samples(parent_dir=args.parent_dir, verbose=not args.quiet)
+    outputs = pipe.build_samples(parent_dir=args.parent_dir, verbose=not args.quiet, allow_partial=args.allow_partial)
     for p in outputs:
         print(f"[romanmock] sample written: {p}")
 
@@ -88,7 +88,7 @@ def cmd_summary(args):
     from .pipeline import RomanMockPipeline
 
     pipe = RomanMockPipeline.from_yaml(args.config)
-    parent = pipe.open_parent(args.parent_dir)
+    parent = pipe.open_parent(args.parent_dir, allow_partial=args.allow_partial)
     data = parent.select("id_outcome", "n_det", "line_true", "line_assigned").get_data("numpy", wrap_single=True)
     print(f"parent catalog: {len(parent):,} galaxies, z_range {parent.z_range}")
     for k, v in outcome_summary(data).items():
@@ -134,6 +134,7 @@ def main(argv=None):
             s.add_argument("--workers", type=int, default=1, help="process slices in parallel with this many processes")
         else:
             s.add_argument("--parent-dir", help="directory of the stage-A outputs (default: output.dir)")
+            s.add_argument("--allow-partial", action="store_true", help="accept a parent catalog that lacks some of the selected slices")
         s.set_defaults(func=fn)
 
     args = p.parse_args(argv)

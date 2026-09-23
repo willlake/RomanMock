@@ -56,6 +56,31 @@ follows `/global/u2/w/willlake/Projects/Roman/RomanMock/Roman_Mock_Plan_and_Comm
 - Parallel workers rebuild the pipeline from `RomanMockPipeline._worker_spec()` (config dict with the
   line set resolved); anything a worker needs must be serialisable through that dict.
 
+## Provenance and review items
+
+- `pipeline.config_hash()` hashes `scientific_config()`; the manifest `<tag>_manifest.yaml` records completed
+  slices and every output file carries `romanmock_config_hash` in its root attrs. Anything that changes the
+  content of a slice output must be part of `scientific_config()`, otherwise reruns will silently reuse stale
+  outputs. `parent_files()` validates hash and completeness; `expected_steps()` comes from `config.catalog`,
+  so a partial run (`--steps`) needs `--allow-partial` in stage B.
+- Multi-component features: `LineFeature.blend` decides between blend detection and per-transition detection
+  (`detect_lines(..., component_flux=...)`); the pipeline passes component fluxes automatically.
+- `SampleDefinition.membership` ("assigned" | "detected") is the tracer definition of review item M2;
+  `diagnostics` separates detection efficiency, identification efficiency and final-sample completeness (M3).
+- The external review lives at `Projects/Roman/RomanMock/RomanMock_Bug_Fixes_and_Methodology.md`; B1-B6 are
+  fixed and tested in `tests/test_review_fixes.py`, M1 is addressed by `poly_degree`/`smooth_bins` (an ensemble
+  selection function is still the recommended end state), M2/M3 by the options above.
+
+## Reference dN/dz
+
+- `reference_dndz.py` transcribes Wang et al. (2022) Tables 1-2 (arXiv:2110.01829). They are true
+  emitters above the flux limit *without* observational efficiency; match them to the detected-line
+  populations in true redshift (`population_thinning`), not to assigned-redshift samples. A test
+  checks the transcription against the paper's summary rows; keep it when editing the numbers.
+- Only the six tabulated flux limits are valid; there is no interpolation in flux limit on purpose.
+- The diffsky mock has 2-6x more Hα emitters than the Galacticus forecast at z > 1.1 and ~3x more
+  [O III]; at z < 0.8 it has fewer Hα emitters (shortage warnings there are expected).
+
 ## OpenCosmo (1.3.11) facts that shaped the code
 
 - `oc.open(one_file)` returns a `Lightcone` (dict step → Dataset), no `close()`; it exposes a

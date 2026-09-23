@@ -63,6 +63,21 @@ redshift:
   sigma_z: 0.0                    # optional Gaussian error sigma_z (1+z) for multi-line redshifts
   context_columns: []             # passthrough columns forwarded to the confusion model (e.g. roman_F158)
 
+# Match the detected-line populations to the Roman HLSS forecast of Wang et al. (2022,
+# arXiv:2110.01829, Tables 1-2: true emitters above the flux limit, observational efficiency
+# not included), in bins of true redshift, before any sample is selected. The reference is
+# looked up at the run's flux limit (must be one of 5e-17, 7e-17, 8.5e-17, 1e-16, 1.5e-16, 2e-16)
+# and dust model A_V = 1.65 (or 1.92). Set to null to keep the mock's own abundances.
+population_thinning:
+  targets:
+    Ha:        {reference: wang2022, dust_av: 1.65}
+    OIII_5007: {reference: wang2022, dust_av: 1.65}
+  by: line_true              # population membership: brightest detected feature
+  z_column: redshift_obs     # true redshift (with peculiar velocity)
+  smooth_bins: 0.0
+  poly_degree: null          # e.g. 4 for a smooth selection function instead of per-bin ratios
+  outside_range: keep        # galaxies outside the tabulated z range / without a target are kept
+
 samples:
   - name: halpha_z1p0_1p9
     z_min: 1.0
@@ -70,7 +85,7 @@ samples:
     outcomes: [MULTI_LINE, SINGLE_CORRECT, SINGLE_MISID]   # what an observer keeps
     assigned_lines: [Ha]                                    # tracer: galaxies *assigned* Ha
     footprint: null                                         # or {type: box, ra_min: 0, ra_max: 45, dec_min: 55, dec_max: 65}
-    downsample: null                                        # or {target_file: target_dndz.txt, nbins: 45, smooth_bins: 1.0}
+    downsample: null                                        # per-sample thinning on z_obs, e.g. {target: {reference: wang2022}, nbins: 45}
   - name: oiii_z2p0_2p9
     z_min: 2.0
     z_max: 2.9

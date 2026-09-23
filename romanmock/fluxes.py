@@ -55,6 +55,18 @@ def feature_fluxes(
     return luminosity_to_flux(lum, z, cosmology, backend=backend)
 
 
+def component_fluxes(
+    data: Mapping[str, np.ndarray],
+    line_set: LineSet,
+    z,
+    cosmology,
+    backend: str = "astropy",
+) -> dict[str, np.ndarray]:
+    """Observed flux of every component luminosity column, ``{column: (n,) array}``."""
+    factor = flux_conversion_factor(z, cosmology, backend=backend)
+    return {col: np.asarray(data[col], dtype=np.float64) * factor for col in line_set.required_columns}
+
+
 def flux_column_names(line_set: LineSet, suffix: str = DEFAULT_FLUX_SUFFIX) -> list[str]:
     return [f"{feat.name}{suffix}" for feat in line_set]
 

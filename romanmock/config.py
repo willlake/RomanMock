@@ -61,13 +61,42 @@ class OutputConfig:
 
 @dataclass
 class DownsampleConfig:
-    target_file: str | None = None   # two columns: z, dN/dz per deg^2
-    target: dict | None = None       # {"z": [...], "dndz": [...]} inline alternative
+    """Thin one analysis sample to a target dN/dz of *assigned* redshift.
+
+    ``target`` is a target spec: ``{"reference": "wang2022", "line": "Ha", "flux_limit": 1e-16,
+    "dust_av": 1.65}`` (line defaults to the sample's first assigned line, flux_limit to the
+    run's constant flux limit), ``{"file": "dndz.txt"}`` (two columns z, dN/dz per deg^2) or
+    ``{"z": [...], "dndz": [...]}``.
+    """
+
+    target_file: str | None = None   # shorthand for target: {"file": ...}
+    target: dict | None = None
     z_edges: list[float] | None = None
     nbins: int = 40
-    area_deg2: float | None = None   # if None, estimated from the HEALPix index
+    area_deg2: float | None = None   # if None, estimated from the HEALPix index (inside the footprint)
     nside: int = 256
     smooth_bins: float = 1.0
+    poly_degree: int | None = None   # smooth selection function: polynomial fit to log dN/dz of the mock
+
+
+@dataclass
+class PopulationThinningConfig:
+    """Thin the detected-line populations to reference dN/dz in bins of true redshift, before
+    sample selection (what forecast tables such as Wang et al. 2022 describe).
+
+    ``targets`` maps feature names to target specs (see :class:`DownsampleConfig`); a spec
+    may be ``{}`` to mean the default reference at the run's flux limit.
+    """
+
+    targets: dict = field(default_factory=lambda: {"Ha": {"reference": "wang2022"}, "OIII_5007": {"reference": "wang2022"}})
+    by: str = "line_true"            # population membership column
+    z_column: str = "redshift_obs"   # true redshift (with peculiar velocity) used for the comparison
+    bin_width: float = 0.1           # used only for targets without their own bins
+    area_deg2: float | None = None
+    nside: int = 256
+    smooth_bins: float = 0.0
+    poly_degree: int | None = None
+    outside_range: str = "keep"      # galaxies with no target / outside the target's z range
 
 
 @dataclass
@@ -77,6 +106,8 @@ class SampleConfig:
     z_max: float | None = None
     outcomes: list = field(default_factory=lambda: ["MULTI_LINE", "SINGLE_CORRECT", "SINGLE_MISID"])
     assigned_lines: list[str] | None = None
+    membership: str = "assigned"     # "assigned": identity from the redshift procedure (disjoint samples);
+                                     # "detected": multi-line galaxies belong to every sample whose line they detect
     n_det_min: int | None = None
     footprint: dict | None = None
     extra_cuts: dict = field(default_factory=dict)
@@ -94,6 +125,7 @@ class RomanMockConfig:
     detection: dict = field(default_factory=lambda: {"type": "threshold"})
     confusion: dict = field(default_factory=lambda: {"type": "identity", "p_fail": 0.0})
     redshift: RedshiftConfig = field(default_factory=RedshiftConfig)
+    population_thinning: PopulationThinningConfig | None = None
     samples: list[SampleConfig] = field(default_factory=list)
     seed: int = 12345
 
@@ -102,11 +134,13 @@ class RomanMockConfig:
     def from_dict(cls, d: dict) -> "RomanMockConfig":
         d = dict(d or {})
         samples = [_dc(SampleConfig, s, downsample=DownsampleConfig) for s in d.pop("samples", []) or []]
+        thinning = d.pop("population_thinning", None)
         return cls(
             catalog=_dc(CatalogConfig, d.pop("catalog", {})),
             output=_dc(OutputConfig, d.pop("output", {})),
             flux=_dc(FluxConfig, d.pop("flux", {})),
             redshift=_dc(RedshiftConfig, d.pop("redshift", {})),
+            population_thinning=None if thinning is None else _dc(PopulationThinningConfig, thinning),
             samples=samples,
             **d,
         )

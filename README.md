@@ -39,8 +39,8 @@ continuum-subtracted luminosities in erg/s, one column per transition.
 | 1. detectability | `romanmock.sensitivity`, `romanmock.detection` | `lambda_obs = lambda_0 (1+z_rsd)`; `ConstantFluxLimit` (initial model) or `TabulatedFluxLimit` (wavelength dependent); `ThresholdDetection` or `GaussianNoiseDetection` |
 | 2. bitmask | `romanmock.lines`, `romanmock.detection` | bit *i* = feature *i* of a `LineSet`; `n_det = popcount`; ordering written to the run metadata |
 | 3. redshift | `romanmock.confusion`, `romanmock.redshift` | multi-line: `z_obs = z_rsd` (optional `sigma_z`); single-line: draw identity *j* from `C_ij` (+ fail column), `z_obs = lambda_i,0 (1+z_rsd)/lambda_j,0 - 1` |
-| 4. samples | `romanmock.selection` | footprint, `z_obs` range, tracer (= assigned line), outcome quality, downsampling with `p_keep = target/mock` |
-| checks | `romanmock.diagnostics` | empirical confusion, contamination fraction `f_{i->j}(B)`, completeness, `dN/dz` |
+| 4. samples | `romanmock.selection` | footprint, `z_obs` range, tracer (`membership: assigned` = brightest line, disjoint samples; `detected` = any detected line for multi-line galaxies), outcome quality, population thinning, downsampling with `p_keep = target/mock` |
+| checks | `romanmock.diagnostics` | empirical confusion, contamination fraction `f_{i->j}(B)`, detection efficiency vs a reference population, identification efficiency given detection, final-sample completeness, `dN/dz` |
 
 ### Line features and bit ordering
 
@@ -60,9 +60,14 @@ bit 8 SIII_6312   6313.902  S_III_6312
 ```
 
 `plan_species` reproduces the five-species bitmask of section 2 (Ha, Hb, [O III], [O II],
-[S III], doublets summed) and `all_transitions` gives every column its own bit. Any custom
-list of `{name, rest_wave, components}` dicts in the YAML `line_set` entry defines a new
-ordering. Rest wavelengths are taken from the catalog's `ssp_data` file when available.
+[S III]) and `all_transitions` gives every column its own bit. Multi-component features are
+either unresolved blends (`blend: true`, detected as one feature at the representative
+wavelength; the [O II] doublet) or separated transitions (`blend: false`, the default; each
+component is tested at its own wavelength and the species bit is set when any component is
+detected; the [O III] and [S III] doublets of `plan_species`). The species flux column is the
+sum of the components. Any custom list of `{name, rest_wave, components, blend}` dicts in the
+YAML `line_set` entry defines a new ordering. Rest wavelengths are taken from the catalog's
+`ssp_data` file when available.
 
 ### Outputs
 
@@ -82,8 +87,15 @@ redshift_true, redshift_obs`), `<feature>_flux` (erg/s/cm^2), and
 
 Optional columns: `<feature>_wave_obs`, `<feature>_snr`, `<feature>_flux_measured`.
 A `<tag>_metadata.yaml` sidecar records the configuration, the bit ordering, the outcome
-codes and the model parameters. Stage B writes `samples/<name>.hdf5` (+ metadata with
-`p_keep` per bin when downsampling).
+codes, the model parameters, the resolved input files and a hash of the scientific
+configuration. A `<tag>_manifest.yaml` lists every completed slice (input file and size,
+output, row count); each output file also carries the hash in its root attributes. Reruns
+with the same configuration reuse completed slices; a different configuration is refused
+unless `output.overwrite` is set, in which case the old outputs are discarded. Stage B opens
+only slices recorded in the manifest, checks the hash, and refuses an incomplete parent catalog
+unless `--allow-partial` / `allow_partial=True`. It writes `samples/<name>.hdf5` (+ metadata with
+`p_keep` per bin when thinning); an empty selection removes a stale sample file and records
+`empty: true`.
 
 ## Usage
 
@@ -117,6 +129,25 @@ ds = add_line_fluxes(ds, "roman_transitions")   # Ha_flux, Hb_flux, ... in erg/s
 Everything in `process_arrays` works on plain dictionaries of numpy arrays, so the physics
 can be exercised without touching the catalog (see `tests/`).
 
+## Reference dN/dz and population thinning
+
+`romanmock.reference_dndz` holds Tables 1 and 2 of Wang et al. (2022, arXiv:2110.01829): the
+Roman HLSS forecast of Hα and [O III] emitters per deg² in Δz = 0.1 bins, for six flux limits
+(5e-17 to 2e-16 erg/s/cm²) and two dust models (A_V = 1.65, 1.92). These are *true emitters above
+the flux limit*, before completeness and purity ("observational efficiency is not included"), so
+they are matched to the mock's detected-line populations in bins of true redshift, before any
+assigned-redshift selection (`population_thinning:` in the config; on by default in the baseline).
+Interlopers are then thinned consistently with the population they belong to. The transcription is
+checked against the paper's summary rows by a unit test.
+
+A target spec is `{reference: wang2022, line: Ha, flux_limit: 1e-16, dust_av: 1.65}` (line and
+flux limit default to the population / the run's constant flux limit), `{file: dndz.txt}` or
+`{z: [...], dndz: [...]}`; the same specs drive the per-sample `downsample` on assigned redshift.
+`poly_degree` fits a smooth selection function instead of per-bin ratios, so the realisation's
+own radial fluctuations are not divided out. Shortages (target above mock, including empty bins)
+are reported, never filled. For this mock at 1e-16 the Hα targets are attainable for z > 0.8 and
+the [O III] targets for z < 2.85.
+
 ## Notebooks
 
 `notebooks/` holds four executed tutorials (regenerate with `python notebooks/build_notebooks.py --execute`;
@@ -126,7 +157,10 @@ edit the builder, not the `.ipynb` files):
 2. `02_pipeline_step_by_step.ipynb` – fluxes, detection and bitmask, confusion matrix, redshift assignment on arrays; input versus empirical confusion.
 3. `03_run_and_build_samples.ipynb` – `RomanMockPipeline.run` on three slices, the parent catalog, contamination and completeness, downsampling a sample to a target dN/dz.
 4. `04_extending_models.ipynb` – tabulated sensitivity, noisy detection, an S/N-dependent confusion model registered for YAML, custom line sets.
-5. `05_full_run.ipynb` – all 67 slices in parallel on an exclusive CPU node, then dN/dz per assigned line, the (z_true, z_obs) plane, contamination, completeness, and two downsampled HLSS-like samples.
+5. `05_full_run.ipynb` – all 67 slices in parallel on an exclusive CPU node, then dN/dz per assigned line, the (z_true, z_obs) plane, contamination, completeness, population thinning to the Wang et al. (2022) forecast and two HLSS-like samples.
+
+Memory: `build_samples` on the full 64 M-galaxy parent catalog peaks at roughly 16 GB and writing a
+16 M-galaxy sample at a few GB more; do not run two such jobs at once on a shared node.
 
 `CLAUDE.md` summarises the layout and conventions for anyone (or any assistant) editing the package.
 

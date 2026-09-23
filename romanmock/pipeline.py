@@ -24,15 +24,18 @@ from ._version import __version__ as _pkg_version
 from .config import RomanMockConfig, SampleConfig
 from .confusion import build_confusion
 from .detection import detect_lines
-from .fluxes import FLUX_UNIT, feature_fluxes, flux_column_names
+from .fluxes import FLUX_UNIT, component_fluxes, feature_fluxes, flux_column_names
 from .io import (
     file_info,
     iter_slices,
     load_aux_data,
     open_catalog,
     output_filename,
+    read_manifest,
     select_files,
+    stamp_output,
     write_dataset,
+    write_manifest,
     write_run_metadata,
 )
 from .lines import get_line_set
@@ -43,10 +46,11 @@ from .selection import (
     build_footprint,
     downsample_to_dndz,
     mock_dndz,
+    population_thinning_mask,
     sample_mask,
     sky_area_deg2,
 )
-from .sensitivity import build_detection, build_sensitivity
+from .sensitivity import ConstantFluxLimit, build_detection, build_sensitivity
 
 RESULT_COLUMNS = ("line_bitmask", "n_det", "line_true", "line_assigned", "id_outcome", "z_obs")
 
@@ -113,7 +117,9 @@ class RomanMockPipeline:
         z_dl = np.asarray(data[cfg.flux.redshift_column], dtype=np.float64)
         z_rsd = np.asarray(data[cfg.redshift.rsd_column], dtype=np.float64)
         flux = feature_fluxes(data, self.line_set, z_dl, cosmology, backend=cfg.flux.backend)
-        det = detect_lines(flux, z_rsd, self.line_set, self.detection, rng)
+        comp = component_fluxes(data, self.line_set, z_dl, cosmology, backend=cfg.flux.backend) \
+            if self.line_set.has_separated_components else None
+        det = detect_lines(flux, z_rsd, self.line_set, self.detection, rng, component_flux=comp)
         context = {c: np.asarray(data[c]) for c in cfg.redshift.context_columns}
         za = assign_redshifts(det, z_rsd, self.line_set, self.confusion, rng, self.multi_line, extra_context=context)
 
@@ -196,23 +202,48 @@ class RomanMockPipeline:
         )
         out_dir = Path(cfg.output.dir)
         out_dir.mkdir(parents=True, exist_ok=True)
-        write_run_metadata(out_dir / f"{cfg.output.tag}_metadata.yaml", self.metadata())
+        manifest = self._prepare_manifest(out_dir, verbose)
 
         todo, outputs = [], []
         for path in paths:
             out_path = output_filename(path, out_dir, cfg.output.tag)
             marker = out_path.with_suffix(".empty")
-            if (out_path.exists() or marker.exists()) and not cfg.output.overwrite:
+            info = file_info(path)
+            entry = manifest["slices"].get(int(info.step))
+            reusable = (
+                entry is not None and not cfg.output.overwrite
+                and entry.get("input") == path.name and entry.get("input_size") == path.stat().st_size
+                and ((entry.get("n_galaxies", 0) > 0 and out_path.exists()) or (entry.get("n_galaxies") == 0 and marker.exists()))
+            )
+            if reusable:
                 if verbose:
-                    print(f"[romanmock] skip {out_path.name}: exists (set output.overwrite to redo)")
+                    print(f"[romanmock] reuse {out_path.name}: completed with the same configuration")
                 if out_path.exists():
                     outputs.append(out_path)
-            else:
-                todo.append(path)
+                continue
+            if (out_path.exists() or marker.exists()) and not cfg.output.overwrite:
+                raise FileExistsError(
+                    f"{out_path.name} exists but is not recorded as completed with this configuration "
+                    f"(manifest {out_dir / (cfg.output.tag + '_manifest.yaml')}); set output.overwrite "
+                    "to redo it or remove it.")
+            todo.append(path)
+
+        metadata = self.metadata()
+        metadata["config_hash"] = manifest["config_hash"]
+        metadata["input_files"] = [str(p) for p in paths]
+        write_run_metadata(out_dir / f"{cfg.output.tag}_metadata.yaml", metadata)
+
+        def record(path, out_path, n_out):
+            info = file_info(path)
+            manifest["slices"][int(info.step)] = {
+                "input": path.name, "input_size": path.stat().st_size, "output": Path(out_path).name,
+                "n_galaxies": int(n_out), "completed": _dt.datetime.now().isoformat(timespec="seconds")}
+            write_manifest(out_dir, cfg.output.tag, manifest)
 
         if n_workers <= 1 or len(todo) <= 1:
             for path in todo:
                 out_path, n_out = self.process_file(path, verbose=verbose)
+                record(path, out_path, n_out)
                 if n_out > 0:
                     outputs.append(out_path)
             return sorted(outputs)
@@ -228,11 +259,73 @@ class RomanMockPipeline:
             futures = {pool.submit(_run_one_file, spec, str(path)): path for path in todo}
             for fut in cf.as_completed(futures):
                 msg, out_path, n_out = fut.result()  # re-raises worker exceptions
+                record(futures[fut], out_path, n_out)
                 if n_out > 0:
                     outputs.append(Path(out_path))
                 if verbose:
                     print(msg, flush=True)
         return sorted(outputs)
+
+    # ------------------------------------------------------------------------------
+    # provenance
+    # ------------------------------------------------------------------------------
+    def scientific_config(self) -> dict:
+        """The part of the configuration that determines the content of a slice output."""
+        cfg = self.config
+        return {
+            "line_set": self.line_set.to_config(),
+            "flux": _asdict(cfg.flux),
+            "sensitivity": _to_config(self.sensitivity),
+            "detection": _to_config(self.detection),
+            "confusion": _to_config(self.confusion),
+            "redshift": _asdict(cfg.redshift),
+            "seed": cfg.seed,
+            "open_kwargs": dict(cfg.catalog.open_kwargs),
+            "passthrough_columns": list(cfg.output.passthrough_columns),
+            "keep_undetected": cfg.output.keep_undetected,
+            "store": {k: getattr(cfg.output, k) for k in ("store_fluxes", "store_wave_obs", "store_snr", "store_measured_flux")},
+        }
+
+    def config_hash(self) -> str:
+        import hashlib
+        import json
+
+        blob = json.dumps(self.scientific_config(), sort_keys=True, default=_json_default).encode()
+        return hashlib.sha256(blob).hexdigest()[:16]
+
+    def _prepare_manifest(self, out_dir: Path, verbose: bool) -> dict:
+        """Load or create the manifest; refuse to mix outputs of different configurations."""
+        cfg = self.config
+        h = self.config_hash()
+        manifest = read_manifest(out_dir, cfg.output.tag)
+        if manifest is None:
+            return {"config_hash": h, "romanmock_version": _pkg_version, "slices": {}}
+        if manifest.get("config_hash") == h:
+            manifest.setdefault("slices", {})
+            manifest["slices"] = {int(k): v for k, v in manifest["slices"].items()}
+            return manifest
+        if not cfg.output.overwrite:
+            raise RuntimeError(
+                f"outputs in {out_dir} were produced with configuration hash {manifest.get('config_hash')} "
+                f"but the current configuration has hash {h}; use a different output dir/tag, or set "
+                "output.overwrite to discard the existing outputs.")
+        if verbose:
+            print(f"[romanmock] configuration changed ({manifest.get('config_hash')} -> {h}); "
+                  f"discarding {len(manifest.get('slices', {}))} recorded slice outputs", flush=True)
+        for entry in manifest.get("slices", {}).values():
+            out = out_dir / entry["output"]
+            out.unlink(missing_ok=True)
+            out.with_suffix(".empty").unlink(missing_ok=True)
+        return {"config_hash": h, "romanmock_version": _pkg_version, "slices": {}}
+
+    def expected_steps(self) -> list[int]:
+        """Steps of the slices selected by ``config.catalog`` (the intended parent catalog)."""
+        from .io import step_from_filename
+
+        cfg = self.config
+        paths = select_files(cfg.catalog.path, files=cfg.catalog.files, steps=cfg.catalog.steps,
+                             z_min=cfg.catalog.z_min, z_max=cfg.catalog.z_max)
+        return sorted(step_from_filename(p) for p in paths)
 
     def process_file(self, path, verbose: bool = True) -> tuple[Path, int]:
         """Process one slice file and write its output (serial building block).
@@ -258,7 +351,9 @@ class RomanMockPipeline:
                 print(f"[romanmock]     no galaxies selected; wrote marker {marker.name}", flush=True)
             return out_path, 0
         marker.unlink(missing_ok=True)
-        write_dataset(out_path, result, overwrite=cfg.output.overwrite)
+        write_dataset(out_path, result, overwrite=True)
+        stamp_output(out_path, {"romanmock_config_hash": self.config_hash(), "romanmock_version": _pkg_version,
+                                "romanmock_step": int(info.step), "romanmock_input": path.name})
         if verbose:
             print(f"[romanmock]     wrote {n_out:,} galaxies ({100.0 * n_out / max(info.n_gal, 1):.2f}% of slice)", flush=True)
         return out_path, n_out
@@ -273,38 +368,69 @@ class RomanMockPipeline:
     # ------------------------------------------------------------------------------
     # stage B: analysis samples
     # ------------------------------------------------------------------------------
-    def parent_files(self, parent_dir=None) -> list[Path]:
+    def parent_files(self, parent_dir=None, allow_partial: bool = False, check_config: bool = True) -> list[Path]:
+        """Slice outputs recorded as completed in the manifest.
+
+        Raises if the manifest is missing, was produced with a different configuration
+        (unless ``check_config=False``), or does not cover every slice selected by
+        ``config.catalog`` (unless ``allow_partial=True``).
+        """
         d = Path(parent_dir or self.config.output.dir)
-        files = sorted(d.glob(f"lc_cores-*.{self.config.output.tag}.hdf5"))
+        tag = self.config.output.tag
+        manifest = read_manifest(d, tag)
+        if manifest is None:
+            raise FileNotFoundError(f"no manifest {tag}_manifest.yaml in {d}; run stage A first")
+        if check_config and manifest.get("config_hash") != self.config_hash():
+            raise RuntimeError(
+                f"parent catalog in {d} has configuration hash {manifest.get('config_hash')}, current config has "
+                f"{self.config_hash()}; use the matching configuration or pass check_config=False.")
+        slices = {int(k): v for k, v in manifest.get("slices", {}).items()}
+        missing = [s for s in self.expected_steps() if s not in slices]
+        if missing and not allow_partial:
+            raise RuntimeError(f"parent catalog is incomplete: {len(missing)} of the selected slices are missing "
+                               f"(steps {missing[:8]}{'...' if len(missing) > 8 else ''}); rerun stage A or pass allow_partial=True.")
+        files = sorted(d / v["output"] for v in slices.values() if v.get("n_galaxies", 0) > 0)
+        lost = [f for f in files if not f.exists()]
+        if lost:
+            raise FileNotFoundError(f"manifest lists outputs that do not exist: {[f.name for f in lost]}")
         if not files:
-            raise FileNotFoundError(f"no parent catalog files lc_cores-*.{self.config.output.tag}.hdf5 in {d}")
+            raise FileNotFoundError(f"no non-empty parent catalog files in {d}")
         return files
 
-    def open_parent(self, parent_dir=None):
-        return oc.open(*self.parent_files(parent_dir))
+    def open_parent(self, parent_dir=None, allow_partial: bool = False, check_config: bool = True):
+        return oc.open(*self.parent_files(parent_dir, allow_partial=allow_partial, check_config=check_config))
 
-    def build_samples(self, parent_dir=None, samples: Sequence[SampleConfig] | None = None, verbose: bool = True) -> list[Path]:
+    def build_samples(self, parent_dir=None, samples: Sequence[SampleConfig] | None = None, verbose: bool = True,
+                      allow_partial: bool = False) -> list[Path]:
         cfg = self.config
         samples = list(samples if samples is not None else cfg.samples)
         if not samples:
             raise ValueError("no samples defined in config.samples")
-        parent = self.open_parent(parent_dir)
+        parent = self.open_parent(parent_dir, allow_partial=allow_partial)
         out_dir = Path(parent_dir or cfg.output.dir) / "samples"
         out_dir.mkdir(parents=True, exist_ok=True)
+        base_keep, thinning_info = self._population_thinning(parent, verbose)
         outputs = []
         for k, scfg in enumerate(samples):
             sdef = SampleDefinition(
                 name=scfg.name, z_min=scfg.z_min, z_max=scfg.z_max, outcomes=scfg.outcomes,
-                assigned_lines=scfg.assigned_lines, n_det_min=scfg.n_det_min,
+                assigned_lines=scfg.assigned_lines, membership=scfg.membership, n_det_min=scfg.n_det_min,
                 footprint=build_footprint(scfg.footprint), extra_cuts=scfg.extra_cuts,
             )
-            need = ["z_obs", "id_outcome", "line_assigned", "n_det", "ra", "dec", *scfg.extra_cuts.keys()]
+            need = ["z_obs", "id_outcome", "line_assigned", "line_bitmask", "n_det", "ra", "dec", *scfg.extra_cuts.keys()]
             data = parent.select(*dict.fromkeys(need)).get_data("numpy", wrap_single=True)
             keep = sample_mask(data, self.line_set, sdef)
+            if base_keep is not None:
+                keep &= base_keep
             p_keep = None
-            if scfg.downsample is not None:
+            out_path = out_dir / f"{scfg.name}.hdf5"
+            meta_path = out_dir / f"{scfg.name}_metadata.yaml"
+            if out_path.exists() and not cfg.output.overwrite:
+                raise FileExistsError(f"sample output {out_path} exists; set output.overwrite to replace it")
+            if scfg.downsample is not None and keep.any():
                 dcfg = scfg.downsample
-                target = _target_from_cfg(dcfg)
+                target = self._target(dcfg.target if dcfg.target is not None else dcfg.target_file,
+                                      default_line=(scfg.assigned_lines or [None])[0])
                 if dcfg.area_deg2 is not None:
                     area = dcfg.area_deg2
                 else:  # area of the lightcone coverage inside the sample footprint
@@ -317,7 +443,7 @@ class RomanMockPipeline:
                     hi = scfg.z_max if scfg.z_max is not None else np.nanmax(z_sel)
                     z_edges = np.linspace(lo, hi, dcfg.nbins + 1)
                 rng = np.random.default_rng([cfg.seed, 10_000 + k])
-                mock = mock_dndz(z_sel, z_edges, area, dcfg.smooth_bins)
+                mock = mock_dndz(z_sel, z_edges, area, dcfg.smooth_bins, dcfg.poly_degree)
                 sub_keep, p_keep = downsample_to_dndz(z_sel, target, area, z_edges, rng, mock_dndz_values=mock)
                 idx = np.where(keep)[0]
                 keep = np.zeros_like(keep)
@@ -328,19 +454,73 @@ class RomanMockPipeline:
             n_keep = int(keep.sum())
             if verbose:
                 print(f"[romanmock] sample {scfg.name!r}: {n_keep:,} of {keep.size:,} parent galaxies", flush=True)
+            meta = {"sample": _asdict(scfg), "n_galaxies": n_keep, "parent_config_hash": self.config_hash(),
+                    "created": _dt.datetime.now().isoformat(timespec="seconds")}
             if n_keep == 0:
-                warnings.warn(f"sample {scfg.name!r} is empty; nothing written")
+                # do not leave a stale non-empty catalog looking like the current result (review B2)
+                out_path.unlink(missing_ok=True)
+                meta["empty"] = True
+                write_run_metadata(meta_path, meta)
+                warnings.warn(f"sample {scfg.name!r} is empty; previous output removed, metadata records the empty result")
                 continue
             out = parent.take_rows(np.where(keep)[0])
-            out_path = out_dir / f"{scfg.name}.hdf5"
-            write_dataset(out_path, out, overwrite=cfg.output.overwrite)
-            meta = {"sample": _asdict(scfg), "n_galaxies": n_keep}
+            write_dataset(out_path, out, overwrite=True)
             if p_keep is not None:
                 meta["p_keep"] = p_keep.tolist()
                 meta["z_edges"] = z_edges.tolist()
-            write_run_metadata(out_dir / f"{scfg.name}_metadata.yaml", meta)
+            if thinning_info:
+                meta["population_thinning"] = {
+                    name: {"z_edges": v["z_edges"].tolist(), "p_keep": v["p_keep"].tolist(),
+                           "n_before": v["n_before"], "n_after": v["n_after"]}
+                    for name, v in thinning_info.items()}
+            write_run_metadata(meta_path, meta)
             outputs.append(out_path)
         return outputs
+
+    def _population_thinning(self, parent, verbose: bool = True):
+        """Apply ``config.population_thinning`` to the parent catalog; returns ``(mask, info)``."""
+        tcfg = self.config.population_thinning
+        if tcfg is None:
+            return None, {}
+        targets = {name: self._target(spec, default_line=name) for name, spec in tcfg.targets.items()}
+        need = list(dict.fromkeys([tcfg.by, tcfg.z_column]))
+        data = parent.select(*need).get_data("numpy", wrap_single=True)
+        area = tcfg.area_deg2 if tcfg.area_deg2 is not None else sky_area_deg2(parent, tcfg.nside)
+        rng = np.random.default_rng([self.config.seed, 20_000])
+        keep, info = population_thinning_mask(
+            data, self.line_set, targets, area, rng, by=tcfg.by, z_column=tcfg.z_column,
+            bin_width=tcfg.bin_width, smooth_bins=tcfg.smooth_bins, poly_degree=tcfg.poly_degree,
+            outside_range=tcfg.outside_range)
+        if verbose:
+            for name, v in info.items():
+                print(f"[romanmock] population thinning {name!r}: {v['n_before']:,} -> {v['n_after']:,} "
+                      f"(p_keep {v['p_keep'].min():.3f}-{v['p_keep'].max():.3f}, area {area:.0f} deg^2)", flush=True)
+        return keep, info
+
+    def _target(self, spec, default_line: str | None = None) -> TargetDNDZ:
+        """Resolve a target spec (dict, file path, or TargetDNDZ) into a TargetDNDZ."""
+        if isinstance(spec, TargetDNDZ):
+            return spec
+        if spec is None:
+            raise ValueError("a downsampling target is required (reference, file, or z/dndz)")
+        if isinstance(spec, (str, Path)):
+            return TargetDNDZ.from_file(spec)
+        spec = dict(spec)
+        if "reference" in spec or not ({"file", "z"} & set(spec)):
+            from .reference_dndz import reference_target
+
+            name = spec.pop("reference", "wang2022")
+            line = spec.pop("line", default_line)
+            if line is None:
+                raise ValueError("reference target needs a 'line' (or a sample with assigned_lines)")
+            if "flux_limit" not in spec:
+                if not isinstance(self.sensitivity, ConstantFluxLimit):
+                    raise ValueError("give 'flux_limit' explicitly for a non-constant sensitivity model")
+                spec["flux_limit"] = self.sensitivity.flux_limit_value
+            return reference_target(name, line=line, **spec)
+        if "file" in spec:
+            return TargetDNDZ.from_file(spec["file"])
+        return TargetDNDZ(spec["z"], spec["dndz"])
 
     # ------------------------------------------------------------------------------
     def metadata(self) -> dict:
@@ -383,15 +563,17 @@ def _to_config(obj):
     return obj.to_config() if hasattr(obj, "to_config") else repr(obj)
 
 
+def _json_default(o):
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    if isinstance(o, (np.integer, np.floating, np.bool_)):
+        return o.item()
+    return str(o)
+
+
 def _asdict(obj):
     import dataclasses
 
     return dataclasses.asdict(obj) if dataclasses.is_dataclass(obj) else dict(obj)
 
 
-def _target_from_cfg(dcfg) -> TargetDNDZ:
-    if dcfg.target_file:
-        return TargetDNDZ.from_file(dcfg.target_file)
-    if dcfg.target:
-        return TargetDNDZ(dcfg.target["z"], dcfg.target["dndz"])
-    raise ValueError("downsample needs target_file or target {z, dndz}")

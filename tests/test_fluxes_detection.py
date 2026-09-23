@@ -28,8 +28,8 @@ def test_luminosity_to_flux_matches_astropy(cosmo):
     np.testing.assert_allclose(luminosity_distance_cm(z, cosmo), dl)
 
 
-@pytest.mark.skipif(pytest.importorskip("dsps", reason="dsps not installed") is None, reason="dsps")
 def test_dsps_backend_agrees_with_astropy(cosmo):
+    pytest.importorskip("dsps", reason="dsps not installed")   # inside the test: skips only this test (review B6)
     z = np.linspace(0.1, 3.9, 20)
     a = luminosity_distance_cm(z, cosmo, backend="astropy")
     b = luminosity_distance_cm(z, cosmo, backend="dsps")

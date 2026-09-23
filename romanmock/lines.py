@@ -52,12 +52,21 @@ class LineFeature:
         diffsky luminosity columns whose luminosities are summed to form the feature.
     label : str
         Human readable description.
+    blend : bool
+        Only meaningful for multi-component features. ``True``: the components are an
+        unresolved blend (e.g. the [O II] doublet) and are detected as one feature at
+        ``rest_wave``. ``False`` (default for multi-component features): the components are
+        separated transitions, each detected independently at its own rest wavelength with
+        its own bandpass test; the feature is detected when any component is. Summing
+        separated lines before the bandpass test would let an out-of-band component count
+        towards a detection, or discard an in-band one (review item B3).
     """
 
     name: str
     rest_wave: float
     components: tuple[str, ...]
     label: str = ""
+    blend: bool = False
 
     def __post_init__(self):
         if not self.components:
@@ -65,12 +74,18 @@ class LineFeature:
         if self.rest_wave <= 0:
             raise ValueError(f"feature {self.name!r} has non-positive rest wavelength")
 
+    @property
+    def is_blend(self) -> bool:
+        """Detected as one feature (single transition or unresolved blend)."""
+        return len(self.components) == 1 or self.blend
+
     def to_dict(self) -> dict:
         return {
             "name": self.name,
             "rest_wave": float(self.rest_wave),
             "components": list(self.components),
             "label": self.label,
+            "blend": bool(self.blend),
         }
 
     @classmethod
@@ -83,7 +98,7 @@ class LineFeature:
             if len(comps) != 1 or comps[0] not in DIFFSKY_LINE_WAVELENGTHS:
                 raise ValueError(f"rest_wave must be given for feature {d['name']!r}")
             rest_wave = DIFFSKY_LINE_WAVELENGTHS[comps[0]]
-        return cls(d["name"], float(rest_wave), tuple(comps), d.get("label", ""))
+        return cls(d["name"], float(rest_wave), tuple(comps), d.get("label", ""), bool(d.get("blend", False)))
 
 
 class LineSet:
@@ -105,6 +120,14 @@ class LineSet:
         self._features = features
         self._index = {f.name: i for i, f in enumerate(features)}
         self.name = name
+        # rest wavelength of every component column (needed to detect separated transitions)
+        self._component_waves = {}
+        for f in features:
+            for c in f.components:
+                w = DIFFSKY_LINE_WAVELENGTHS.get(c, f.rest_wave if len(f.components) == 1 else None)
+                if w is None:
+                    raise ValueError(f"unknown rest wavelength for component {c!r} of feature {f.name!r}")
+                self._component_waves[c] = float(w)
 
     # ---- basic container behaviour -------------------------------------------------
     def __len__(self) -> int:
@@ -147,6 +170,14 @@ class LineSet:
                     cols.append(c)
         return cols
 
+    def component_wave(self, column: str) -> float:
+        """Vacuum rest wavelength [A] of a component luminosity column."""
+        return self._component_waves[column]
+
+    @property
+    def has_separated_components(self) -> bool:
+        return any(not f.is_blend for f in self._features)
+
     def bit(self, name: str) -> int:
         """Bit position of a feature."""
         return self._index[name]
@@ -168,10 +199,14 @@ class LineSet:
         new = []
         for f in self._features:
             if len(f.components) == 1 and f.components[0] in table:
-                new.append(LineFeature(f.name, float(table[f.components[0]]), f.components, f.label))
+                new.append(LineFeature(f.name, float(table[f.components[0]]), f.components, f.label, f.blend))
             else:
                 new.append(f)
-        return LineSet(new, name=self.name)
+        ls = LineSet(new, name=self.name)
+        for c, w in table.items():
+            if c in ls._component_waves:
+                ls._component_waves[c] = float(w)
+        return ls
 
     def subset(self, names: Sequence[str], name: str | None = None) -> "LineSet":
         return LineSet([self[n] for n in names], name=name or f"{self.name}_subset")
@@ -218,7 +253,7 @@ ROMAN_TRANSITIONS = LineSet(
         LineFeature("Hb", _w("Ba_beta_4861"), ("Ba_beta_4861",), "H-beta 4861"),
         LineFeature("OIII_5007", _w("O_III_5007"), ("O_III_5007",), "[O III] 5007"),
         LineFeature("OIII_4959", _w("O_III_4959"), ("O_III_4959",), "[O III] 4959"),
-        LineFeature("OII_3727", _OII_BLEND_WAVE, ("O_II_3726", "O_II_3729"), "[O II] 3726+3729 blend"),
+        LineFeature("OII_3727", _OII_BLEND_WAVE, ("O_II_3726", "O_II_3729"), "[O II] 3726+3729 blend", blend=True),
         LineFeature("SIII_9532", _w("S_III_9532"), ("S_III_9532",), "[S III] 9532"),
         LineFeature("SIII_9069", _w("S_III_9069"), ("S_III_9069",), "[S III] 9069"),
         LineFeature("OIII_4363", _w("O_III_4363"), ("O_III_4363",), "[O III] 4363 (auroral)"),
@@ -228,15 +263,17 @@ ROMAN_TRANSITIONS = LineSet(
 )
 
 #: The five species of the plan's section 2 (bits 0..4 in the order written there).
-#: Doublets are summed; the rest wavelength of a summed species is that of its
-#: strongest component ([O II]: mean of the doublet).
+#: [O III] and [S III] are *separated* transitions: each component is detected on its own
+#: (own wavelength and bandpass test) and the species bit is set when any component is
+#: detected; the species flux column is the sum. [O II] is an unresolved blend. The
+#: representative rest wavelength of a species is that of its strongest component.
 PLAN_SPECIES = LineSet(
     [
         LineFeature("Ha", _w("Ba_alpha_6563"), ("Ba_alpha_6563",), "H-alpha"),
         LineFeature("Hb", _w("Ba_beta_4861"), ("Ba_beta_4861",), "H-beta"),
-        LineFeature("OIII", _w("O_III_5007"), ("O_III_4959", "O_III_5007"), "[O III] 4959+5007"),
-        LineFeature("OII", _OII_BLEND_WAVE, ("O_II_3726", "O_II_3729"), "[O II] 3726+3729"),
-        LineFeature("SIII", _w("S_III_9532"), ("S_III_9069", "S_III_9532"), "[S III] 9069+9532"),
+        LineFeature("OIII", _w("O_III_5007"), ("O_III_4959", "O_III_5007"), "[O III] 4959+5007 (separated)", blend=False),
+        LineFeature("OII", _OII_BLEND_WAVE, ("O_II_3726", "O_II_3729"), "[O II] 3726+3729 blend", blend=True),
+        LineFeature("SIII", _w("S_III_9532"), ("S_III_9069", "S_III_9532"), "[S III] 9069+9532 (separated)", blend=False),
     ],
     name="plan_species",
 )

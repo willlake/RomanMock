@@ -73,6 +73,7 @@ def detect_lines(
     line_set="roman_transitions",
     detection_model: DetectionModel | None = None,
     rng: np.random.Generator | None = None,
+    component_flux: dict | None = None,
 ) -> DetectionResult:
     """Apply the detection model to feature fluxes and build the bitmask.
 
@@ -87,6 +88,9 @@ def detect_lines(
         Defaults to :class:`ThresholdDetection` with the Roman grism constant limit.
     rng : numpy Generator, optional
         Needed by stochastic detection models.
+    component_flux : dict, optional
+        ``{luminosity column: (n,) flux}`` from :func:`romanmock.fluxes.component_fluxes`;
+        required when the line set has separated multi-component features.
     """
     line_set = get_line_set(line_set)
     flux = np.asarray(flux, dtype=np.float64)
@@ -94,15 +98,47 @@ def detect_lines(
         raise ValueError(f"flux must have shape (n, {len(line_set)}); got {flux.shape}")
     model = detection_model if detection_model is not None else ThresholdDetection()
     rng = rng if rng is not None else np.random.default_rng()
+    z_rsd = np.asarray(z_rsd, dtype=np.float64)
     wave_obs = observed_wavelength(line_set.rest_waves, z_rsd)
-    det: Detection = model.detect(flux, wave_obs, rng)
-    bitmask = pack_bitmask(det.detected)
+
+    if not line_set.has_separated_components:
+        det: Detection = model.detect(flux, wave_obs, rng)
+        detected, flux_measured, snr = det.detected, det.flux_measured, det.snr
+    else:
+        # Separated multi-component features (e.g. the plan's [O III] = 4959 + 5007 species)
+        # are tested transition by transition: each component has its own observed
+        # wavelength and bandpass test; the feature is detected when any component is.
+        if component_flux is None:
+            raise ValueError("line set has separated multi-component features; pass component_flux "
+                             "(see romanmock.fluxes.component_fluxes)")
+        cols, waves, owner = [], [], []
+        for i, feat in enumerate(line_set):
+            if feat.is_blend:
+                cols.append(flux[:, i]); waves.append(feat.rest_wave); owner.append(i)
+            else:
+                for c in feat.components:
+                    cols.append(np.asarray(component_flux[c], dtype=np.float64))
+                    waves.append(line_set.component_wave(c)); owner.append(i)
+        owner = np.asarray(owner)
+        f_cols = np.stack(cols, axis=1)
+        w_cols = observed_wavelength(np.asarray(waves), z_rsd)
+        det = model.detect(f_cols, w_cols, rng)
+        n, nf = flux.shape
+        detected = np.zeros((n, nf), dtype=bool)
+        flux_measured = np.zeros((n, nf))
+        snr = np.zeros((n, nf))
+        for i in range(nf):
+            sel = owner == i
+            detected[:, i] = det.detected[:, sel].any(axis=1)
+            flux_measured[:, i] = det.flux_measured[:, sel].sum(axis=1)
+            snr[:, i] = det.snr[:, sel].max(axis=1)
+    bitmask = pack_bitmask(detected)
     return DetectionResult(
         wave_obs=wave_obs,
         flux=flux,
-        flux_measured=det.flux_measured,
-        snr=det.snr,
-        detected=det.detected,
+        flux_measured=flux_measured,
+        snr=snr,
+        detected=detected,
         bitmask=bitmask,
         n_det=popcount(bitmask),
     )

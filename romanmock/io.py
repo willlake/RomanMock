@@ -165,3 +165,45 @@ def write_run_metadata(path, metadata: dict):
     with open(path, "w") as f:
         yaml.safe_dump(metadata, f, sort_keys=False)
     return path
+
+
+# ---------------------------------------------------------------------------------
+# Provenance: manifest of completed slices and in-file configuration stamps
+# ---------------------------------------------------------------------------------
+def manifest_path(output_dir, tag: str) -> Path:
+    return Path(output_dir) / f"{tag}_manifest.yaml"
+
+
+def read_manifest(output_dir, tag: str) -> dict | None:
+    import yaml
+
+    path = manifest_path(output_dir, tag)
+    if not path.exists():
+        return None
+    with open(path) as f:
+        return yaml.safe_load(f) or {}
+
+
+def write_manifest(output_dir, tag: str, manifest: dict) -> Path:
+    """Write the manifest atomically (temp file + rename)."""
+    import os
+    import yaml
+
+    path = manifest_path(output_dir, tag)
+    tmp = path.with_suffix(".yaml.tmp")
+    with open(tmp, "w") as f:
+        yaml.safe_dump(manifest, f, sort_keys=False)
+    os.replace(tmp, path)
+    return path
+
+
+def stamp_output(path, attrs: dict):
+    """Store provenance attributes on the root of a written HDF5 file."""
+    with h5py.File(Path(path), "r+") as f:
+        for k, v in attrs.items():
+            f.attrs[k] = v
+
+
+def read_stamp(path) -> dict:
+    with h5py.File(Path(path), "r") as f:
+        return {k: (v.item() if hasattr(v, "item") else v) for k, v in f.attrs.items() if k.startswith("romanmock_")}

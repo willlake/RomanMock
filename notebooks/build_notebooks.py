@@ -342,7 +342,7 @@ object drives the CLI. Each slice gets a random stream seeded by `(seed, step)`.
 from romanmock import RomanMockConfig, RomanMockPipeline
 
 cfg = RomanMockConfig.from_dict({
-    "catalog": {"path": CATALOG},
+    "catalog": {"path": CATALOG, "steps": [148, 219, 224]},   # the intended parent catalog: three slices
     "output": {"dir": os.path.join(WORK, "parent"), "overwrite": False,
                "passthrough_columns": ["gal_id", "ra", "dec", "redshift_true", "redshift_obs", "logsm_obs", "roman_F158"]},
     "line_set": "roman_transitions",
@@ -354,10 +354,18 @@ cfg = RomanMockConfig.from_dict({
     "seed": 2026,
 })
 pipe = RomanMockPipeline(cfg)
-outputs = pipe.run(steps=[148, 219, 224])      # existing outputs are skipped unless output.overwrite
+outputs = pipe.run()      # slices already completed with this configuration are reused (see the manifest)
 outputs'''),
+    md('''
+Every run writes a manifest of completed slices with a hash of the scientific configuration
+(line set, sensitivity, detection, confusion, seed, ...). A rerun with the same configuration
+reuses finished slices; a changed configuration refuses to mix with existing outputs unless
+`output.overwrite` is set, and stage B only accepts a parent catalog whose manifest matches the
+configuration and covers every selected slice.
+'''),
     code('''
-print(open(os.path.join(cfg.output.dir, "romanmock_metadata.yaml")).read()[:1500])'''),
+print(open(os.path.join(cfg.output.dir, "romanmock_manifest.yaml")).read())
+print(open(os.path.join(cfg.output.dir, "romanmock_metadata.yaml")).read()[:600])'''),
     md('''
 ## The parent emission-line catalog
 
@@ -755,30 +763,45 @@ print("            " + " ".join(f"{n[:9]:>9s}" for n in names))
 for i, n in enumerate(pipe.line_set.names):
     print(f"  {n[:9]:<9s} " + " ".join(f"{x:9.4f}" for x in emp[i]))"""),
     md("""
-## Analysis samples
+## Matching the emitter populations to the HLSS forecast
 
-Two HLSS-like tracer samples over the full footprint. The downsampling target below is a smooth
-curve at half the mock density, standing in for a survey forecast; replace it with
-`DownsampleConfig(target_file="forecast_dndz.txt")` (two columns: z, dN/dz per deg²) when one is
-available. Bins where the target exceeds the mock are kept entirely and reported.
+Wang et al. (2022, arXiv:2110.01829) tabulate the expected dN/dz per deg² of Hα and [O III]
+emitters above a given line-flux limit (Tables 1–2, Galacticus on the UNIT lightcone). Those
+numbers describe *true emitters before observational efficiency*, so the right quantity to match
+is the mock's detected-line population in bins of true redshift, before any redshift assignment
+or sample selection. `romanmock.reference_dndz` carries the tables; the comparison below uses the
+run's flux limit (1e-16) and the A_V = 1.65 dust model.
 """),
     code("""
-from romanmock.config import SampleConfig, DownsampleConfig
-from scipy.ndimage import gaussian_filter1d
+from romanmock.reference_dndz import wang2022_bins
 
-def half_mock_target(name, z_min, z_max, nbins=40):
-    edges = np.linspace(z_min, z_max, nbins + 1)
-    sel = has_z & (pdata["line_assigned"] == pipe.line_set.bit(name))
-    mock = gaussian_filter1d(dndz(pdata["z_obs"][sel], edges, area), 1.5, mode="nearest")
-    return {"z": (0.5 * (edges[1:] + edges[:-1])).tolist(), "dndz": (0.5 * mock).tolist()}, edges
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+for ax, name in zip(axes, ["Ha", "OIII_5007"]):
+    edges, ref = wang2022_bins(name, 1e-16, 1.65)
+    _, ref192 = wang2022_bins(name, 1e-16, 1.92)
+    sel = pdata["line_true"] == pipe.line_set.bit(name)
+    zc = 0.5 * (edges[1:] + edges[:-1])
+    ax.step(zc, dndz(pdata["redshift_obs"][sel], edges, area), where="mid", color=plotting.feature_color(name), label=f"diffsky mock, {name} brightest detected line")
+    ax.step(zc, ref, where="mid", color=plotting.TEXT_PRIMARY, label="Wang+22 A_V=1.65")
+    ax.step(zc, ref192, where="mid", color=plotting.TEXT_SECONDARY, ls="--", label="Wang+22 A_V=1.92")
+    ax.set_xlabel("true redshift"); ax.set_ylabel("dN/dz per deg²"); ax.set_title(f"{name} emitters above 1e-16 erg/s/cm²"); ax.legend(fontsize=8)
+plt.tight_layout(); plt.show()"""),
+    md("""
+The diffsky mock contains several times more Hα emitters than the Galacticus forecast at z > 1
+(and fewer at z < 0.8, where thinning cannot help and the pipeline warns). Population thinning
+draws `p_keep(z_true) = target / mock` per population and applies it before the analysis samples
+are built, so interlopers in a sample are thinned consistently with the population they really
+belong to. It is switched on with `population_thinning:` in the configuration.
+"""),
+    code("""
+from romanmock.config import PopulationThinningConfig, SampleConfig
 
-tgt_ha, edges_ha = half_mock_target("Ha", 1.0, 1.9)
-tgt_o3, edges_o3 = half_mock_target("OIII_5007", 2.0, 2.9)
+cfg.population_thinning = PopulationThinningConfig(
+    targets={"Ha": {"reference": "wang2022", "dust_av": 1.65}, "OIII_5007": {"reference": "wang2022", "dust_av": 1.65}},
+    by="line_true", z_column="redshift_obs", outside_range="keep")
 samples = [
-    SampleConfig(name="halpha_z1p0_1p9", z_min=1.0, z_max=1.9, assigned_lines=["Ha"],
-                 downsample=DownsampleConfig(target=tgt_ha, z_edges=edges_ha.tolist(), area_deg2=area, smooth_bins=1.0)),
-    SampleConfig(name="oiii_z2p0_2p9", z_min=2.0, z_max=2.9, assigned_lines=["OIII_5007"],
-                 downsample=DownsampleConfig(target=tgt_o3, z_edges=edges_o3.tolist(), area_deg2=area, smooth_bins=1.0)),
+    SampleConfig(name="halpha_z1p0_1p9", z_min=1.0, z_max=1.9, assigned_lines=["Ha"]),
+    SampleConfig(name="oiii_z2p0_2p9", z_min=2.0, z_max=2.9, assigned_lines=["OIII_5007"]),
 ]
 cfg.output.overwrite = True
 t0 = time.time()
@@ -787,18 +810,103 @@ print(f"{(time.time() - t0) / 60:.1f} min")
 sample_files"""),
     code("""
 fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-for ax, path, (tgt, edges), name in zip(axes, sample_files, [(tgt_ha, edges_ha), (tgt_o3, edges_o3)], ["Ha", "OIII_5007"]):
-    ds = oc.open(path)
-    d = ds.select("z_obs", "id_outcome").get_data("numpy", wrap_single=True)
+for ax, path, name in zip(axes, sample_files, ["Ha", "OIII_5007"]):
+    d = oc.open(path).select("z_obs", "redshift_obs", "id_outcome", "line_true").get_data("numpy", wrap_single=True)
+    edges, ref = wang2022_bins(name, 1e-16, 1.65)
     zc = 0.5 * (edges[1:] + edges[:-1])
-    sel = has_z & (pdata["line_assigned"] == pipe.line_set.bit(name))
-    ax.step(zc, dndz(pdata["z_obs"][sel], edges, area), where="mid", color=plotting.CATEGORICAL[0], label="parent (assigned line)")
-    ax.plot(tgt["z"], tgt["dndz"], color=plotting.CATEGORICAL[1], label="target")
-    ax.step(zc, dndz(d["z_obs"], edges, area), where="mid", color=plotting.CATEGORICAL[2], label="sample")
+    sel = pdata["line_assigned"] == pipe.line_set.bit(name)
+    ax.step(zc, dndz(pdata["z_obs"][sel], edges, area), where="mid", color=plotting.CATEGORICAL[0], label="parent, assigned line (z_obs)")
+    ax.step(zc, ref, where="mid", color=plotting.TEXT_PRIMARY, label="Wang+22 target (true emitters)")
+    ax.step(zc, dndz(d["z_obs"], edges, area), where="mid", color=plotting.CATEGORICAL[2], label="sample after thinning (z_obs)")
     misid = np.mean(d["id_outcome"] == 3)
-    ax.set_xlabel("z_obs"); ax.set_ylabel("dN/dz per deg²"); ax.set_title(f"{name} sample: {len(d['z_obs']):,} galaxies, {100 * misid:.1f}% interlopers")
-    ax.legend(fontsize=8)
-plt.tight_layout(); plt.show()"""),
+    ax.set_xlabel("redshift"); ax.set_ylabel("dN/dz per deg²")
+    ax.set_title(f"{name} sample: {len(d['z_obs']):,} galaxies, {100 * misid:.1f}% interlopers"); ax.legend(fontsize=8)
+plt.tight_layout(); plt.show()
+print(open(os.path.join(OUT_DIR, "samples", "halpha_z1p0_1p9_metadata.yaml")).read()[-700:])"""),
+    md("""
+The sample dN/dz is close to, but not identical with, the target: the sample is defined on
+*assigned* redshift and contains interlopers (thinned with their own population's `p_keep`)
+while missing the emitters that failed or were misidentified. That difference is the point of
+keeping the two steps separate (plan comment 5). For matching a forecast of the *final* sample
+instead, use the per-sample `downsample` option on `z_obs`.
+"""),
+    md("""
+## Mock versus forecast, and confusion versus contamination
+
+Two quantitative points are worth making explicit. First, how far the diffsky abundances are
+from the Galacticus forecast: the ratio of the mock's detected-emitter dN/dz to the Wang et al.
+table per bin. Ratios above one are what thinning removes; ratios below one are shortages that
+thinning cannot fill (the pipeline warns about them).
+"""),
+    code("""
+fig, ax = plt.subplots(figsize=(8, 4.2))
+for name in ["Ha", "OIII_5007"]:
+    edges, ref = wang2022_bins(name, 1e-16, 1.65)
+    zc = 0.5 * (edges[1:] + edges[:-1])
+    sel = pdata["line_true"] == pipe.line_set.bit(name)
+    ratio = dndz(pdata["redshift_obs"][sel], edges, area) / ref
+    ax.step(zc, ratio, where="mid", color=plotting.feature_color(name), label=f"{name}: mock / Wang+22 (A_V=1.65)")
+    for z, r in zip(zc, ratio):
+        if 0 < r < 100:
+            ax.text(z, r, f"{r:.1f}", fontsize=7, ha="center", va="bottom", color=plotting.TEXT_SECONDARY)
+ax.axhline(1.0, color=plotting.TEXT_SECONDARY, lw=1, ls="--")
+ax.set_yscale("log"); ax.set_ylim(0.1, 20)
+ax.set_xlabel("true redshift"); ax.set_ylabel("mock dN/dz / forecast dN/dz")
+ax.set_title("Detected emitters in the mock relative to the HLSS forecast (F > 1e-16)"); ax.legend(fontsize=8)
+plt.show()"""),
+    md("""
+Second, why the [O III] sample is far more contaminated than the confusion matrix alone suggests.
+The matrix says a single-line Hα emitter is called [O III] with probability 5 %. But the sample of
+galaxies *assigned* [O III] at z_obs = 2–2.9 draws its interlopers from single-line Hα emitters at
+z_rsd ≈ 1.3–1.95 (the redshifts that map onto 2–2.9 through λ_Hα/λ_[O III]), and those are many
+times more numerous than the true [O III] emitters at z ≈ 2–2.9, even after thinning. The
+contamination fraction is the abundance-weighted quantity
+
+f(Hα → [O III]) = N_Hα,single(z_src) · C(Hα→[O III]) / N_sample([O III]),
+
+which is plan comment 4 and review item 4: a fixed confusion matrix does not imply a fixed
+interloper fraction.
+"""),
+    code("""
+from romanmock import IdOutcome
+
+i_ha, i_o3 = pipe.line_set.bit("Ha"), pipe.line_set.bit("OIII_5007")
+d = oc.open(sample_files[1]).select("z_obs", "redshift_obs", "line_true", "id_outcome").get_data("numpy", wrap_single=True)
+edges = np.linspace(2.0, 2.9, 10)
+zc = 0.5 * (edges[1:] + edges[:-1])
+true_o3 = d["line_true"] == i_o3
+ha_interloper = (d["line_true"] == i_ha) & (d["id_outcome"] == IdOutcome.SINGLE_MISID)
+n_true, _ = np.histogram(d["z_obs"][true_o3], bins=edges)
+n_int, _ = np.histogram(d["z_obs"][ha_interloper], bins=edges)
+n_all, _ = np.histogram(d["z_obs"], bins=edges)
+
+# source population: single-line Hα emitters (after thinning) at the redshifts that map into each bin
+lam_ratio = pipe.line_set["Ha"].rest_wave / pipe.line_set["OIII_5007"].rest_wave
+src_edges = (1 + edges) / lam_ratio - 1
+c_ha_o3 = pipe.confusion.matrix[i_ha, i_o3]
+
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+w = np.diff(edges)
+ax1.bar(zc - 0.22 * w, n_true, width=0.42 * w, color=plotting.feature_color("OIII_5007"), label="true [O III] emitters")
+ax1.bar(zc + 0.22 * w, n_int, width=0.42 * w, color=plotting.feature_color("Ha"), label="Hα emitters assigned [O III]")
+ax1.set_xlabel("z_obs"); ax1.set_ylabel("galaxies in the [O III] sample"); ax1.set_title("Composition of the assigned-[O III] sample"); ax1.legend(fontsize=8)
+ax1.grid(axis="x", visible=False)
+ax2.step(zc, 100 * n_int / n_all, where="mid", color=plotting.feature_color("Ha"), label="measured Hα interloper fraction")
+ax2.axhline(100 * c_ha_o3, color=plotting.TEXT_SECONDARY, ls="--", lw=1, label=f"confusion matrix entry C(Hα→[O III]) = {100 * c_ha_o3:.0f}%")
+ax2.set_ylim(0, 60); ax2.set_xlabel("z_obs"); ax2.set_ylabel("% of the [O III] sample"); ax2.set_title("Contamination fraction versus confusion probability"); ax2.legend(fontsize=8)
+plt.tight_layout(); plt.show()
+print(f"[O III] sample: {n_all.sum():,} galaxies; true [O III] {n_true.sum():,}; Hα interlopers {n_int.sum():,} "
+      f"({100 * n_int.sum() / n_all.sum():.1f}%), from a source population of single-line Hα emitters at z_rsd ~ {src_edges[0]:.2f}-{src_edges[-1]:.2f}")
+n_src = np.sum((pdata['line_true'] == i_ha) & (pdata['n_det'] == 1) & (pdata['redshift_obs'] >= src_edges[0]) & (pdata['redshift_obs'] <= src_edges[-1]))
+print(f"single-line Hα emitters in the parent at those redshifts (before thinning): {n_src:,}; "
+      f"x C(Hα→[O III]) = {c_ha_o3:.2f} -> {n_src * c_ha_o3:,.0f} interlopers before thinning, versus {n_true.sum():,} true [O III] emitters kept")"""),
+    md("""
+So the 5 % matrix entry becomes a ~30 % contamination because the source population is an order of
+magnitude larger than the target population. Lowering the interloper fraction in this scenario
+requires either a smaller C(Hα→[O III]) (the calibration the plan calls the main external input),
+or the extra information the comments suggest (photometric redshifts, missing companion lines)
+entering the confusion model; thinning to a forecast dN/dz does not change it.
+"""),
     md("""
 The sample files retain `gal_id`, `redshift_obs` (z_rsd), `z_obs`, `line_bitmask`, `line_true`,
 `line_assigned` and `id_outcome`, so completeness, contamination and clustering can be checked
