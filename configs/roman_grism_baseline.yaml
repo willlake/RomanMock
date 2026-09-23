@@ -1,0 +1,79 @@
+# Baseline Roman grism emission-line mock (plan sections 1-3) plus one example sample.
+# Run:   romanmock run configs/roman_grism_baseline.yaml
+#        romanmock select configs/roman_grism_baseline.yaml
+catalog:
+  path: /global/cfs/cdirs/m4943/Simulations/sdss_feniks_hizels_260710_09_07_2026
+  files: null          # explicit list of lc_cores-*.diffsky_gals.hdf5 (relative to path), or null for all
+  steps: null          # e.g. [219, 224] to process only these slices
+  z_min: 0.4           # only slices overlapping [z_min, z_max] are processed (Ha/[O III]/[O II] in 1.0-1.93 um)
+  z_max: 4.0
+  open_kwargs: {synth_cores: false, keep_top_host: true}
+  rest_waves_from_catalog: true   # take rest wavelengths from the diffsky ssp_data file
+
+output:
+  dir: /pscratch/sd/w/willlake/roman/romanmock_baseline
+  tag: romanmock                  # output files are lc_cores-<step>.<tag>.hdf5
+  overwrite: false
+  keep_undetected: false          # drop galaxies with line_bitmask == 0
+  passthrough_columns: [gal_id, ra, dec, redshift_true, redshift_obs, logsm_obs, logssfr_obs,
+                        roman_F106, roman_F129, roman_F158, roman_F184, roman_Grism_1stOrder, av]
+  store_fluxes: true
+  store_wave_obs: false
+  store_snr: false
+  store_measured_flux: false
+
+# Bit ordering (see `romanmock lines roman_transitions`):
+#   0 Ha, 1 Hb, 2 OIII_5007, 3 OIII_4959, 4 OII_3727 (blend), 5 SIII_9532, 6 SIII_9069, 7 OIII_4363, 8 SIII_6312
+line_set: roman_transitions
+
+flux:
+  redshift_column: redshift_true  # luminosity distance uses the cosmological redshift
+  backend: astropy                # or dsps (JAX routine diffsky uses internally)
+  suffix: _flux
+
+sensitivity:                      # initial model: constant threshold inside the grism bandpass
+  type: constant
+  flux_limit: 1.0e-16             # erg/s/cm^2
+  wave_range: [10000.0, 19300.0]  # Angstrom (1.00-1.93 um)
+  # wavelength-dependent alternative:
+  # type: tabulated
+  # file: sensitivity_curve.txt   # two columns: wavelength [A], 1-sigma-equivalent flux limit
+  # wave_unit: angstrom
+
+detection:
+  type: threshold                 # F > F_lim(lambda_obs); or gaussian_noise with snr_at_limit / snr_threshold
+
+confusion:                        # assumed scenario, not a calibrated Roman prediction
+  type: matrix
+  default_p_fail: 0.02            # rows not listed: identity with this failure probability
+  rows:
+    Ha:        {OIII_5007: 0.03, OII_3727: 0.02, fail: 0.05}
+    OIII_5007: {Ha: 0.10, OII_3727: 0.03, fail: 0.05}
+    OII_3727:  {Ha: 0.15, OIII_5007: 0.10, fail: 0.10}
+    Hb:        {Ha: 0.30, OIII_5007: 0.30, fail: 0.20}
+  # alternatives:
+  # type: identity
+  # p_fail: 0.0
+  # type: wavelength_binned
+  # edges: [10000, 15000, 19300]
+  # matrices: [{rows: {...}}, {file: confusion_red.yaml}]
+
+redshift:
+  rsd_column: redshift_obs        # z including peculiar velocity: sets lambda_obs and z_obs
+  sigma_z: 0.0                    # optional Gaussian error sigma_z (1+z) for multi-line redshifts
+  context_columns: []             # passthrough columns forwarded to the confusion model (e.g. roman_F158)
+
+samples:
+  - name: halpha_z1p0_1p9
+    z_min: 1.0
+    z_max: 1.9
+    outcomes: [MULTI_LINE, SINGLE_CORRECT, SINGLE_MISID]   # what an observer keeps
+    assigned_lines: [Ha]                                    # tracer: galaxies *assigned* Ha
+    footprint: null                                         # or {type: box, ra_min: 0, ra_max: 45, dec_min: 55, dec_max: 65}
+    downsample: null                                        # or {target_file: target_dndz.txt, nbins: 45, smooth_bins: 1.0}
+  - name: oiii_z2p0_2p9
+    z_min: 2.0
+    z_max: 2.9
+    assigned_lines: [OIII_5007]
+
+seed: 12345

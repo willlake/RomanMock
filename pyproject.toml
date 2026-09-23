@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "romanmock"
+version = "0.1.0"
+description = "Roman-like emission-line spectroscopic mock built from diffsky lightcones via OpenCosmo"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "BSD-3-Clause"}
+authors = [{name = "Will Lake"}]
+dependencies = [
+    "numpy>=1.24",
+    "scipy",
+    "astropy>=5",
+    "h5py",
+    "hdf5plugin",
+    "pyyaml",
+    "opencosmo>=1.3",
+]
+
+[project.optional-dependencies]
+diffsky = ["diffsky", "dsps", "jax"]
+test = ["pytest"]
+
+[project.scripts]
+romanmock = "romanmock.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["romanmock*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
