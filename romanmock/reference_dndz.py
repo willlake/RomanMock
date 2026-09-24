@@ -5,7 +5,8 @@ Roman Space Telescope", ApJ 928, 1 (arXiv:2110.01829), Tables 1 and 2. They list
 per square degree of H-alpha and [O III] emitting galaxies in bins of width 0.1 in
 redshift, predicted from the Galacticus semi-analytic model on the UNIT lightcone, for six
 line-flux limits and two dust models (A_V = 1.65 and 1.92). Central values only; the
-tabulated uncertainties (jackknife + cosmic variance, typically 5-10 %) are not reproduced.
+tabulated 1-sigma uncertainties (jackknife + cosmic variance, typically 5-10 %) are in
+``wang2022_errors``.
 
 Important: the tables describe *true emitters above the flux limit*. Per the table caption,
 "the observational efficiency is not included", i.e. the HLSS completeness (60 %) and purity
@@ -116,17 +117,106 @@ _O3_SUMMARY = {
     1.92: {(1.0, 2.0): [5185, 2836, 1975, 1433, 657, 393], (2.0, 3.0): [1364, 639, 411, 297, 166, 119]},
 }
 
+# 1-sigma uncertainties of the same entries (jackknife resampling + cosmic variance, table '+-' values)
+_HA_165_ERR = np.array([
+    [2775, 2109, 1805, 1550, 1070, 775],
+    [2922, 2197, 1878, 1600, 1057, 770],
+    [2025, 1527, 1285, 1088, 686, 470],
+    [2205, 1647, 1380, 1132, 670, 459],
+    [1836, 1335, 1081, 892, 507, 340],
+    [2225, 1575, 1238, 1013, 549, 337],
+    [1983, 1372, 1075, 847, 444, 266],
+    [2061, 1394, 1060, 840, 433, 262],
+    [2009, 1288, 949, 740, 350, 200],
+    [1708, 1078, 831, 632, 310, 172],
+    [1442, 934, 688, 505, 219, 100],
+    [1144, 689, 503, 373, 159, 78],
+    [1174, 680, 477, 322, 135, 70],
+    [957, 505, 343, 233, 83, 51],
+    [547, 285, 199, 139, 58, 32],
+], dtype=float)
+_HA_192_ERR = np.array([
+    [2363, 1800, 1506, 1311, 863, 610],
+    [2481, 1868, 1548, 1308, 839, 591],
+    [1734, 1280, 1043, 879, 541, 354],
+    [1859, 1374, 1083, 874, 511, 341],
+    [1531, 1074, 846, 673, 401, 261],
+    [1828, 1229, 956, 759, 395, 242],
+    [1595, 1069, 805, 622, 304, 182],
+    [1646, 1051, 794, 607, 301, 172],
+    [1550, 944, 693, 521, 245, 128],
+    [1309, 823, 598, 454, 204, 115],
+    [1116, 679, 460, 345, 127, 59],
+    [869, 497, 346, 254, 94, 56],
+    [848, 472, 298, 212, 82, 54],
+    [661, 339, 220, 140, 56, 34],
+    [388, 196, 127, 96, 38, 22],
+], dtype=float)
+_HA_SUMMARY_ERR = {
+    1.65: {(1.0, 2.0): [1201, 762, 569, 432, 206, 114], (0.5, 2.0): [1404, 958, 758, 610, 341, 217]},
+    1.92: {(1.0, 2.0): [924, 564, 405, 303, 138, 75], (0.5, 2.0): [1125, 753, 580, 461, 250, 156]},
+}
+_O3_165_ERR = np.array([
+    [617, 381, 287, 230, 117, 74],
+    [589, 364, 257, 204, 114, 72],
+    [609, 350, 254, 191, 101, 67],
+    [616, 344, 246, 189, 105, 64],
+    [578, 361, 275, 196, 109, 67],
+    [484, 288, 209, 163, 77, 50],
+    [495, 295, 209, 150, 75, 45],
+    [460, 254, 182, 134, 64, 44],
+    [415, 236, 169, 122, 48, 31],
+    [251, 141, 103, 68, 33, 28],
+    [237, 135, 104, 85, 51, 37],
+    [243, 138, 100, 69, 39, 30],
+    [287, 151, 116, 79, 38, 31],
+    [230, 129, 93, 69, 37, 32],
+    [219, 100, 71, 54, 30, 21],
+    [169, 88, 65, 50, 27, 21],
+    [169, 76, 44, 33, 22, 12],
+    [149, 67, 36, 33, 14, 11],
+    [187, 95, 60, 46, 23, 20],
+    [117, 61, 40, 29, 19, 15],
+], dtype=float)
+_O3_192_ERR = np.array([
+    [426, 259, 197, 140, 76, 58],
+    [400, 228, 170, 131, 76, 47],
+    [387, 222, 164, 132, 69, 48],
+    [388, 218, 160, 128, 67, 45],
+    [394, 244, 166, 139, 71, 49],
+    [328, 191, 137, 99, 52, 33],
+    [335, 177, 126, 93, 46, 29],
+    [286, 153, 107, 77, 44, 37],
+    [266, 147, 97, 66, 32, 22],
+    [161, 89, 53, 40, 29, 17],
+    [152, 99, 71, 62, 39, 32],
+    [160, 84, 58, 45, 31, 23],
+    [175, 99, 63, 46, 31, 22],
+    [137, 81, 56, 41, 34, 26],
+    [114, 61, 44, 33, 21, 17],
+    [103, 59, 42, 32, 23, 19],
+    [93, 43, 31, 23, 12, 8],
+    [78, 34, 28, 19, 11, 8],
+    [106, 54, 39, 29, 20, 11],
+    [66, 33, 22, 18, 14, 11],
+], dtype=float)
+_O3_SUMMARY_ERR = {
+    1.65: {(1.0, 2.0): [406, 230, 164, 121, 54, 32], (2.0, 3.0): [127, 62, 42, 30, 15, 10]},
+    1.92: {(1.0, 2.0): [258, 143, 99, 72, 33, 20], (2.0, 3.0): [74, 37, 24, 18, 11, 7]},
+}
+
 WANG2022_TABLES = {
-    "Ha": {"edges": _HA_EDGES, 1.65: _HA_165, 1.92: _HA_192, "summary": _HA_SUMMARY, "table": 1},
-    "OIII": {"edges": _O3_EDGES, 1.65: _O3_165, 1.92: _O3_192, "summary": _O3_SUMMARY, "table": 2},
+    "Ha": {"edges": _HA_EDGES, 1.65: _HA_165, 1.92: _HA_192, "err": {1.65: _HA_165_ERR, 1.92: _HA_192_ERR},
+           "summary": _HA_SUMMARY, "summary_err": _HA_SUMMARY_ERR, "table": 1},
+    "OIII": {"edges": _O3_EDGES, 1.65: _O3_165, 1.92: _O3_192, "err": {1.65: _O3_165_ERR, 1.92: _O3_192_ERR},
+             "summary": _O3_SUMMARY, "summary_err": _O3_SUMMARY_ERR, "table": 2},
 }
 
 #: feature names of the presets mapped onto the two tabulated species
 _LINE_ALIASES = {"Ha": "Ha", "OIII": "OIII", "OIII_5007": "OIII", "O_III_5007": "OIII", "Ba_alpha_6563": "Ha"}
 
 
-def wang2022_bins(line: str, flux_limit: float = 1e-16, dust_av: float = 1.65) -> tuple[np.ndarray, np.ndarray]:
-    """Bin edges and ``dN/dz`` per deg^2 of Table 1 (H-alpha) or Table 2 ([O III])."""
+def _lookup(line: str, flux_limit: float, dust_av: float) -> tuple[dict, int]:
     key = _LINE_ALIASES.get(line)
     if key is None:
         raise KeyError(f"no Wang et al. (2022) table for line {line!r}; available: Ha, OIII (5007)")
@@ -136,8 +226,19 @@ def wang2022_bins(line: str, flux_limit: float = 1e-16, dust_av: float = 1.65) -
         raise ValueError(f"flux limit {flux_limit:.3g} is not tabulated; choose one of {WANG2022_FLUX_LIMITS}")
     if dust_av not in WANG2022_DUST_AV:
         raise ValueError(f"dust_av must be one of {WANG2022_DUST_AV}")
-    tab = WANG2022_TABLES[key]
-    return tab["edges"].copy(), tab[dust_av][:, j[0]].copy()
+    return WANG2022_TABLES[key], int(j[0])
+
+
+def wang2022_bins(line: str, flux_limit: float = 1e-16, dust_av: float = 1.65) -> tuple[np.ndarray, np.ndarray]:
+    """Bin edges and ``dN/dz`` per deg^2 of Table 1 (H-alpha) or Table 2 ([O III])."""
+    tab, j = _lookup(line, flux_limit, dust_av)
+    return tab["edges"].copy(), tab[dust_av][:, j].copy()
+
+
+def wang2022_errors(line: str, flux_limit: float = 1e-16, dust_av: float = 1.65) -> np.ndarray:
+    """1-sigma uncertainty of each bin of :func:`wang2022_bins` (jackknife + cosmic variance)."""
+    tab, j = _lookup(line, flux_limit, dust_av)
+    return tab["err"][dust_av][:, j].copy()
 
 
 def wang2022_target(line: str, flux_limit: float = 1e-16, dust_av: float = 1.65) -> TargetDNDZ:

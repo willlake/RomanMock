@@ -99,6 +99,25 @@ def test_box_footprint_area_and_healpix_intersection():
     from romanmock.selection import sky_area_deg2
 
     full = sky_area_deg2(FakeCatalog(), 64)
-    assert abs(full - 41252.96) < 1.0
+    assert abs(full - 41252.96) < 1.0                      # no edge on the full sky
     octant = sky_area_deg2(FakeCatalog(), 64, footprint=box)
     assert abs(octant / full - 0.125) < 0.01
+    # a polar cap: boundary-corrected count converges to the exact area much faster than plain counting
+    cap_area = 2 * np.pi * (1 - np.sin(np.radians(60.0))) * (180 / np.pi) ** 2
+
+    class CapCatalog:
+        """Like a lightcone index: a pixel is listed when *any* part of it holds galaxies."""
+
+        def get_pixels(self, nside):
+            if nside > 256:
+                raise ValueError("resolution not available")
+            pix = np.arange(hp.nside2npix(nside))
+            corners = hp.boundaries(nside, pix, step=1, nest=True)          # (npix, 3, 4)
+            dec_corners = np.degrees(np.arcsin(corners[:, 2, :]))
+            return pix[dec_corners.max(axis=1) > 60.0]
+
+    plain = sky_area_deg2(CapCatalog(), 256, boundary_correction=False)
+    corrected = sky_area_deg2(CapCatalog())      # picks nside 256 as the finest available
+    assert plain > cap_area * 1.005              # plain counting overestimates
+    assert abs(corrected / cap_area - 1) < 0.003
+    assert abs(corrected / cap_area - 1) < abs(plain / cap_area - 1)

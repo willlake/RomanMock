@@ -10,10 +10,11 @@ GRISM_WAVE_RANGE_ANGSTROM = (10_000.0, 19_300.0)
 # Roman WFI prism: 0.75-1.80 micron.
 PRISM_WAVE_RANGE_ANGSTROM = (7_500.0, 18_000.0)
 
-# Constant line-flux threshold used by the initial model (erg/s/cm^2). This is the
-# usual order of magnitude quoted for the Roman High Latitude Spectroscopic Survey
-# and is meant to be replaced by a wavelength-dependent sensitivity curve.
-DEFAULT_LINE_FLUX_LIMIT = 1.0e-16
+# Constant line-flux threshold used by the initial model (erg/s/cm^2). The Roman HLSS
+# reference depth is 1e-16 at 6.5 sigma (Wang et al. 2022); the project default is the
+# more conservative 1.5e-16 (also a tabulated column of the Wang et al. dN/dz tables).
+# Meant to be replaced by a wavelength-dependent sensitivity curve.
+DEFAULT_LINE_FLUX_LIMIT = 1.5e-16
 
 # Nominal signal-to-noise ratio that a line exactly at the flux limit is assumed to
 # have. Used only to translate a flux limit into a noise level for the optional

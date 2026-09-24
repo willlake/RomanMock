@@ -105,3 +105,20 @@ def test_multi_line_sigma_z(synthetic, cosmo):
     multi = det.n_det >= 2
     scatter = (za.z_assigned[multi] - z_rsd[multi]) / (1 + z_rsd[multi])
     assert 0.8e-3 < scatter.std() < 1.2e-3
+
+
+def test_default_confusion_adapts_to_line_set():
+    from romanmock.confusion import DEFAULT_CONFUSION_ROWS, default_confusion, default_confusion_rows
+    from romanmock.lines import PLAN_SPECIES
+
+    cm = default_confusion(ROMAN_TRANSITIONS)
+    i, j = ROMAN_TRANSITIONS.bit("Ha"), ROMAN_TRANSITIONS.bit("OIII_5007")
+    assert cm.matrix[i, j] == 0.005 and cm.matrix[i, i] == pytest.approx(0.995)
+    assert np.all(cm.p_fail == 0.0)
+    rows = default_confusion_rows(PLAN_SPECIES)
+    assert rows["OIII"] == {"Ha": 0.05, "fail": 0.0} and rows["SIII"] == {"Ha": 0.05, "fail": 0.0}
+    assert rows["Ha"] == {"OIII": 0.005, "fail": 0.0}
+    cm2 = default_confusion(PLAN_SPECIES)
+    assert cm2.matrix.shape == (5, 6)
+    assert build_confusion({"type": "default"}, ROMAN_TRANSITIONS).matrix.tolist() == cm.matrix.tolist()
+    assert set(DEFAULT_CONFUSION_ROWS) == {"Ha", "OIII_5007", "SIII_9532", "Hb"}

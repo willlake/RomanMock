@@ -77,3 +77,18 @@ def test_pipeline_resolves_reference_targets():
     t = pipe._target({"z": [0, 1], "dndz": [5, 5]})
     assert t(np.array([0.5]))[0] == 5
     assert cfg.to_dict()["population_thinning"]["targets"]["Ha"] == {}
+
+
+def test_wang2022_errors_match_bins():
+    from romanmock.reference_dndz import wang2022_errors
+
+    for line, limit, av in [("Ha", 1e-16, 1.65), ("Ha", 1.5e-16, 1.92), ("OIII_5007", 1e-16, 1.65), ("OIII_5007", 2e-16, 1.92)]:
+        edges, dndz = wang2022_bins(line, limit, av)
+        err = wang2022_errors(line, limit, av)
+        assert err.shape == dndz.shape
+        assert (err > 0).all()
+        rel = err / dndz
+        assert rel.min() > 0.02 and rel.max() < 0.4        # 5-10 % typical, up to ~30 % in the sparsest [O III] bins
+    # spot checks against the paper: Table 1 first row 34725 +- 2775; Table 2 last row, 2e-16, A_V 1.92: 35 +- 11
+    assert wang2022_errors("Ha", 5e-17, 1.65)[0] == 2775
+    assert wang2022_errors("OIII", 2e-16, 1.92)[-1] == 11

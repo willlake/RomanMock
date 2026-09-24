@@ -36,7 +36,7 @@ continuum-subtracted luminosities in erg/s, one column per transition.
 | Plan step | Module | What it does |
 |---|---|---|
 | fluxes | `romanmock.fluxes`, `romanmock.cosmology` | `F = L / (4 pi D_L^2)` with the catalog cosmology from OpenCosmo (`astropy` backend) or `dsps.cosmology.luminosity_distance_to_z` (`dsps` backend; agree to 5e-6) |
-| 1. detectability | `romanmock.sensitivity`, `romanmock.detection` | `lambda_obs = lambda_0 (1+z_rsd)`; `ConstantFluxLimit` (initial model) or `TabulatedFluxLimit` (wavelength dependent); `ThresholdDetection` or `GaussianNoiseDetection` |
+| 1. detectability | `romanmock.sensitivity`, `romanmock.detection` | `lambda_obs = lambda_0 (1+z_rsd)`; `ConstantFluxLimit` (initial model, default 1.5e-16 erg/s/cm²) or `TabulatedFluxLimit` (wavelength dependent); `ThresholdDetection` or `GaussianNoiseDetection` |
 | 2. bitmask | `romanmock.lines`, `romanmock.detection` | bit *i* = feature *i* of a `LineSet`; `n_det = popcount`; ordering written to the run metadata |
 | 3. redshift | `romanmock.confusion`, `romanmock.redshift` | multi-line: `z_assigned = z_rsd` (optional `sigma_z`); single-line: draw identity *j* from `C_ij` (+ fail column), `z_assigned = lambda_i,0 (1+z_rsd)/lambda_j,0 - 1` |
 | 4. samples | `romanmock.selection` | footprint, `redshift_assigned` range, tracer (`membership: assigned` = brightest line, disjoint samples; `detected` = any detected line for multi-line galaxies), outcome quality, population thinning, downsampling with `p_keep = target/mock` |
@@ -142,19 +142,24 @@ the flux limit*, before completeness and purity ("observational efficiency is no
 they are matched to the mock's detected-line populations in bins of true redshift, before any
 assigned-redshift selection (`population_thinning:` in the config; on by default in the baseline).
 Interlopers are then thinned consistently with the population they belong to. The transcription is
-checked against the paper's summary rows by a unit test.
+checked against the paper's summary rows by a unit test, and `wang2022_errors` gives the tabulated ±1σ
+(jackknife + cosmic variance) for plotting.
 
-A target spec is `{reference: wang2022, line: Ha, flux_limit: 1e-16, dust_av: 1.65}` (line and
+A target spec is `{reference: wang2022, line: Ha, flux_limit: 1.5e-16, dust_av: 1.65}` (line and
 flux limit default to the population / the run's constant flux limit), `{file: dndz.txt}` or
 `{z: [...], dndz: [...]}`; the same specs drive the per-sample `downsample` on assigned redshift.
+`romanmock.census.line_census` counts that same population directly from the input mock (flux, bandpass and
+redshift cuts only, several flux limits in one pass, single- versus multi-line split) for a clean comparison
+with the tables; see notebook 06.
+
 `poly_degree` fits a smooth selection function instead of per-bin ratios, so the realisation's
 own radial fluctuations are not divided out. Shortages (target above mock, including empty bins)
-are reported, never filled. For this mock at 1e-16 the Hα targets are attainable for z > 0.8 and
-the [O III] targets for z < 2.85.
+are reported, never filled. For this mock at 1e-16 the Hα targets were attainable for z > 0.8 and
+the [O III] targets for z < 2.85; the default limit is now 1.5e-16 (`romanmock.roman.DEFAULT_LINE_FLUX_LIMIT`).
 
 ## Notebooks
 
-`notebooks/` holds four executed tutorials (regenerate with `python notebooks/build_notebooks.py --execute`;
+`notebooks/` holds six executed tutorials (regenerate with `python notebooks/build_notebooks.py --execute`;
 edit the builder, not the `.ipynb` files):
 
 1. `01_explore_diffsky_catalog.ipynb` – slices, columns, units, rest wavelengths, luminosities to fluxes with `add_line_fluxes`, which lines fall in the grism.
@@ -162,11 +167,13 @@ edit the builder, not the `.ipynb` files):
 3. `03_run_and_build_samples.ipynb` – `RomanMockPipeline.run` on three slices, the parent catalog, contamination and completeness, downsampling a sample to a target dN/dz.
 4. `04_extending_models.ipynb` – tabulated sensitivity, noisy detection, an S/N-dependent confusion model registered for YAML, custom line sets.
 5. `05_full_run.ipynb` – all 67 slices in parallel on an exclusive CPU node, then dN/dz per assigned line, the (z_rsd, z_assigned) plane, contamination, completeness, population thinning to the Wang et al. (2022) forecast and two HLSS-like samples.
+6. `06_dndz_census.ipynb` – `romanmock.census`: dN/dz of galaxies with a line above 1.0e-16 or 1.5e-16 erg/s/cm² inside the grism range at 0.5 < z < 3.0, with no confusion or downsampling, split into single-line and multi-line galaxies and compared with the Wang et al. (2022) tables at the same flux limits.
 
 Memory: one stage-A worker peaks at 4.4 GB on the largest slice; `build_samples` on the full 64 M-galaxy
 parent catalog peaks at about 22 GB while writing a 16 M-galaxy sample. `--workers auto` /
 `romanmock.io.suggest_n_workers()` size the pool from the node's available memory and any cgroup cap
-(NERSC login nodes: 30 GB per user, so at most 5 workers there). Notebook 5 needs a compute node:
+(NERSC login nodes: 30 GB per user, so at most 5 workers there). Sky areas come from the HEALPix
+index at its finest resolution with edge pixels counted half (2062.5 deg² for this mock, nominal 2062.6). Notebook 5 needs a compute node:
 `sbatch scripts/execute_notebooks.sh 05`.
 
 `CLAUDE.md` summarises the layout and conventions for anyone (or any assistant) editing the package.
@@ -188,4 +195,6 @@ parent catalog peaks at about 22 GB while writing a 16 M-galaxy sample. `--worke
 * **Target dN/dz** (comment 5): `TargetDNDZ` table; `mock_dndz` can be smoothed; shortages
   are reported, never filled.
 
-The shipped confusion matrices are explicitly assumed scenarios, not Roman calibrations.
+The default confusion matrix (`romanmock.config.DEFAULT_CONFUSION_ROWS`: true Hα called [O III] 5007 with
+probability 0.5 %, true [O III] 5007 or [S III] 9532 called Hα with 5 %, true Hβ called [O III] 5007 with 5 %,
+no failures) is an explicitly assumed scenario, not a Roman calibration.

@@ -92,3 +92,11 @@ def test_gaussian_noise_detection_scatters_near_limit():
     assert 0.47 < frac < 0.53
     # lines outside the bandpass are never detected, even with noise
     assert not det.detected[:, ROMAN_TRANSITIONS.bit("SIII_9532")].any()
+
+
+def test_default_flux_limit_is_project_default():
+    from romanmock.roman import DEFAULT_LINE_FLUX_LIMIT
+
+    assert DEFAULT_LINE_FLUX_LIMIT == 1.5e-16
+    assert ConstantFluxLimit().flux_limit_value == 1.5e-16
+    assert ThresholdDetection().sensitivity.flux_limit_value == 1.5e-16

@@ -46,10 +46,12 @@ def cmd_lines(args):
 def cmd_example_config(args):
     from .config import RomanMockConfig, SampleConfig, DownsampleConfig
 
+    from .config import default_confusion_rows
+
     cfg = RomanMockConfig()
+    cfg.confusion = {"type": "matrix", "default_p_fail": 0.0, "rows": default_confusion_rows(cfg.line_set)}
     cfg.catalog.path = args.catalog or "/path/to/diffsky/mock"
     cfg.output.dir = args.output or "/path/to/output"
-    cfg.confusion = {"type": "matrix", "rows": {"Ha": {"OIII_5007": 0.05, "fail": 0.05}}, "default_p_fail": 0.02}
     cfg.samples = [SampleConfig(name="halpha_z1p0_1p9", z_min=1.0, z_max=1.9, assigned_lines=["Ha"],
                                 downsample=DownsampleConfig(target_file="target_dndz.txt", nbins=45))]
     sys.stdout.write(cfg.to_yaml())

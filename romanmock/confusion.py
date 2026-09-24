@@ -197,21 +197,69 @@ class WavelengthBinnedConfusion:
                 "matrices": [m.to_dict() for m in self.matrices]}
 
 
+#: Default single-line confusion scenario, P(assigned j | true i), keyed by the feature names
+#: of the ``roman_transitions`` preset. Rows not listed are identity; there are no failures.
+#: E.g. a true Ha line is called [O III] 5007 with probability 0.5 %. This is an assumed
+#: scenario, not a Roman calibration.
+DEFAULT_CONFUSION_ROWS = {
+    "Ha":        {"OIII_5007": 0.005, "fail": 0.0},
+    "OIII_5007": {"Ha": 0.05, "fail": 0.0},
+    "SIII_9532": {"Ha": 0.05, "fail": 0.0},
+    "Hb":        {"OIII_5007": 0.05, "fail": 0.0},
+}
+#: Equivalent feature names in other presets (e.g. ``plan_species`` sums the [O III] doublet).
+_FEATURE_ALIASES = {"OIII_5007": ("OIII_5007", "OIII"), "SIII_9532": ("SIII_9532", "SIII"),
+                    "Ha": ("Ha",), "Hb": ("Hb",)}
+
+
+def default_confusion_rows(line_set) -> dict:
+    """:data:`DEFAULT_CONFUSION_ROWS` translated to the feature names of ``line_set``;
+    lines the set does not contain are dropped (their probability goes back to the diagonal)."""
+    line_set = get_line_set(line_set)
+
+    def resolve(name):
+        for cand in _FEATURE_ALIASES.get(name, (name,)):
+            if cand in line_set:
+                return cand
+        return None
+
+    rows = {}
+    for true_name, row in DEFAULT_CONFUSION_ROWS.items():
+        t = resolve(true_name)
+        if t is None:
+            continue
+        new_row = {}
+        for assigned, p in row.items():
+            a = FAIL_KEY if assigned == FAIL_KEY else resolve(assigned)
+            if a is not None:
+                new_row[a] = p
+        rows[t] = new_row
+    return rows
+
+
+def default_confusion(line_set) -> "ConfusionMatrix":
+    line_set = get_line_set(line_set)
+    return ConfusionMatrix.from_dict(line_set, default_confusion_rows(line_set), default_p_fail=0.0)
+
+
 CONFUSION_MODELS = {}
 
 
 def build_confusion(cfg, line_set) -> ConfusionModel:
     """Build a confusion model from a config dict.
 
-    ``type`` may be ``"identity"`` (optional ``p_fail``), ``"matrix"`` (``rows`` nested
-    dict or ``matrix`` array, or ``file``), or ``"wavelength_binned"`` (``edges`` and a
-    list of ``matrices`` in either of the ``matrix`` forms).
+    ``type`` may be ``"default"`` (:data:`DEFAULT_CONFUSION_ROWS` adapted to the line set),
+    ``"identity"`` (optional ``p_fail``), ``"matrix"`` (``rows`` nested dict or ``matrix``
+    array, or ``file``), or ``"wavelength_binned"`` (``edges`` and a list of ``matrices``
+    in either of the ``matrix`` forms).
     """
     if isinstance(cfg, ConfusionModel):
         return cfg
     line_set = get_line_set(line_set)
     cfg = dict(cfg or {})
-    kind = cfg.pop("type", "identity")
+    kind = cfg.pop("type", "default")
+    if kind == "default":
+        return default_confusion(line_set)
     if kind == "identity":
         return ConfusionMatrix.identity(line_set, p_fail=float(cfg.get("p_fail", 0.0)))
     if kind == "matrix":

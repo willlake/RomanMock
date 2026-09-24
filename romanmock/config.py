@@ -19,6 +19,8 @@ from .lines import DEFAULT_LINE_SET
 from .roman import DEFAULT_LINE_FLUX_LIMIT, GRISM_WAVE_RANGE_ANGSTROM
 
 DEFAULT_PASSTHROUGH = ["ra", "dec", "redshift_true"]
+from .confusion import DEFAULT_CONFUSION_ROWS, default_confusion_rows  # noqa: F401  (re-exported)
+
 #: columns written to analysis-sample files by default (stage B); None = every parent column
 DEFAULT_SAMPLE_COLUMNS = ["ra", "dec", "redshift_true", "redshift_rsd", "redshift_assigned", "id_outcome"]
 
@@ -70,7 +72,7 @@ class OutputConfig:
 class DownsampleConfig:
     """Thin one analysis sample to a target dN/dz of *assigned* redshift.
 
-    ``target`` is a target spec: ``{"reference": "wang2022", "line": "Ha", "flux_limit": 1e-16,
+    ``target`` is a target spec: ``{"reference": "wang2022", "line": "Ha", "flux_limit": 1.5e-16,
     "dust_av": 1.65}`` (line defaults to the sample's first assigned line, flux_limit to the
     run's constant flux limit), ``{"file": "dndz.txt"}`` (two columns z, dN/dz per deg^2) or
     ``{"z": [...], "dndz": [...]}``.
@@ -81,7 +83,7 @@ class DownsampleConfig:
     z_edges: list[float] | None = None
     nbins: int = 40
     area_deg2: float | None = None   # if None, estimated from the HEALPix index (inside the footprint)
-    nside: int = 256
+    nside: int | None = None         # None = finest index resolution, edge pixels counted half
     smooth_bins: float = 1.0
     poly_degree: int | None = None   # smooth selection function: polynomial fit to log dN/dz of the mock
 
@@ -100,7 +102,7 @@ class PopulationThinningConfig:
     z_column: str = "redshift_rsd"   # true redshift (with peculiar velocity) used for the comparison
     bin_width: float = 0.1           # used only for targets without their own bins
     area_deg2: float | None = None
-    nside: int = 256
+    nside: int | None = None         # None = finest index resolution, edge pixels counted half
     smooth_bins: float = 0.0
     poly_degree: int | None = None
     outside_range: str = "keep"      # galaxies with no target / outside the target's z range
@@ -130,7 +132,7 @@ class RomanMockConfig:
     sensitivity: dict = field(default_factory=lambda: {
         "type": "constant", "flux_limit": DEFAULT_LINE_FLUX_LIMIT, "wave_range": list(GRISM_WAVE_RANGE_ANGSTROM)})
     detection: dict = field(default_factory=lambda: {"type": "threshold"})
-    confusion: dict = field(default_factory=lambda: {"type": "identity", "p_fail": 0.0})
+    confusion: dict = field(default_factory=lambda: {"type": "default"})   # DEFAULT_CONFUSION_ROWS adapted to the line set
     redshift: RedshiftConfig = field(default_factory=RedshiftConfig)
     population_thinning: PopulationThinningConfig | None = None
     samples: list[SampleConfig] = field(default_factory=list)

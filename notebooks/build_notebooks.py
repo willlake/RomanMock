@@ -136,7 +136,7 @@ bins = np.linspace(-19, -14.5, 70)
 for name in ["Ha", "OIII_5007", "OII_3727"]:
     ax.hist(np.log10(flux[f"{name}_flux"]), bins=bins, histtype="step", color=plotting.feature_color(name), label=name)
 ax.axvline(np.log10(DEFAULT_LINE_FLUX_LIMIT), color=plotting.TEXT_SECONDARY, lw=1, ls="--")
-ax.text(np.log10(DEFAULT_LINE_FLUX_LIMIT) + 0.05, ax.get_ylim()[1] * 0.95, "1e-16 erg/s/cm²", color=plotting.TEXT_SECONDARY, fontsize=8, va="top")
+ax.text(np.log10(DEFAULT_LINE_FLUX_LIMIT) + 0.05, ax.get_ylim()[1] * 0.95, f"{DEFAULT_LINE_FLUX_LIMIT:.1e} erg/s/cm² (default limit)", color=plotting.TEXT_SECONDARY, fontsize=8, va="top")
 ax.set_xlabel("log10 observed line flux [erg/s/cm²]"); ax.set_ylabel("galaxies")
 ax.set_title("Observed line fluxes at z ≈ 1.2"); ax.legend(); plt.show()'''),
     md('''
@@ -227,7 +227,8 @@ line set; `n_det = popcount(bitmask)`.
 from romanmock import ConstantFluxLimit, ThresholdDetection, detect_lines, unpack_bitmask
 
 rng = np.random.default_rng(0)
-model = ThresholdDetection(ConstantFluxLimit(flux_limit=1e-16, wave_range=(10000.0, 19300.0)))
+from romanmock.roman import DEFAULT_LINE_FLUX_LIMIT
+model = ThresholdDetection(ConstantFluxLimit(flux_limit=DEFAULT_LINE_FLUX_LIMIT, wave_range=(10000.0, 19300.0)))
 det = detect_lines(flux, z_rsd, line_set, model, rng)
 
 print("bitmask dtype", det.bitmask.dtype, "| example bitmasks", det.bitmask[:8])
@@ -254,12 +255,10 @@ is drawn from `C_ij = P(assigned j | true i)`, with an explicit fail column, and
     code('''
 from romanmock import ConfusionMatrix, assign_redshifts, IdOutcome
 
-cm = ConfusionMatrix.from_dict(line_set, {
-    "Ha":        {"OIII_5007": 0.05, "OII_3727": 0.03, "fail": 0.05},
-    "OIII_5007": {"Ha": 0.15, "OII_3727": 0.05, "fail": 0.05},
-    "OII_3727":  {"Ha": 0.15, "OIII_5007": 0.10, "fail": 0.10},
-    "Hb":        {"Ha": 0.30, "OIII_5007": 0.30, "fail": 0.20},
-}, default_p_fail=0.02)
+from romanmock.confusion import DEFAULT_CONFUSION_ROWS
+
+print(DEFAULT_CONFUSION_ROWS)          # the package default: e.g. a true Ha line is called [O III] with probability 0.5 %
+cm = ConfusionMatrix.from_dict(line_set, DEFAULT_CONFUSION_ROWS, default_p_fail=0.0)
 print(cm)
 za = assign_redshifts(det, z_rsd, line_set, cm, rng)
 for o in IdOutcome:
@@ -306,11 +305,12 @@ output columns of the catalog.
 '''),
     code('''
 from romanmock import RomanMockConfig, RomanMockPipeline
+from romanmock.roman import DEFAULT_LINE_FLUX_LIMIT as FLUX_LIMIT
 
 cfg = RomanMockConfig.from_dict({
     "line_set": "roman_transitions",
-    "sensitivity": {"type": "constant", "flux_limit": 1e-16, "wave_range": [10000.0, 19300.0]},
-    "confusion": {"type": "matrix", "default_p_fail": 0.02, "rows": cm.to_dict()["rows"]},
+    "sensitivity": {"type": "constant", "flux_limit": FLUX_LIMIT, "wave_range": [10000.0, 19300.0]},
+    "confusion": {"type": "matrix", "default_p_fail": 0.0, "rows": cm.to_dict()["rows"]},   # same as the package default
     "output": {"store_snr": True},
 })
 pipe = RomanMockPipeline(cfg)
@@ -340,17 +340,15 @@ object drives the CLI. Each slice gets a random stream seeded by `(seed, step)`.
 '''),
     code('''
 from romanmock import RomanMockConfig, RomanMockPipeline
+from romanmock.roman import DEFAULT_LINE_FLUX_LIMIT as FLUX_LIMIT
 
 cfg = RomanMockConfig.from_dict({
     "catalog": {"path": CATALOG, "steps": [148, 219, 224]},   # the intended parent catalog: three slices
     "output": {"dir": os.path.join(WORK, "parent"), "overwrite": False, "store_fluxes": True,   # fluxes are optional; kept here to show them
                "passthrough_columns": ["gal_id", "ra", "dec", "redshift_true", "logsm_obs", "roman_F158"]},
     "line_set": "roman_transitions",
-    "sensitivity": {"type": "constant", "flux_limit": 1e-16, "wave_range": [10000.0, 19300.0]},
-    "confusion": {"type": "matrix", "default_p_fail": 0.02, "rows": {
-        "Ha":        {"OIII_5007": 0.05, "OII_3727": 0.03, "fail": 0.05},
-        "OIII_5007": {"Ha": 0.15, "OII_3727": 0.05, "fail": 0.05},
-        "OII_3727":  {"Ha": 0.15, "OIII_5007": 0.10, "fail": 0.10}}},
+    "sensitivity": {"type": "constant", "flux_limit": FLUX_LIMIT, "wave_range": [10000.0, 19300.0]},
+    # confusion: omitted -> the package default scenario (romanmock.config.DEFAULT_CONFUSION_ROWS)
     "seed": 2026,
 })
 pipe = RomanMockPipeline(cfg)
@@ -570,7 +568,7 @@ class SNRDependentConfusion:
 CONFUSION_MODELS["snr_dependent"] = SNRDependentConfusion
 model = build_confusion({"type": "snr_dependent", "base_rows": {"Ha": {"OIII_5007": 0.05}}, "p0": 0.4}, line_set)
 
-det = detect_lines(flux, z_rsd, line_set, ThresholdDetection(ConstantFluxLimit(1e-16)), rng)
+det = detect_lines(flux, z_rsd, line_set, ThresholdDetection(ConstantFluxLimit()), rng)   # package default limit
 za = assign_redshifts(det, z_rsd, line_set, model, rng)
 single = det.n_det == 1
 snr = det.snr[np.arange(len(z_rsd)), np.maximum(za.line_true, 0)][single]
@@ -624,6 +622,7 @@ The same run from the command line is
     code("""
 import time
 from romanmock import RomanMockConfig, RomanMockPipeline
+from romanmock.roman import DEFAULT_LINE_FLUX_LIMIT as FLUX_LIMIT
 
 from romanmock.io import memory_budget_gb, suggest_n_workers
 
@@ -638,19 +637,18 @@ cfg = RomanMockConfig.from_dict({
     "output": {"dir": OUT_DIR, "overwrite": False,
                "passthrough_columns": ["ra", "dec", "redshift_true"]},          # plus redshift_rsd, redshift_assigned, id_outcome, identification columns
     "line_set": "roman_transitions",
-    "sensitivity": {"type": "constant", "flux_limit": 1e-16, "wave_range": [10000.0, 19300.0]},
+    "sensitivity": {"type": "constant", "flux_limit": FLUX_LIMIT, "wave_range": [10000.0, 19300.0]},
     "detection": {"type": "threshold"},
-    "confusion": {"type": "matrix", "default_p_fail": 0.02, "rows": {      # assumed scenario, not a calibration
-        "Ha":        {"OIII_5007": 0.05, "OII_3727": 0.03, "fail": 0.05},
-        "OIII_5007": {"Ha": 0.15, "OII_3727": 0.05, "fail": 0.05},
-        "OII_3727":  {"Ha": 0.15, "OIII_5007": 0.10, "fail": 0.10},
-        "Hb":        {"Ha": 0.30, "OIII_5007": 0.30, "fail": 0.20}}},
+    # confusion: omitted -> the package default scenario (romanmock.config.DEFAULT_CONFUSION_ROWS):
+    #   true Ha called [O III] 5007 with p = 0.005; true [O III] 5007, [S III] 9532 called Ha with p = 0.05;
+    #   true Hb called [O III] 5007 with p = 0.05; no failures. An assumed scenario, not a calibration.
     "seed": 2026,
 })
 os.makedirs(OUT_DIR, exist_ok=True)
 cfg.to_yaml(os.path.join(OUT_DIR, "config.yaml"))     # reusable with: romanmock run .../config.yaml --workers 32
 pipe = RomanMockPipeline(cfg)
-print(pipe.line_set.describe())"""),
+print(pipe.line_set.describe())
+print(pipe.confusion)"""),
     code("""
 t0 = time.time()
 outputs = pipe.run(n_workers=N_WORKERS)               # existing outputs are skipped (output.overwrite = False)
@@ -698,7 +696,7 @@ for name in ["Ha", "OIII_5007", "OII_3727", "Hb", "OIII_4959", "SIII_9532"]:
     y = dndz(pdata["redshift_assigned"][sel], z_edges, area)
     ax.step(zc, y, where="mid", color=plotting.feature_color(name), label=f"{name} ({sel.sum():,})")
 ax.set_yscale("log"); ax.set_ylim(1, None)
-ax.set_xlabel("redshift_assigned"); ax.set_ylabel("dN/dz per deg²"); ax.set_title("Assigned-line samples, F > 1e-16 erg/s/cm², 1.00–1.93 μm")
+ax.set_xlabel("redshift_assigned"); ax.set_ylabel("dN/dz per deg²"); ax.set_title(f"Assigned-line samples, F > {FLUX_LIMIT:.1e} erg/s/cm², 1.00–1.93 μm")
 ax.legend(fontsize=8); plt.show()"""),
     md("""
 ## True versus assigned redshift
@@ -775,21 +773,21 @@ emitters above a given line-flux limit (Tables 1–2, Galacticus on the UNIT lig
 numbers describe *true emitters before observational efficiency*, so the right quantity to match
 is the mock's detected-line population in bins of true redshift, before any redshift assignment
 or sample selection. `romanmock.reference_dndz` carries the tables; the comparison below uses the
-run's flux limit (1e-16) and the A_V = 1.65 dust model.
+run's flux limit (the package default, 1.5e-16) and the A_V = 1.65 dust model.
 """),
     code("""
 from romanmock.reference_dndz import wang2022_bins
 
 fig, axes = plt.subplots(1, 2, figsize=(12, 4))
 for ax, name in zip(axes, ["Ha", "OIII_5007"]):
-    edges, ref = wang2022_bins(name, 1e-16, 1.65)
-    _, ref192 = wang2022_bins(name, 1e-16, 1.92)
+    edges, ref = wang2022_bins(name, FLUX_LIMIT, 1.65)
+    _, ref192 = wang2022_bins(name, FLUX_LIMIT, 1.92)
     sel = pdata["line_true"] == pipe.line_set.bit(name)
     zc = 0.5 * (edges[1:] + edges[:-1])
     ax.step(zc, dndz(pdata["redshift_rsd"][sel], edges, area), where="mid", color=plotting.feature_color(name), label=f"diffsky mock, {name} brightest detected line")
     ax.step(zc, ref, where="mid", color=plotting.TEXT_PRIMARY, label="Wang+22 A_V=1.65")
     ax.step(zc, ref192, where="mid", color=plotting.TEXT_SECONDARY, ls="--", label="Wang+22 A_V=1.92")
-    ax.set_xlabel("true redshift"); ax.set_ylabel("dN/dz per deg²"); ax.set_title(f"{name} emitters above 1e-16 erg/s/cm²"); ax.legend(fontsize=8)
+    ax.set_xlabel("true redshift"); ax.set_ylabel("dN/dz per deg²"); ax.set_title(f"{name} emitters above {FLUX_LIMIT:.1e} erg/s/cm²"); ax.legend(fontsize=8)
 plt.tight_layout(); plt.show()"""),
     md("""
 The diffsky mock contains several times more Hα emitters than the Galacticus forecast at z > 1
@@ -819,7 +817,7 @@ sample_files"""),
 fig, axes = plt.subplots(1, 2, figsize=(12, 4))
 for ax, path, name in zip(axes, sample_files, ["Ha", "OIII_5007"]):
     d = oc.open(path).select("redshift_assigned", "redshift_rsd", "id_outcome", "line_true").get_data("numpy", wrap_single=True)
-    edges, ref = wang2022_bins(name, 1e-16, 1.65)
+    edges, ref = wang2022_bins(name, FLUX_LIMIT, 1.65)
     zc = 0.5 * (edges[1:] + edges[:-1])
     sel = pdata["line_assigned"] == pipe.line_set.bit(name)
     ax.step(zc, dndz(pdata["redshift_assigned"][sel], edges, area), where="mid", color=plotting.CATEGORICAL[0], label="parent, assigned line (assigned z)")
@@ -848,7 +846,7 @@ thinning cannot fill (the pipeline warns about them).
     code("""
 fig, ax = plt.subplots(figsize=(8, 4.2))
 for name in ["Ha", "OIII_5007"]:
-    edges, ref = wang2022_bins(name, 1e-16, 1.65)
+    edges, ref = wang2022_bins(name, FLUX_LIMIT, 1.65)
     zc = 0.5 * (edges[1:] + edges[:-1])
     sel = pdata["line_true"] == pipe.line_set.bit(name)
     ratio = dndz(pdata["redshift_rsd"][sel], edges, area) / ref
@@ -859,7 +857,7 @@ for name in ["Ha", "OIII_5007"]:
 ax.axhline(1.0, color=plotting.TEXT_SECONDARY, lw=1, ls="--")
 ax.set_yscale("log"); ax.set_ylim(0.1, 20)
 ax.set_xlabel("true redshift"); ax.set_ylabel("mock dN/dz / forecast dN/dz")
-ax.set_title("Detected emitters in the mock relative to the HLSS forecast (F > 1e-16)"); ax.legend(fontsize=8)
+ax.set_title(f"Detected emitters in the mock relative to the HLSS forecast (F > {FLUX_LIMIT:.1e})"); ax.legend(fontsize=8)
 plt.show()"""),
     md("""
 Second, why the [O III] sample is far more contaminated than the confusion matrix alone suggests.
@@ -923,12 +921,190 @@ against the truth (plan section 4). Open them with `opencosmo.open(path)`.
 ]
 
 
+# =====================================================================================
+# 06 - ideal-detection dN/dz census (flux + redshift + bandpass cuts only)
+# =====================================================================================
+NB06 = [
+    md("""
+# 06 — dN/dz of emitters above the flux limit (no confusion, no downsampling)
+
+A census of the mock with only three cuts: the line flux exceeds the limit (1.0e-16 or 1.5e-16 erg/s/cm²),
+the observed line wavelength falls in the Roman grism range (1.00–1.93 μm), and 0.5 < z < 3.0. No confusion
+matrix, no interlopers, no downsampling. This is the population the Wang et al. (2022) tables describe
+(true emitters above the flux limit, "observational efficiency not included"), so it is the cleanest
+mock-versus-forecast comparison.
+
+Each line is counted separately, and galaxies are split by the number of lines of the set that pass the
+cut: exactly one (single-line galaxies, whose redshift would rely on line identification) or more than one
+(multi-line galaxies). `romanmock.census` does the counting slice by slice, in parallel, reusing the pipeline's
+flux and detection code. Run it on a compute node (`sbatch scripts/execute_notebooks.sh 06`) or on a login
+node with a few workers (~15 s per slice per worker).
+"""),
+    code(SETUP),
+    code("""
+import time
+from romanmock.census import LineCensus, line_census
+from romanmock.io import select_files, suggest_n_workers, memory_budget_gb, open_catalog
+from romanmock.reference_dndz import wang2022_bins, wang2022_errors, WANG2022_CITATION
+from romanmock.roman import GRISM_WAVE_RANGE_ANGSTROM
+from romanmock.selection import sky_area_deg2
+
+FLUX_LIMITS = [1.0e-16, 1.5e-16]                              # erg/s/cm², both tabulated by Wang et al. (2022)
+Z_EDGES = np.round(np.arange(0.5, 3.0 + 1e-9, 0.1), 2)         # the tables' 0.1-wide bins
+ZC = 0.5 * (Z_EDGES[1:] + Z_EDGES[:-1])
+# every line of the set is counted; lines with no galaxy above the limit are left out of the legends and table
+CENSUS_FILE = os.path.join(WORK, "census_z0p5_3p0.npz")
+
+files = select_files(CATALOG, z_min=Z_EDGES[0], z_max=Z_EDGES[-1])
+N_WORKERS = suggest_n_workers(max_workers=32, per_worker_gb=4.0)
+print(f"{len(files)} slices overlap 0.5 < z < 3.0; memory budget {memory_budget_gb():.0f} GB -> {N_WORKERS} worker(s)")
+print(f"bandpass {GRISM_WAVE_RANGE_ANGSTROM} Å; binned in redshift_obs (peculiar velocity included), D_L at redshift_true")"""),
+    code("""
+if os.path.exists(CENSUS_FILE):
+    census = LineCensus.load(CENSUS_FILE)
+    print(f"loaded {CENSUS_FILE} ({len(census.steps)} slices)")
+else:
+    t0 = time.time()
+    census = line_census(CATALOG, FLUX_LIMITS, Z_EDGES, line_set="roman_transitions", n_workers=N_WORKERS, verbose=False)
+    census.save(CENSUS_FILE)
+    print(f"{len(census.steps)} slices in {(time.time() - t0) / 60:.1f} min -> {CENSUS_FILE}")
+print(f"{census.n_all.sum():,} galaxies with 0.5 < z < 3.0")"""),
+    md("""
+## Sky area
+
+Occupied HEALPix pixels of the input lightcone at the finest index level, edge pixels counted half. All
+slices in the redshift range are opened together (a single slice is too sparse: empty pixels inside the
+footprint would be mistaken for edges and bias the area low by a few per cent).
+"""),
+    code("""
+t0 = time.time()
+area = sky_area_deg2(open_catalog(files))
+print(f"area = {area:.1f} deg² (nominal 5 % of the sky = {0.05 * 41252.96:.1f}), {time.time() - t0:.0f} s")"""),
+    md("""
+## dN/dz per line at both flux limits
+
+Solid steps: the mock. Dashed steps with shaded ±1σ bands: Wang et al. (2022) Tables 1–2 (Galacticus, A_V = 1.65)
+for Hα and [O III] 5007 at the same flux limit; the tabulated uncertainties combine jackknife resampling and cosmic
+variance. Every galaxy with the line above the limit is counted, whatever its other lines do. All nine lines of
+the `roman_transitions` set are counted; lines with fewer than one galaxy per deg² above the limit (the auroral
+[O III] 4363, never, and [S III] 6312, ~150 galaxies in the whole footprint) are left out of the legends and the table.
+"""),
+    code("""
+fig, axes = plt.subplots(1, 2, figsize=(12, 4.6), sharey=True)
+for ax, lim in zip(axes, FLUX_LIMITS):
+    for name in census.line_names:
+        y = census.dndz(name, lim, area)
+        if census.integrated(name, lim, area) < 1:          # auroral lines: a handful of galaxies in the whole footprint
+            continue
+        ax.step(ZC, y, where="mid", color=plotting.feature_color(name), label=f"{name} ({census.integrated(name, lim, area):,.0f} /deg²)")
+    for name in ["Ha", "OIII_5007"]:
+        edges, ref = wang2022_bins(name, lim)
+        err = wang2022_errors(name, lim)
+        zc_ref = 0.5 * (edges[1:] + edges[:-1])
+        ax.step(zc_ref, ref, where="mid", color=plotting.feature_color(name), ls="--", lw=1.2, label=f"{name} Wang+22 ±1σ")
+        ax.fill_between(edges, np.append(ref - err, ref[-1] - err[-1]), np.append(ref + err, ref[-1] + err[-1]),
+                        step="post", color=plotting.feature_color(name), alpha=0.18, lw=0)
+    ax.set_yscale("log"); ax.set_ylim(10, None); ax.set_xlim(Z_EDGES[0], Z_EDGES[-1])
+    ax.set_xlabel("redshift"); ax.set_title(f"F > {lim:.1e} erg/s/cm²")
+    ax.legend(fontsize=7.5, ncol=2)
+axes[0].set_ylabel("dN/dz per deg²")
+fig.suptitle("Emitters above the flux limit in 1.00–1.93 μm, no confusion, no downsampling", y=1.02)
+plt.show()"""),
+    code("""
+# integrated counts over 0.5 < z < 3.0: per deg² and over the whole footprint
+from astropy.table import Table
+
+rows = []
+for lim in FLUX_LIMITS:
+    for name in census.line_names:
+        tot = census.integrated(name, lim, area)
+        if tot < 1:
+            continue
+        single = census.integrated(name, lim, area, "single")
+        rows.append({"flux_limit": f"{lim:.1e}", "line": name, "N/deg²": round(tot), "single-line /deg²": round(single),
+                     "multi-line /deg²": round(tot - single), "single fraction": round(single / tot, 3),
+                     "N total": int(census.hist(name, lim).sum())})
+table = Table(rows=rows)
+table.write(os.path.join(WORK, "census_z0p5_3p0.csv"), format="csv", overwrite=True)
+table"""),
+    md("""
+## Single-line versus multi-line galaxies
+
+For each line: all galaxies with the line above the limit (solid), those with **only** that line above the
+limit inside the bandpass (dashed), and those with at least one other line above it (dotted). The single-line
+population is the one exposed to misidentification; the multi-line one gets an unambiguous redshift.
+"""),
+    code("""
+SHOW = ["Ha", "OIII_5007", "OII_3727", "Hb"]
+fig, axes = plt.subplots(2, 2, figsize=(12, 8), sharex=True)
+for ax, name in zip(axes.ravel(), SHOW):
+    for lim, col in zip(FLUX_LIMITS, [plotting.CATEGORICAL[0], plotting.CATEGORICAL[1]]):
+        for which, ls in [("all", "-"), ("single", "--"), ("multi", ":")]:
+            y = census.dndz(name, lim, area, which)
+            ax.step(ZC, y, where="mid", color=col, ls=ls, label=f"F > {lim:.1e}, {which}")
+    ax.set_yscale("log"); ax.set_ylim(10, None); ax.set_xlim(Z_EDGES[0], Z_EDGES[-1])
+    ax.set_title(name); ax.set_ylabel("dN/dz per deg²")
+    ax.legend(fontsize=7, ncol=2)
+for ax in axes[1]:
+    ax.set_xlabel("redshift")
+plt.tight_layout(); plt.show()"""),
+    code("""
+fig, ax = plt.subplots(figsize=(9, 4.4))
+for name in SHOW:
+    for lim, ls in zip(FLUX_LIMITS, ["-", "--"]):
+        ax.step(ZC, census.single_fraction(name, lim), where="mid", color=plotting.feature_color(name), ls=ls,
+                label=f"{name}, F > {lim:.1e}")
+ax.set_ylim(0, 1); ax.set_xlim(Z_EDGES[0], Z_EDGES[-1])
+ax.set_xlabel("redshift"); ax.set_ylabel("fraction with no other line above the limit")
+ax.set_title("Single-line fraction of each line's emitters"); ax.legend(fontsize=7.5, ncol=2); plt.show()"""),
+    md("""
+Reading the single-line fraction: at z < 1 most Hα emitters also have [S III] 9532 (and 9069) above the limit,
+so only ~30 % are single-line. Once the [S III] lines leave the grism (z ≈ 1.0–1.1) the remaining companions,
+[O III] 5007 and Hβ, pass the flux cut for a minority of Hα emitters, and the single-line fraction climbs to
+~0.8–0.85 by z ≈ 1.9. [O III] 5007 emitters are almost never single-line while Hα is in the bandpass (z < 1.94),
+and ~85–90 % single-line beyond it, where only Hβ, [O III] 4959 and [O II] could accompany the line.
+"""),
+    md("""
+## Ratio to the Wang et al. (2022) forecast
+
+Mock over forecast per 0.1 bin, for the total population of each line (the tables do not split by line multiplicity).
+Error bars propagate the tabulated ±1σ of the forecast; the mock's own Poisson error is negligible in comparison.
+"""),
+    code("""
+fig, ax = plt.subplots(figsize=(9, 4.4))
+for name in ["Ha", "OIII_5007"]:
+    for lim, ls in zip(FLUX_LIMITS, ["-", "--"]):
+        edges, ref = wang2022_bins(name, lim)
+        zc_ref = np.round(0.5 * (edges[1:] + edges[:-1]), 3)
+        mock = census.dndz(name, lim, area)
+        sel = np.isin(np.round(ZC, 3), zc_ref)
+        ratio = mock[sel] / ref
+        ratio_err = ratio * wang2022_errors(name, lim) / ref
+        ax.step(zc_ref, ratio, where="mid", color=plotting.feature_color(name), ls=ls, label=f"{name}, F > {lim:.1e}")
+        ax.errorbar(zc_ref, ratio, yerr=ratio_err, fmt="none", ecolor=plotting.feature_color(name), elinewidth=0.9, capsize=2)
+        lo, hi = edges[0], edges[-1]
+        print(f"{name:10s} F > {lim:.1e}: mock/Wang+22 over {lo:.1f} < z < {hi:.1f} = "
+              f"{census.integrated(name, lim, area, z_range=(lo, hi)) / (ref * np.diff(edges)).sum():.2f}  "
+              f"(per-bin range {ratio.min():.2f}–{ratio.max():.2f})")
+ax.axhline(1, color=plotting.TEXT_SECONDARY, lw=0.8)
+ax.set_yscale("log"); ax.set_xlim(Z_EDGES[0], Z_EDGES[-1])
+ax.set_xlabel("redshift"); ax.set_ylabel("mock / Wang et al. (2022)")
+ax.set_title("Ratio to Wang et al. (2022), A_V = 1.65"); ax.legend(fontsize=8); plt.show()"""),
+    md("""
+Files written to `WORK`: `census_z0p5_3p0.npz` (all counts, reloadable with `LineCensus.load`) and
+`census_z0p5_3p0.csv` (the integrated table). To add a flux limit or change the bins, delete the `.npz` and rerun;
+`line_census` accepts any list of limits, tabulated or not.
+"""),
+]
+
+
 NOTEBOOKS = {
     "01_explore_diffsky_catalog.ipynb": NB01,
     "02_pipeline_step_by_step.ipynb": NB02,
     "03_run_and_build_samples.ipynb": NB03,
     "04_extending_models.ipynb": NB04,
     "05_full_run.ipynb": NB05,
+    "06_dndz_census.ipynb": NB06,
 }
 
 

@@ -41,6 +41,7 @@ follows `/global/u2/w/willlake/Projects/Roman/RomanMock/Roman_Mock_Plan_and_Comm
 | `selection.py` | footprints, `SampleDefinition`, `downsample_to_dndz`, `sky_area_deg2` |
 | `pipeline.py` | `RomanMockPipeline`: `process_arrays` (pure numpy) → `process_dataset` → `run` / `build_samples` |
 | `config.py`, `cli.py`, `io.py`, `diagnostics.py` | YAML config dataclasses, CLI, OpenCosmo I/O, checks |
+| `census.py` | `line_census` / `LineCensus`: dN/dz of emitters above a flux limit in the bandpass, split single/multi-line, no confusion (notebook 06; the population Wang et al. tabulate) |
 
 - Keep the physics in array-level functions (`process_arrays` and below) that take dicts of numpy
   arrays; only `process_dataset`/`run` touch OpenCosmo. Add tests at the array level.
@@ -49,7 +50,13 @@ follows `/global/u2/w/willlake/Projects/Roman/RomanMock/Roman_Mock_Plan_and_Comm
   `if type == ...` branches inside the pipeline.
 - A `LineSet` fixes the bit ordering; never reorder presets (existing outputs depend on it).
   Add new presets instead.
-- Confusion matrices ship as assumed scenarios only; never describe them as Roman calibrations.
+- Confusion matrices ship as assumed scenarios only; never describe them as Roman calibrations. The default
+  (`confusion: {type: default}`) is `romanmock.confusion.DEFAULT_CONFUSION_ROWS` (Ha->OIII_5007 0.5 %,
+  OIII_5007->Ha 5 %, SIII_9532->Ha 5 %, Hb->OIII_5007 5 %, no failures), translated to the line set's names.
+- Sky area: `sky_area_deg2` uses the finest HEALPix index level with at least `min_per_pixel` (50) galaxies
+  per occupied pixel, edge pixels counted half (2062.5 deg^2 for this mock = 5 % of the sky); plain counting
+  at nside 256 overestimates by 2.5 %, and a single sparse slice at nside 1024 underestimates by 5 % (holes
+  look like edges), so estimate the area from the whole lightcone or the parent catalog, not one slice.
 - Outcome codes (`IdOutcome`) and output column names are part of the file format; changing
   them requires bumping `_version.py` and the metadata sidecar. Since 0.2.0 the redshift columns
   are `redshift_true`, `redshift_rsd` (input `redshift_obs`, peculiar velocity included) and
@@ -83,6 +90,8 @@ follows `/global/u2/w/willlake/Projects/Roman/RomanMock/Roman_Mock_Plan_and_Comm
   populations in true redshift (`population_thinning`), not to assigned-redshift samples. A test
   checks the transcription against the paper's summary rows; keep it when editing the numbers.
 - Only the six tabulated flux limits are valid; there is no interpolation in flux limit on purpose.
+- `wang2022_errors` returns the tables' +-1 sigma (jackknife + cosmic variance); both central values and errors
+  were checked bin by bin against the arXiv LaTeX source (e-print 2110.01829, tables `tab:Halpha`/`tab:OIII`).
 - The diffsky mock has 2-6x more Hα emitters than the Galacticus forecast at z > 1.1 and ~3x more
   [O III]; at z < 0.8 it has fewer Hα emitters (shortage warnings there are expected).
 
