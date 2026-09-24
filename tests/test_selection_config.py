@@ -21,7 +21,7 @@ def _parent(n=50000, seed=0):
     z[outcome == 0] = np.nan
     z[outcome == 4] = np.nan
     return {
-        "z_obs": z,
+        "redshift_assigned": z,
         "id_outcome": outcome,
         "line_assigned": rng.choice([-1, 0, 2], size=n).astype(np.int8),
         "n_det": rng.integers(0, 4, n).astype(np.uint8),
@@ -37,7 +37,7 @@ def test_sample_mask_cuts():
                          extra_cuts={"logsm_obs": [9.5, None]})
     m = sample_mask(d, ROMAN_TRANSITIONS, s)
     assert m.any()
-    assert np.all((d["z_obs"][m] >= 1.0) & (d["z_obs"][m] <= 2.0))
+    assert np.all((d["redshift_assigned"][m] >= 1.0) & (d["redshift_assigned"][m] <= 2.0))
     assert np.all(d["line_assigned"][m] == 0)
     assert np.all(np.isin(d["id_outcome"][m], [1, 2, 3]))
     assert np.all(d["ra"][m] <= 45) and np.all(d["logsm_obs"][m] >= 9.5)

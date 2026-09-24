@@ -40,7 +40,7 @@ class IdOutcome(IntEnum):
 
 @dataclass
 class RedshiftAssignment:
-    z_obs: np.ndarray          # (n,) assigned redshift, NaN when none
+    z_assigned: np.ndarray     # (n,) assigned redshift, NaN when none
     line_true: np.ndarray      # (n,) int8: index of the (brightest) detected feature, -1 if none
     line_assigned: np.ndarray  # (n,) int8: assigned identity, -1 if none/fail
     outcome: np.ndarray        # (n,) int8: IdOutcome
@@ -48,7 +48,7 @@ class RedshiftAssignment:
 
 class MultiLineModel(Protocol):
     def assign(self, det: DetectionResult, z_rsd: np.ndarray, sel: np.ndarray, rng: np.random.Generator) -> np.ndarray:
-        """Return z_obs for the galaxies selected by the boolean mask ``sel``."""
+        """Return the assigned redshift for the galaxies selected by the boolean mask ``sel``."""
         ...
 
 
@@ -147,7 +147,7 @@ def assign_redshifts(
         outcome[single] = out.astype(np.int8)
 
     return RedshiftAssignment(
-        z_obs=z_obs,
+        z_assigned=z_obs,
         line_true=line_true.astype(np.int8),
         line_assigned=line_assigned.astype(np.int8),
         outcome=outcome,

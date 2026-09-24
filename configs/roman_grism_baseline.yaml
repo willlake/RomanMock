@@ -15,9 +15,10 @@ output:
   tag: romanmock                  # output files are lc_cores-<step>.<tag>.hdf5
   overwrite: false
   keep_undetected: false          # drop galaxies with line_bitmask == 0
-  passthrough_columns: [gal_id, ra, dec, redshift_true, redshift_obs, logsm_obs, logssfr_obs,
-                        roman_F106, roman_F129, roman_F158, roman_F184, roman_Grism_1stOrder, av]
-  store_fluxes: true
+  passthrough_columns: [ra, dec, redshift_true]   # copied from the input; add gal_id, logsm_obs, roman_F158, ... if needed
+  store_identification: true      # line_bitmask, n_det, line_true, line_assigned (needed by `select` and the diagnostics)
+  sample_columns: [ra, dec, redshift_true, redshift_rsd, redshift_assigned, id_outcome]   # columns of the sample files (null = all)
+  store_fluxes: false
   store_wave_obs: false
   store_snr: false
   store_measured_flux: false
@@ -33,7 +34,7 @@ flux:
 
 sensitivity:                      # initial model: constant threshold inside the grism bandpass
   type: constant
-  flux_limit: 1.0e-16             # erg/s/cm^2
+  flux_limit: 1.5e-16             # erg/s/cm^2
   wave_range: [10000.0, 19300.0]  # Angstrom (1.00-1.93 um)
   # wavelength-dependent alternative:
   # type: tabulated
@@ -45,12 +46,12 @@ detection:
 
 confusion:                        # assumed scenario, not a calibrated Roman prediction
   type: matrix
-  default_p_fail: 0.02            # rows not listed: identity with this failure probability
+  default_p_fail: 0.0            # rows not listed: identity with this failure probability
   rows:
-    Ha:        {OIII_5007: 0.03, OII_3727: 0.02, fail: 0.05}
-    OIII_5007: {Ha: 0.10, OII_3727: 0.03, fail: 0.05}
-    OII_3727:  {Ha: 0.15, OIII_5007: 0.10, fail: 0.10}
-    Hb:        {Ha: 0.30, OIII_5007: 0.30, fail: 0.20}
+    Ha:        {OIII_5007: 0.03, OII_3727: 0.02, fail: 0.0}
+    OIII_5007: {Ha: 0.10, OII_3727: 0.03, fail: 0.0}
+    OII_3727:  {Ha: 0.15, OIII_5007: 0.10, fail: 0.0}
+    Hb:        {Ha: 0.30, OIII_5007: 0.30, fail: 0.0}
   # alternatives:
   # type: identity
   # p_fail: 0.0
@@ -59,7 +60,7 @@ confusion:                        # assumed scenario, not a calibrated Roman pre
   # matrices: [{rows: {...}}, {file: confusion_red.yaml}]
 
 redshift:
-  rsd_column: redshift_obs        # z including peculiar velocity: sets lambda_obs and z_obs
+  rsd_column: redshift_obs        # input column with peculiar velocity; written out as redshift_rsd
   sigma_z: 0.0                    # optional Gaussian error sigma_z (1+z) for multi-line redshifts
   context_columns: []             # passthrough columns forwarded to the confusion model (e.g. roman_F158)
 
@@ -73,7 +74,7 @@ population_thinning:
     Ha:        {reference: wang2022, dust_av: 1.65}
     OIII_5007: {reference: wang2022, dust_av: 1.65}
   by: line_true              # population membership: brightest detected feature
-  z_column: redshift_obs     # true redshift (with peculiar velocity)
+  z_column: redshift_rsd     # true redshift (with peculiar velocity)
   smooth_bins: 0.0
   poly_degree: null          # e.g. 4 for a smooth selection function instead of per-bin ratios
   outside_range: keep        # galaxies outside the tabulated z range / without a target are kept
@@ -85,7 +86,7 @@ samples:
     outcomes: [MULTI_LINE, SINGLE_CORRECT, SINGLE_MISID]   # what an observer keeps
     assigned_lines: [Ha]                                    # tracer: galaxies *assigned* Ha
     footprint: null                                         # or {type: box, ra_min: 0, ra_max: 45, dec_min: 55, dec_max: 65}
-    downsample: null                                        # per-sample thinning on z_obs, e.g. {target: {reference: wang2022}, nbins: 45}
+    downsample: null                                        # per-sample thinning on redshift_assigned, e.g. {target: {reference: wang2022}, nbins: 45}
   - name: oiii_z2p0_2p9
     z_min: 2.0
     z_max: 2.9

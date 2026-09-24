@@ -9,7 +9,7 @@ from romanmock.pipeline import RomanMockPipeline
 
 pipe = RomanMockPipeline.from_yaml(sys.argv[1])
 parent = pipe.open_parent()
-cols = ["z_obs", "redshift_obs", "id_outcome", "n_det", "line_true", "line_assigned"]
+cols = ["redshift_assigned", "redshift_rsd", "id_outcome", "n_det", "line_true", "line_assigned"]
 data = parent.select(*cols).get_data("numpy", wrap_single=True)
 
 print(outcome_summary(data))

@@ -52,7 +52,8 @@ from .selection import (
 )
 from .sensitivity import ConstantFluxLimit, build_detection, build_sensitivity
 
-RESULT_COLUMNS = ("line_bitmask", "n_det", "line_true", "line_assigned", "id_outcome", "z_obs")
+IDENTIFICATION_COLUMNS = ("line_bitmask", "n_det", "line_true", "line_assigned")
+RESULT_COLUMNS = ("redshift_rsd", "redshift_assigned", "id_outcome", *IDENTIFICATION_COLUMNS)
 
 
 class RomanMockPipeline:
@@ -106,7 +107,8 @@ class RomanMockPipeline:
         d["line_true"] = "Index of the brightest detected feature (-1 if none)"
         d["line_assigned"] = "Feature index assigned by the redshift identification (-1 = none / failed)"
         d["id_outcome"] = "Identification outcome: " + IdOutcome.describe()
-        d["z_obs"] = "Assigned (measured) redshift; NaN when no reliable redshift"
+        d["redshift_assigned"] = "Assigned (measured) redshift; NaN when no reliable redshift"
+        d["redshift_rsd"] = f"True redshift including the line-of-sight peculiar velocity (copy of {self.config.redshift.rsd_column})"
         return d
 
     # ------------------------------------------------------------------------------
@@ -134,12 +136,13 @@ class RomanMockPipeline:
                 out[f"{feat.name}_snr"] = det.snr[:, i]
             if cfg.output.store_measured_flux:
                 out[f"{feat.name}_flux_measured"] = det.flux_measured[:, i]
-        out["line_bitmask"] = det.bitmask
+        out["redshift_rsd"] = z_rsd
+        out["redshift_assigned"] = za.z_assigned
+        out["id_outcome"] = za.outcome
+        out["line_bitmask"] = det.bitmask          # always computed: needed to drop undetected rows
         out["n_det"] = det.n_det
         out["line_true"] = za.line_true
         out["line_assigned"] = za.line_assigned
-        out["id_outcome"] = za.outcome
-        out["z_obs"] = za.z_obs
         return out
 
     # ------------------------------------------------------------------------------
@@ -161,6 +164,8 @@ class RomanMockPipeline:
             keep = np.where(result["line_bitmask"] > 0)[0]
             base = base.take_rows(keep)
             result = {k: v[keep] for k, v in result.items()}
+        if not cfg.output.store_identification:
+            result = {k: v for k, v in result.items() if k not in IDENTIFICATION_COLUMNS}
         descriptions = self.column_descriptions()
         new_cols = {}
         for name, arr in result.items():
@@ -283,7 +288,7 @@ class RomanMockPipeline:
             "open_kwargs": dict(cfg.catalog.open_kwargs),
             "passthrough_columns": list(cfg.output.passthrough_columns),
             "keep_undetected": cfg.output.keep_undetected,
-            "store": {k: getattr(cfg.output, k) for k in ("store_fluxes", "store_wave_obs", "store_snr", "store_measured_flux")},
+            "store": {k: getattr(cfg.output, k) for k in ("store_identification", "store_fluxes", "store_wave_obs", "store_snr", "store_measured_flux")},
         }
 
     def config_hash(self) -> str:
@@ -417,7 +422,10 @@ class RomanMockPipeline:
                 assigned_lines=scfg.assigned_lines, membership=scfg.membership, n_det_min=scfg.n_det_min,
                 footprint=build_footprint(scfg.footprint), extra_cuts=scfg.extra_cuts,
             )
-            need = ["z_obs", "id_outcome", "line_assigned", "line_bitmask", "n_det", "ra", "dec", *scfg.extra_cuts.keys()]
+            need = ["redshift_assigned", "id_outcome", "line_assigned", "line_bitmask", "n_det", "ra", "dec", *scfg.extra_cuts.keys()]
+            missing = [c for c in need if c not in parent.columns]
+            if missing:
+                raise KeyError(f"parent catalog lacks {missing}; stage A must be run with output.store_identification=true")
             data = parent.select(*dict.fromkeys(need)).get_data("numpy", wrap_single=True)
             keep = sample_mask(data, self.line_set, sdef)
             if base_keep is not None:
@@ -435,7 +443,7 @@ class RomanMockPipeline:
                     area = dcfg.area_deg2
                 else:  # area of the lightcone coverage inside the sample footprint
                     area = sky_area_deg2(parent, dcfg.nside, footprint=sdef.footprint)
-                z_sel = data["z_obs"][keep]
+                z_sel = data["redshift_assigned"][keep]
                 if dcfg.z_edges is not None:
                     z_edges = np.asarray(dcfg.z_edges, dtype=float)
                 else:
@@ -464,6 +472,12 @@ class RomanMockPipeline:
                 warnings.warn(f"sample {scfg.name!r} is empty; previous output removed, metadata records the empty result")
                 continue
             out = parent.take_rows(np.where(keep)[0])
+            if cfg.output.sample_columns:
+                cols = [c for c in cfg.output.sample_columns if c in out.columns]
+                absent = sorted(set(cfg.output.sample_columns) - set(cols))
+                if absent:
+                    warnings.warn(f"sample columns not in the parent catalog are skipped: {absent}")
+                out = out.select(*cols)
             write_dataset(out_path, out, overwrite=True)
             if p_keep is not None:
                 meta["p_keep"] = p_keep.tolist()

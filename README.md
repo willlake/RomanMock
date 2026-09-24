@@ -38,8 +38,8 @@ continuum-subtracted luminosities in erg/s, one column per transition.
 | fluxes | `romanmock.fluxes`, `romanmock.cosmology` | `F = L / (4 pi D_L^2)` with the catalog cosmology from OpenCosmo (`astropy` backend) or `dsps.cosmology.luminosity_distance_to_z` (`dsps` backend; agree to 5e-6) |
 | 1. detectability | `romanmock.sensitivity`, `romanmock.detection` | `lambda_obs = lambda_0 (1+z_rsd)`; `ConstantFluxLimit` (initial model) or `TabulatedFluxLimit` (wavelength dependent); `ThresholdDetection` or `GaussianNoiseDetection` |
 | 2. bitmask | `romanmock.lines`, `romanmock.detection` | bit *i* = feature *i* of a `LineSet`; `n_det = popcount`; ordering written to the run metadata |
-| 3. redshift | `romanmock.confusion`, `romanmock.redshift` | multi-line: `z_obs = z_rsd` (optional `sigma_z`); single-line: draw identity *j* from `C_ij` (+ fail column), `z_obs = lambda_i,0 (1+z_rsd)/lambda_j,0 - 1` |
-| 4. samples | `romanmock.selection` | footprint, `z_obs` range, tracer (`membership: assigned` = brightest line, disjoint samples; `detected` = any detected line for multi-line galaxies), outcome quality, population thinning, downsampling with `p_keep = target/mock` |
+| 3. redshift | `romanmock.confusion`, `romanmock.redshift` | multi-line: `z_assigned = z_rsd` (optional `sigma_z`); single-line: draw identity *j* from `C_ij` (+ fail column), `z_assigned = lambda_i,0 (1+z_rsd)/lambda_j,0 - 1` |
+| 4. samples | `romanmock.selection` | footprint, `redshift_assigned` range, tracer (`membership: assigned` = brightest line, disjoint samples; `detected` = any detected line for multi-line galaxies), outcome quality, population thinning, downsampling with `p_keep = target/mock` |
 | checks | `romanmock.diagnostics` | empirical confusion, contamination fraction `f_{i->j}(B)`, detection efficiency vs a reference population, identification efficiency given detection, final-sample completeness, `dN/dz` |
 
 ### Line features and bit ordering
@@ -73,29 +73,32 @@ YAML `line_set` entry defines a new ordering. Rest wavelengths are taken from th
 
 Stage A writes one OpenCosmo file per input slice, `lc_cores-<step>.<tag>.hdf5`, that
 `opencosmo.open(*files)` reassembles into a Lightcone (header, cosmology and HEALPix index
-are preserved). Columns: the configured passthrough columns (defaults `gal_id, ra, dec,
-redshift_true, redshift_obs`), `<feature>_flux` (erg/s/cm^2), and
+are preserved). The default columns are
 
 | column | meaning |
 |---|---|
-| `line_bitmask` (uint32) | detected features, bit *i* = feature *i* |
+| `ra`, `dec` | position (deg), copied from the input |
+| `redshift_true` | cosmological redshift, copied from the input |
+| `redshift_rsd` | true redshift including the line-of-sight peculiar velocity (the plan's z_rsd; copy of the input `redshift_obs`) |
+| `redshift_assigned` | redshift assigned by the identification procedure, NaN when no reliable redshift |
+| `id_outcome` (int8) | 0 NOT_DETECTED, 1 MULTI_LINE, 2 SINGLE_CORRECT, 3 SINGLE_MISID (interloper), 4 SINGLE_FAILED |
+| `line_bitmask` (uint32) | detected features, bit *i* = feature *i* (`output.store_identification`) |
 | `n_det` (uint8) | `popcount(line_bitmask)` |
 | `line_true` (int8) | index of the brightest detected feature, -1 if none |
 | `line_assigned` (int8) | identity assigned by the redshift procedure, -1 = none/failed |
-| `id_outcome` (int8) | 0 NOT_DETECTED, 1 MULTI_LINE, 2 SINGLE_CORRECT, 3 SINGLE_MISID, 4 SINGLE_FAILED |
-| `z_obs` (float64) | assigned redshift, NaN when no reliable redshift |
 
-Optional columns: `<feature>_wave_obs`, `<feature>_snr`, `<feature>_flux_measured`.
-A `<tag>_metadata.yaml` sidecar records the configuration, the bit ordering, the outcome
-codes, the model parameters, the resolved input files and a hash of the scientific
-configuration. A `<tag>_manifest.yaml` lists every completed slice (input file and size,
-output, row count); each output file also carries the hash in its root attributes. Reruns
-with the same configuration reuse completed slices; a different configuration is refused
-unless `output.overwrite` is set, in which case the old outputs are discarded. Stage B opens
-only slices recorded in the manifest, checks the hash, and refuses an incomplete parent catalog
-unless `--allow-partial` / `allow_partial=True`. It writes `samples/<name>.hdf5` (+ metadata with
-`p_keep` per bin when thinning); an empty selection removes a stale sample file and records
-`empty: true`.
+OpenCosmo adds its own `redshift` column (equal to `redshift_true`). `output.passthrough_columns`
+copies further input columns (`gal_id`, `logsm_obs`, `roman_F158`, ...); `store_fluxes`,
+`store_wave_obs`, `store_snr`, `store_measured_flux` add per-feature columns (`<feature>_flux` in
+erg/s/cm^2, ...). A `<tag>_metadata.yaml` sidecar records the configuration, the bit ordering, the
+outcome codes and the model parameters, and `<tag>_manifest.yaml` the completed slices and the
+configuration hash.
+
+Stage B writes `samples/<name>.hdf5` with `output.sample_columns` (default `ra, dec,
+redshift_true, redshift_rsd, redshift_assigned, id_outcome`; `null` keeps every parent column),
+plus a metadata file with `p_keep` per bin when thinning was applied. Note that the diffsky
+input column `redshift_obs` is z_rsd, not a measured redshift; it is never written under that
+name to avoid confusion with the assigned redshift.
 
 ## Usage
 
@@ -105,6 +108,7 @@ romanmock example-config --catalog DIR --output OUT > my.yaml
 romanmock run configs/roman_grism_baseline.yaml   # stage A over all configured slices
 romanmock run my.yaml --steps 219 224             # a subset of slices (job arrays: scripts/run_slices.sh)
 romanmock run my.yaml --workers 32                # whole mock on one exclusive CPU node (one slice per process)
+romanmock run my.yaml --workers auto              # fit the memory budget (node memory or the 30 GB login-node cap)
 romanmock summary my.yaml                         # outcome counts + empirical confusion
 romanmock select my.yaml                          # stage B: analysis samples
 ```
@@ -157,10 +161,13 @@ edit the builder, not the `.ipynb` files):
 2. `02_pipeline_step_by_step.ipynb` – fluxes, detection and bitmask, confusion matrix, redshift assignment on arrays; input versus empirical confusion.
 3. `03_run_and_build_samples.ipynb` – `RomanMockPipeline.run` on three slices, the parent catalog, contamination and completeness, downsampling a sample to a target dN/dz.
 4. `04_extending_models.ipynb` – tabulated sensitivity, noisy detection, an S/N-dependent confusion model registered for YAML, custom line sets.
-5. `05_full_run.ipynb` – all 67 slices in parallel on an exclusive CPU node, then dN/dz per assigned line, the (z_true, z_obs) plane, contamination, completeness, population thinning to the Wang et al. (2022) forecast and two HLSS-like samples.
+5. `05_full_run.ipynb` – all 67 slices in parallel on an exclusive CPU node, then dN/dz per assigned line, the (z_rsd, z_assigned) plane, contamination, completeness, population thinning to the Wang et al. (2022) forecast and two HLSS-like samples.
 
-Memory: `build_samples` on the full 64 M-galaxy parent catalog peaks at roughly 16 GB and writing a
-16 M-galaxy sample at a few GB more; do not run two such jobs at once on a shared node.
+Memory: one stage-A worker peaks at 4.4 GB on the largest slice; `build_samples` on the full 64 M-galaxy
+parent catalog peaks at about 22 GB while writing a 16 M-galaxy sample. `--workers auto` /
+`romanmock.io.suggest_n_workers()` size the pool from the node's available memory and any cgroup cap
+(NERSC login nodes: 30 GB per user, so at most 5 workers there). Notebook 5 needs a compute node:
+`sbatch scripts/execute_notebooks.sh 05`.
 
 `CLAUDE.md` summarises the layout and conventions for anyone (or any assistant) editing the package.
 

@@ -73,22 +73,22 @@ def test_assign_redshifts_formula(synthetic, cosmo):
     za = assign_redshifts(det, z_rsd, ROMAN_TRANSITIONS, cm, rng)
 
     multi = det.n_det >= 2
-    np.testing.assert_array_equal(za.z_obs[multi], z_rsd[multi])
+    np.testing.assert_array_equal(za.z_assigned[multi], z_rsd[multi])
     assert (za.outcome[multi] == IdOutcome.MULTI_LINE).all()
     assert (za.outcome[det.n_det == 0] == IdOutcome.NOT_DETECTED).all()
-    assert np.isnan(za.z_obs[det.n_det == 0]).all()
+    assert np.isnan(za.z_assigned[det.n_det == 0]).all()
 
     mis = za.outcome == IdOutcome.SINGLE_MISID
     assert mis.any()
     rest = ROMAN_TRANSITIONS.rest_waves
     expected = rest[za.line_true[mis]] * (1 + z_rsd[mis]) / rest[za.line_assigned[mis]] - 1
-    np.testing.assert_allclose(za.z_obs[mis], expected)
+    np.testing.assert_allclose(za.z_assigned[mis], expected)
     # [O III] 5007 -> Ha maps (1+z) by 5008.3/6564.7
     assert np.all(za.line_true[mis] == ROMAN_TRANSITIONS.bit("OIII_5007"))
     assert np.all(za.line_assigned[mis] == ROMAN_TRANSITIONS.bit("Ha"))
 
     failed = za.outcome == IdOutcome.SINGLE_FAILED
-    assert failed.any() and np.isnan(za.z_obs[failed]).all() and (za.line_assigned[failed] == FAIL).all()
+    assert failed.any() and np.isnan(za.z_assigned[failed]).all() and (za.line_assigned[failed] == FAIL).all()
 
     emp = empirical_confusion({"n_det": det.n_det, "line_true": za.line_true, "line_assigned": za.line_assigned}, ROMAN_TRANSITIONS)
     i = ROMAN_TRANSITIONS.bit("OIII_5007")
@@ -103,5 +103,5 @@ def test_multi_line_sigma_z(synthetic, cosmo):
     det = detect_lines(flux, z_rsd, ROMAN_TRANSITIONS, ThresholdDetection(ConstantFluxLimit(1e-16)), rng)
     za = assign_redshifts(det, z_rsd, ROMAN_TRANSITIONS, None, rng, sigma_z=1e-3)
     multi = det.n_det >= 2
-    scatter = (za.z_obs[multi] - z_rsd[multi]) / (1 + z_rsd[multi])
+    scatter = (za.z_assigned[multi] - z_rsd[multi]) / (1 + z_rsd[multi])
     assert 0.8e-3 < scatter.std() < 1.2e-3

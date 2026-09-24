@@ -1,8 +1,8 @@
 """Checks suggested by the plan: empirical confusion, completeness and contamination.
 
 All functions work on dictionaries of numpy arrays with the column names produced by
-the pipeline (``z_obs``, ``line_true``, ``line_assigned``, ``id_outcome``, ``n_det``,
-``redshift_obs``), so they can be applied to an OpenCosmo dataset via
+the pipeline (``redshift_assigned``, ``line_true``, ``line_assigned``, ``id_outcome``, ``n_det``,
+``redshift_rsd``), so they can be applied to an OpenCosmo dataset via
 ``ds.select(...).get_data("numpy")``.
 """
 
@@ -43,7 +43,7 @@ def contamination_fraction(data, line_set, z_edges, assigned_line: str, membersh
     line_set = get_line_set(line_set)
     j = line_set.bit(assigned_line)
     z_edges = np.asarray(z_edges, dtype=np.float64)
-    z = np.asarray(data["z_obs"])
+    z = np.asarray(data["redshift_assigned"])
     la = np.asarray(data["line_assigned"]).astype(np.int64)
     lt = np.asarray(data["line_true"]).astype(np.int64)
     out = np.asarray(data["id_outcome"])
@@ -61,7 +61,7 @@ def contamination_fraction(data, line_set, z_edges, assigned_line: str, membersh
     return {"z_edges": z_edges, "n_sample": n_sample, "fraction": frac, "lines": line_set.names}
 
 
-def detection_efficiency(data, line_set, z_edges, line: str, reference_mask=None, true_z_column: str = "redshift_obs") -> dict:
+def detection_efficiency(data, line_set, z_edges, line: str, reference_mask=None, true_z_column: str = "redshift_rsd") -> dict:
     """Fraction of a *reference population* with ``line`` detected (bit set), in bins of
     true redshift (review M3, item 1). The reference population is ``reference_mask``
     (e.g. a stellar-mass cut) over all rows of ``data``; it only makes sense on a parent
@@ -80,7 +80,7 @@ def detection_efficiency(data, line_set, z_edges, line: str, reference_mask=None
     return {"z_edges": z_edges, "n_reference": n_ref, "n_detected": n_det, "efficiency": eff}
 
 
-def sample_completeness(data, line_set, z_edges, line: str, in_sample, true_z_column: str = "redshift_obs") -> dict:
+def sample_completeness(data, line_set, z_edges, line: str, in_sample, true_z_column: str = "redshift_rsd") -> dict:
     """Fraction of detected emitters whose brightest feature is ``line`` that are in the final
     analysis sample ``in_sample`` (boolean mask over ``data``), in bins of true redshift
     (review M3, item 3: completeness after the actual selection, including thinning)."""
@@ -96,7 +96,7 @@ def sample_completeness(data, line_set, z_edges, line: str, in_sample, true_z_co
     return {"z_edges": z_edges, "n_parent": n_parent, "n_in_sample": n_in, "completeness": c}
 
 
-def completeness(data, line_set, z_edges, line: str, true_z_column: str = "redshift_obs") -> dict:
+def completeness(data, line_set, z_edges, line: str, true_z_column: str = "redshift_rsd") -> dict:
     """Identification efficiency conditional on detection (review M3, item 2): fraction of
     galaxies whose *brightest detected* feature is ``line`` that end up with a correct
     redshift (multi-line or single correct), in bins of true redshift. Undetected galaxies

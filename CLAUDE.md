@@ -13,7 +13,8 @@ follows `/global/u2/w/willlake/Projects/Roman/RomanMock/Roman_Mock_Plan_and_Comm
 - Reading the mock needs `import hdf5plugin` (done in `romanmock.io`; opencosmo does it too).
 - Tests: `python -m pytest -q tests` (~10 s). The real-catalog test skips when the mock is absent;
   point `ROMANMOCK_TEST_CATALOG` elsewhere to use another mock.
-- Do not run the full 67-slice pipeline on a login node. On an exclusive CPU node use
+- NERSC login nodes cap each user at 30 GB (user-slice cgroup) and 12.5% CPU; `suggest_n_workers()` in
+  `io.py` reads that cap. Do not run the full 67-slice pipeline on a login node. On an exclusive CPU node use
   `romanmock run cfg.yaml --workers 32` / `pipe.run(n_workers=32)` (spawned processes, one slice each,
   2–5 GB peak per worker; ~10 min for the whole mock, I/O bound); otherwise `scripts/run_slices.sh`.
 
@@ -50,7 +51,11 @@ follows `/global/u2/w/willlake/Projects/Roman/RomanMock/Roman_Mock_Plan_and_Comm
   Add new presets instead.
 - Confusion matrices ship as assumed scenarios only; never describe them as Roman calibrations.
 - Outcome codes (`IdOutcome`) and output column names are part of the file format; changing
-  them requires bumping `_version.py` and the metadata sidecar.
+  them requires bumping `_version.py` and the metadata sidecar. Since 0.2.0 the redshift columns
+  are `redshift_true`, `redshift_rsd` (input `redshift_obs`, peculiar velocity included) and
+  `redshift_assigned`; never write the input name `redshift_obs` to an output. Default parent
+  columns: ra, dec, redshift_true, redshift_rsd, redshift_assigned, id_outcome + the identification
+  columns (`store_identification`); default sample columns are the first six (`sample_columns`).
 - Per-slice randomness is seeded with `(seed, step)` so results do not depend on which files a
   job processes or on `n_workers`. Keep that property (there is a test for serial == parallel).
 - Parallel workers rebuild the pipeline from `RomanMockPipeline._worker_spec()` (config dict with the

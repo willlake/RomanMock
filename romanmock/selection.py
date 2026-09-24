@@ -170,10 +170,10 @@ class SampleDefinition:
 def sample_mask(data: Mapping[str, np.ndarray], line_set, sample: SampleDefinition) -> np.ndarray:
     """Boolean mask of ``data`` (dict of arrays from the parent catalog) for a sample."""
     line_set = get_line_set(line_set)
-    n = len(data["z_obs"])
+    n = len(data["redshift_assigned"])
     mask = np.ones(n, dtype=bool)
     mask &= np.isin(data["id_outcome"], sample.outcome_codes())
-    z = np.asarray(data["z_obs"])
+    z = np.asarray(data["redshift_assigned"])
     if sample.z_min is not None:
         mask &= z >= sample.z_min
     if sample.z_max is not None:
@@ -338,7 +338,7 @@ def population_thinning_mask(
     area_deg2: float,
     rng: np.random.Generator,
     by: str = "line_true",
-    z_column: str = "redshift_obs",
+    z_column: str = "redshift_rsd",
     bin_width: float = 0.1,
     smooth_bins: float = 0.0,
     poly_degree: int | None = None,

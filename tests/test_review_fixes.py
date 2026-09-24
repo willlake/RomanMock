@@ -72,7 +72,7 @@ def test_tracer_membership_modes():
     assert tracer_membership(data, ROMAN_TRANSITIONS, ["Ha"], "assigned").tolist() == [False, True, True, False]
     assert tracer_membership(data, ROMAN_TRANSITIONS, ["Ha"], "detected").tolist() == [True, True, True, False]
     assert tracer_membership(data, ROMAN_TRANSITIONS, ["OIII_5007"], "detected").tolist() == [True, False, False, False]
-    data.update({"z_obs": np.array([1.2, 1.2, 1.2, np.nan]), "id_outcome": np.array([1, 2, 3, 0], dtype=np.int8),
+    data.update({"redshift_assigned": np.array([1.2, 1.2, 1.2, np.nan]), "id_outcome": np.array([1, 2, 3, 0], dtype=np.int8),
                  "ra": np.zeros(4), "dec": np.zeros(4)})
     m = sample_mask(data, ROMAN_TRANSITIONS, SampleDefinition(assigned_lines=["Ha"], membership="detected"))
     assert m.tolist() == [True, True, True, False]
@@ -84,7 +84,7 @@ def test_tracer_membership_modes():
 def test_m3_diagnostics_split():
     z = np.array([1.1, 1.1, 1.1, 1.1, 1.15, 1.15])
     data = {
-        "redshift_obs": z, "z_obs": z,
+        "redshift_rsd": z, "redshift_assigned": z,
         "line_bitmask": np.array([1, 1, 1, 0, 1, 1], dtype=np.uint32),
         "n_det": np.array([1, 1, 1, 0, 1, 1], dtype=np.uint8),
         "line_true": np.array([0, 0, 0, -1, 0, 0], dtype=np.int8),
@@ -117,7 +117,7 @@ def test_provenance_manifest_and_stale_samples(tmp_path):
     base = {
         "catalog": {"path": CATALOG_DIR, "steps": steps, "rest_waves_from_catalog": False},
         "output": {"dir": str(tmp_path), "keep_undetected": True,
-                   "passthrough_columns": ["gal_id", "ra", "dec", "redshift_true", "redshift_obs"]},
+                   "passthrough_columns": ["gal_id", "ra", "dec", "redshift_true"]},
         "sensitivity": {"type": "constant", "flux_limit": 1e-17, "wave_range": [3000.0, 25000.0]},
         "confusion": {"type": "identity", "p_fail": 0.1},
     }

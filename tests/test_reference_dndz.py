@@ -51,7 +51,7 @@ def test_population_thinning_mask_matches_target():
     area = 10.0
     z = rng.uniform(0.5, 2.5, n)                       # ~6700 per unit z per deg^2 per population
     line_true = rng.choice([0, 2, 4], size=n)          # Ha, OIII_5007, OII_3727 in equal numbers
-    data = {"line_true": line_true, "redshift_obs": z}
+    data = {"line_true": line_true, "redshift_rsd": z}
     targets = {"Ha": TargetDNDZ.from_bins([1.0, 1.5, 2.0], [2000.0, 1000.0])}
     keep, info = population_thinning_mask(data, ROMAN_TRANSITIONS, targets, area, rng)
     ha = line_true == 0

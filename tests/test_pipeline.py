@@ -12,7 +12,7 @@ def test_process_arrays_synthetic(synthetic, cosmo):
     cfg = RomanMockConfig.from_dict({
         "line_set": "plan_species",
         "confusion": {"type": "matrix", "rows": {"OIII": {"Ha": 0.3}}},
-        "output": {"store_snr": True, "store_wave_obs": True},
+        "output": {"store_fluxes": True, "store_snr": True, "store_wave_obs": True},
     })
     pipe = RomanMockPipeline(cfg)
     assert pipe.line_set is PLAN_SPECIES
@@ -24,7 +24,7 @@ def test_process_arrays_synthetic(synthetic, cosmo):
     assert (out["id_outcome"] == IdOutcome.SINGLE_MISID).any()
     # deterministic given the seed
     out2 = pipe.process_arrays(synthetic, cosmo, np.random.default_rng(0))
-    np.testing.assert_array_equal(out["z_obs"][np.isfinite(out["z_obs"])], out2["z_obs"][np.isfinite(out2["z_obs"])])
+    np.testing.assert_array_equal(out["redshift_assigned"][np.isfinite(out["redshift_assigned"])], out2["redshift_assigned"][np.isfinite(out2["redshift_assigned"])])
 
 
 @pytest.mark.skipif(not catalog_available(), reason="diffsky mock not available")
@@ -37,8 +37,8 @@ def test_run_on_real_slice(tmp_path):
     small = min(files, key=lambda p: p.stat().st_size)
     cfg = RomanMockConfig.from_dict({
         "catalog": {"path": CATALOG_DIR, "rest_waves_from_catalog": False},
-        "output": {"dir": str(tmp_path), "overwrite": True, "keep_undetected": True,
-                   "passthrough_columns": ["gal_id", "ra", "dec", "redshift_true", "redshift_obs", "logsm_obs"]},
+        "output": {"dir": str(tmp_path), "overwrite": True, "keep_undetected": True, "store_fluxes": True,
+                   "passthrough_columns": ["gal_id", "ra", "dec", "redshift_true", "logsm_obs"]},
         "sensitivity": {"type": "constant", "flux_limit": 1e-17, "wave_range": [3000.0, 25000.0]},
         "confusion": {"type": "identity", "p_fail": 0.1},
     })
@@ -46,11 +46,12 @@ def test_run_on_real_slice(tmp_path):
     outputs = pipe.run(files=[small], verbose=False)
     assert len(outputs) == 1 and outputs[0].exists()
     back = oc.open(outputs[0])
-    assert "line_bitmask" in back.columns and "z_obs" in back.columns
+    assert "line_bitmask" in back.columns and "redshift_assigned" in back.columns and "redshift_rsd" in back.columns
+    assert "redshift_obs" not in back.columns
     assert str(back.units["Ha_flux"]) in ("erg / (s cm2)", "erg / (cm2 s)")
-    d = back.select("z_obs", "id_outcome", "redshift_obs").get_data("numpy", wrap_single=True)
+    d = back.select("redshift_assigned", "id_outcome", "redshift_rsd").get_data("numpy", wrap_single=True)
     ok = d["id_outcome"] == IdOutcome.MULTI_LINE
-    np.testing.assert_allclose(d["z_obs"][ok], d["redshift_obs"][ok])
+    np.testing.assert_allclose(d["redshift_assigned"][ok], d["redshift_rsd"][ok])
     assert (tmp_path / f"{cfg.output.tag}_metadata.yaml").exists()
 
 
@@ -63,19 +64,20 @@ def test_parallel_run_matches_serial(tmp_path):
     files = sorted(list_catalog_files(CATALOG_DIR), key=lambda p: p.stat().st_size)[:2]
     base = {
         "catalog": {"path": CATALOG_DIR, "rest_waves_from_catalog": False},
+        "output": {"passthrough_columns": ["gal_id", "ra", "dec", "redshift_true"]},
         "sensitivity": {"type": "constant", "flux_limit": 1e-17, "wave_range": [3000.0, 25000.0]},
         "confusion": {"type": "matrix", "rows": {"Ha": {"OIII_5007": 0.2, "fail": 0.1}}},
     }
-    serial = RomanMockPipeline(RomanMockConfig.from_dict({**base, "output": {"dir": str(tmp_path / "serial")}}), aux_data=None)
-    parallel = RomanMockPipeline(RomanMockConfig.from_dict({**base, "output": {"dir": str(tmp_path / "par")}}), aux_data=None)
+    serial = RomanMockPipeline(RomanMockConfig.from_dict({**base, "output": {**base["output"], "dir": str(tmp_path / "serial")}}), aux_data=None)
+    parallel = RomanMockPipeline(RomanMockConfig.from_dict({**base, "output": {**base["output"], "dir": str(tmp_path / "par")}}), aux_data=None)
     out_s = serial.run(files=files, verbose=False)
     out_p = parallel.run(files=files, verbose=False, n_workers=2)
     for a, b in zip(out_s, out_p):
-        da = oc.open(a).select("gal_id", "line_bitmask", "z_obs").get_data("numpy", wrap_single=True)
-        db = oc.open(b).select("gal_id", "line_bitmask", "z_obs").get_data("numpy", wrap_single=True)
+        da = oc.open(a).select("gal_id", "line_bitmask", "redshift_assigned").get_data("numpy", wrap_single=True)
+        db = oc.open(b).select("gal_id", "line_bitmask", "redshift_assigned").get_data("numpy", wrap_single=True)
         np.testing.assert_array_equal(da["gal_id"], db["gal_id"])
         np.testing.assert_array_equal(da["line_bitmask"], db["line_bitmask"])
-        np.testing.assert_array_equal(np.nan_to_num(da["z_obs"]), np.nan_to_num(db["z_obs"]))
+        np.testing.assert_array_equal(np.nan_to_num(da["redshift_assigned"]), np.nan_to_num(db["redshift_assigned"]))
 
 
 @pytest.mark.skipif(not catalog_available(), reason="diffsky mock not available")

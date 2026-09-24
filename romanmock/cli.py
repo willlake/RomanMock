@@ -63,8 +63,15 @@ def cmd_run(args):
     if args.print_config:
         print(pipe.config.to_yaml())
         print(pipe.line_set.describe())
+    if args.workers == "auto":
+        from .io import memory_budget_gb, suggest_n_workers
+
+        n_workers = suggest_n_workers()
+        print(f"[romanmock] memory budget {memory_budget_gb():.0f} GB -> {n_workers} worker(s)")
+    else:
+        n_workers = int(args.workers)
     outputs = pipe.run(files=args.files, steps=args.steps, z_min=args.z_min, z_max=args.z_max, verbose=not args.quiet,
-                       n_workers=args.workers)
+                       n_workers=n_workers)
     print(f"[romanmock] wrote {len(outputs)} file(s) to {pipe.config.output.dir}")
 
 
@@ -131,7 +138,7 @@ def main(argv=None):
             s.add_argument("--z-min", type=float)
             s.add_argument("--z-max", type=float)
             s.add_argument("--print-config", action="store_true")
-            s.add_argument("--workers", type=int, default=1, help="process slices in parallel with this many processes")
+            s.add_argument("--workers", default="1", help="number of parallel slice processes, or 'auto' to fit the memory budget (~5 GB each)")
         else:
             s.add_argument("--parent-dir", help="directory of the stage-A outputs (default: output.dir)")
             s.add_argument("--allow-partial", action="store_true", help="accept a parent catalog that lacks some of the selected slices")

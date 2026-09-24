@@ -207,3 +207,52 @@ def stamp_output(path, attrs: dict):
 def read_stamp(path) -> dict:
     with h5py.File(Path(path), "r") as f:
         return {k: (v.item() if hasattr(v, "item") else v) for k, v in f.attrs.items() if k.startswith("romanmock_")}
+
+
+# ---------------------------------------------------------------------------------
+# Resource helpers
+# ---------------------------------------------------------------------------------
+PER_WORKER_GB = 5.0   # measured peak of one stage-A worker on the largest diffsky slice: 4.4 GB
+
+
+def memory_budget_gb() -> float:
+    """Memory (GB) this process tree may still use: the minimum of the node's available
+    memory and the headroom of every enclosing cgroup that sets a limit (NERSC login
+    nodes cap each user at 30 GB through such a cgroup). Falls back to 8 GB if unknown."""
+    budget = None
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    budget = int(line.split()[1]) / 1e6
+    except OSError:
+        pass
+    try:
+        with open("/proc/self/cgroup") as f:
+            path = f.read().strip().split(":")[-1]
+        while path and path != "/":
+            base = Path("/sys/fs/cgroup") / path.lstrip("/")
+            try:
+                limit = (base / "memory.max").read_text().strip()
+                if limit != "max":
+                    headroom = (int(limit) - int((base / "memory.current").read_text())) / 1e9
+                    budget = headroom if budget is None else min(budget, headroom)
+            except OSError:
+                pass
+            path = str(Path(path).parent)
+    except OSError:
+        pass
+    return 8.0 if budget is None else max(budget, 0.0)
+
+
+def suggest_n_workers(max_workers: int = 32, per_worker_gb: float = PER_WORKER_GB, reserve_gb: float = 2.0) -> int:
+    """Number of stage-A worker processes that fit in :func:`memory_budget_gb`, capped by
+    ``max_workers`` and the CPUs this process may use."""
+    import os
+
+    try:
+        n_cpu = len(os.sched_getaffinity(0))
+    except AttributeError:  # pragma: no cover
+        n_cpu = os.cpu_count() or 1
+    by_memory = int((memory_budget_gb() - reserve_gb) / per_worker_gb)
+    return max(1, min(max_workers, n_cpu, by_memory))

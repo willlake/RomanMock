@@ -18,7 +18,9 @@ import yaml
 from .lines import DEFAULT_LINE_SET
 from .roman import DEFAULT_LINE_FLUX_LIMIT, GRISM_WAVE_RANGE_ANGSTROM
 
-DEFAULT_PASSTHROUGH = ["gal_id", "ra", "dec", "redshift_true", "redshift_obs"]
+DEFAULT_PASSTHROUGH = ["ra", "dec", "redshift_true"]
+#: columns written to analysis-sample files by default (stage B); None = every parent column
+DEFAULT_SAMPLE_COLUMNS = ["ra", "dec", "redshift_true", "redshift_rsd", "redshift_assigned", "id_outcome"]
 
 
 @dataclass
@@ -53,10 +55,15 @@ class OutputConfig:
     overwrite: bool = False
     keep_undetected: bool = False        # keep galaxies with bitmask == 0 in the parent catalog
     passthrough_columns: list[str] = field(default_factory=lambda: list(DEFAULT_PASSTHROUGH))
-    store_fluxes: bool = True
+    # The parent catalog always contains redshift_rsd (copy of redshift.rsd_column),
+    # redshift_assigned and id_outcome. The identification columns (line_bitmask, n_det,
+    # line_true, line_assigned) are needed by stage B and the diagnostics.
+    store_identification: bool = True
+    store_fluxes: bool = False
     store_wave_obs: bool = False
     store_snr: bool = False
     store_measured_flux: bool = False    # only differs from flux for noisy detection models
+    sample_columns: list[str] | None = field(default_factory=lambda: list(DEFAULT_SAMPLE_COLUMNS))
 
 
 @dataclass
@@ -90,7 +97,7 @@ class PopulationThinningConfig:
 
     targets: dict = field(default_factory=lambda: {"Ha": {"reference": "wang2022"}, "OIII_5007": {"reference": "wang2022"}})
     by: str = "line_true"            # population membership column
-    z_column: str = "redshift_obs"   # true redshift (with peculiar velocity) used for the comparison
+    z_column: str = "redshift_rsd"   # true redshift (with peculiar velocity) used for the comparison
     bin_width: float = 0.1           # used only for targets without their own bins
     area_deg2: float | None = None
     nside: int = 256
