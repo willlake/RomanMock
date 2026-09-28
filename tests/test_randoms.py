@@ -34,6 +34,10 @@ def test_footprint_area_and_sampling(tmp_path):
     # points outside
     assert not fp.contains([10.0, 200.0, 200.0], [55.0, 45.0, 75.0]).any()
     assert fp.contains([200.0, 10.0], [55.0, 65.0]).all()
+    grid = fp.contains(np.array([200.0, 10.0])[:, None], np.array([55.0, 65.0, 45.0])[None, :])      # broadcast
+    assert grid.shape == (2, 3) and grid.tolist() == [[True, True, False], [False, True, False]]
+    assert fp.rectangles().shape == (6, 4)
+    assert bool(fp.contains(200.0, 55.0))
     fp2 = PatchFootprint.load(fp.save(tmp_path / "fp.json"))
     assert fp2.area_deg2 == fp.area_deg2 and fp2.n_patches == 6
 

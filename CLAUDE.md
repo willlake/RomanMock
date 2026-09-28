@@ -110,6 +110,12 @@ Two-step workflow:
   Stream of random catalog k: `(seed, 30000, kind index, k)`. One file per multiple of the data size.
   Neither OpenCosmo nor diffsky makes randoms for a footprint; diffsky has
   `experimental.lc_utils.mc_lightcone_random_ra_dec` for a single rectangle.
+- `make_catalog(lines=..., membership="detected")`: sample of a line = galaxies with a correct redshift in which the
+  line is detected (any line of a multi-line galaxy, `selection.tracer_membership`) plus the single-line galaxies
+  taken for it. `membership="assigned"` = `line_assigned` only (brightest line), the default of the file route
+  (`SampleConfig.membership`). In the mock [O III] 5007 is never the brightest line at 1 < z < 1.9, so with
+  "assigned" an [O III] sample there holds interlopers only. The line report counts detected / identified /
+  brightest / mistaken / interlopers per line.
 - Line report: `make_catalog(verbose=True)` prints `cat.line_report()`; the numbers are in
   `cat.info["line_report"]` (`lines`, `interlopers`). Geometry in `catalog.line_report` (potential interlopers:
   line i inside the bandpass that passes the redshift cut when taken for j; lightcone bounds padded by
@@ -237,7 +243,8 @@ mock has 203 M galaxies with a line in 0.5 < z < 3.0 (74 % of all), against 59 M
 ## Demo outputs (`$PSCRATCH/romanmock_demo`)
 
 - `two_step/base` (base catalog, rebuilt 2026-09-28 with `line_bitmask_base`; `romanmock_base_area.json` caches
-  the sky area), `two_step/nb_F*` (notebook 07), `two_step/halpha_z1p0_1p9.hdf5` (notebook 09).
+  the sky area), `two_step/nb_F*` (notebook 07), `two_step/halpha_z1p0_1p9.hdf5` (notebook 09),
+  `two_step/randoms/` (notebook 10: Hα catalog and its randoms, 2.2 GB).
 - `full_F1.0e-16_S4.0e-17`, `parent_F1.0e-16_S4.0e-17`: notebooks 05 and 03 with the current defaults.
 - `full/`, `parent/`: older 1.5e-16 single-threshold runs, uncompressed index.
 - `census_z0p5_3p0.npz` (notebook 06), `census_secondary_z0p5_3p0.npz` (notebook 08), `census_z0p5_3p0_1e17.npz`.
@@ -245,8 +252,8 @@ mock has 203 M galaxies with a line in 0.5 < z < 3.0 (74 % of all), against 59 M
 ## Working style
 
 - Plots (notebooks) use `romanmock.plotting` (fixed categorical order, single axis, thin marks).
-- Notebooks live in `notebooks/` (01–09) and are generated from `notebooks/build_notebooks.py`; edit the builder,
-  then `python notebooks/build_notebooks.py --execute --only <prefixes>` (login node: 01–04, 09; the user edits
+- Notebooks live in `notebooks/` (01–10) and are generated from `notebooks/build_notebooks.py`; edit the builder,
+  then `python notebooks/build_notebooks.py --execute --only <prefixes>` (login node: 01–04, 09, 10; the user edits
   and reruns notebook copies in Jupyter, so check the `.ipynb` on disk for their settings before regenerating) or
   `sbatch scripts/execute_notebooks.sh <prefixes>` (05–08). Running the builder without `--only` rewrites every
   notebook, and without `--execute` it strips their outputs.

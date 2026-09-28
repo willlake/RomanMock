@@ -38,7 +38,7 @@ from .lines import get_line_set
 from .redshift import IdOutcome, PerfectMultiLine, assign_redshifts
 from .roman import DEFAULT_LINE_FLUX_LIMIT, DEFAULT_SECONDARY_LINE_FLUX_LIMIT
 from .samples import THINNING_STREAM
-from .selection import TargetDNDZ, dndz_from_counts, keep_probability, probability_per_galaxy, sky_area_deg2
+from .selection import TargetDNDZ, tracer_membership, dndz_from_counts, keep_probability, probability_per_galaxy, sky_area_deg2
 from .sensitivity import ConstantFluxLimit, build_detection, build_sensitivity
 
 #: columns of a catalog when ``columns`` is not given
@@ -372,6 +372,7 @@ class BaseCatalog:
         z_range: tuple[float | None, float | None] | None = None,
         z_column: str = "redshift_assigned",
         lines: Sequence[str] | str | None = None,
+        membership: str = "detected",
         outcomes: Sequence[str] | None = DEFAULT_OUTCOMES,
         n_det_min: int | None = None,
         cuts: Mapping[str, tuple] | None = None,
@@ -403,7 +404,13 @@ class BaseCatalog:
             Keep galaxies with ``z_column`` inside the range (either end may be None).
         z_column : {"redshift_assigned", "redshift_rsd", "redshift_true"}
         lines : list of str
-            Keep galaxies whose *assigned* line is one of these, e.g. ``["Ha"]``.
+            Keep the galaxies in which one of these lines is identified, e.g. ``["Ha"]``.
+        membership : {"detected", "assigned"}
+            What "identified" means for a galaxy with several detected lines. ``"detected"``
+            (default): each of its detected lines is identified, since its redshift is right; a
+            galaxy with Ha and [O III] belongs to both. ``"assigned"``: only its brightest line
+            (``line_assigned``), which makes the samples of different lines disjoint. A
+            single-line galaxy always counts under the line it was taken for.
         outcomes : list of str or None
             Identification outcomes to keep. Default: every galaxy with a redshift
             (multi-line, single-line correct, single-line misidentified). ``None`` = all.
@@ -436,7 +443,7 @@ class BaseCatalog:
             redshift cut, and the potential and actual line interlopers. The report is also
             kept: ``cat.line_report()`` (text) and ``cat.info["line_report"]`` (numbers).
         """
-        spec = self._spec(flux_limit, secondary_flux_limit, confusion, z_range, z_column, lines, outcomes, n_det_min,
+        spec = self._spec(flux_limit, secondary_flux_limit, confusion, z_range, z_column, lines, membership, outcomes, n_det_min,
                           cuts, downsample, columns, wave_range, detection, sigma_z, seed)
         populations = spec["populations"]
         area = self.area_deg2 if populations else None
@@ -464,8 +471,8 @@ class BaseCatalog:
         z_cover = (max(z_cover[0] - RSD_MARGIN * (1 + z_cover[0]), 0.0), z_cover[1] + RSD_MARGIN * (1 + z_cover[1]))
         info["line_report"] = line_report(self.line_set.names, self.line_set.rest_waves, spec["wave_range"], spec["z_range"],
                                           spec["z_column"], z_cover, spec["line_bits"], confusion_probabilities(spec["confusion"]),
-                                          counts, spec["outcome_codes"])
-        settings = {k: spec[k] for k in ("flux_limit", "secondary_flux_limit", "wave_range", "z_range", "z_column", "lines",
+                                          counts, spec["outcome_codes"], spec["membership"])
+        settings = {k: spec[k] for k in ("flux_limit", "secondary_flux_limit", "wave_range", "z_range", "z_column", "lines", "membership",
                                          "outcomes", "n_det_min", "cuts", "sigma_z", "seed", "detection")}
         settings.update(confusion=spec["confusion_config"], downsample=spec["downsample_label"], base=str(self.dir), base_tag=self.tag)
         cat = Catalog(data, settings, info, self.line_set.names, self.area_deg2 if (populations or self._has_area()) else None)
@@ -483,7 +490,7 @@ class BaseCatalog:
         return self._area is not None or (self.dir / f"{self.tag}_area.json").exists()
 
     # ---- settings -> a picklable description for the workers -------------------------
-    def _spec(self, flux_limit, secondary, confusion, z_range, z_column, lines, outcomes, n_det_min, cuts, downsample,
+    def _spec(self, flux_limit, secondary, confusion, z_range, z_column, lines, membership, outcomes, n_det_min, cuts, downsample,
               columns, wave_range, detection, sigma_z, seed) -> dict:
         names = self.line_set.names
         flux_limit = self.flux_limit if flux_limit is None else float(flux_limit)
@@ -516,6 +523,8 @@ class BaseCatalog:
             z_range = tuple(None if z is None else float(z) for z in z_range)
             if len(z_range) != 2:
                 raise ValueError("z_range is (min, max)")
+        if membership not in ("detected", "assigned"):
+            raise ValueError("membership must be 'detected' or 'assigned'")
         if isinstance(lines, str):
             lines = [lines]
         if lines is not None:
@@ -546,7 +555,7 @@ class BaseCatalog:
             "confusion": model, "confusion_config": confusion_config, "sigma_z": float(sigma_z), "seed": int(seed),
             "z_range": None if z_range is None else list(z_range), "z_column": z_column,
             "lines": None if lines is None else list(lines),
-            "line_bits": None if lines is None else [names.index(x) for x in lines],
+            "line_bits": None if lines is None else [names.index(x) for x in lines], "membership": membership,
             "outcomes": None if outcomes is None else [IdOutcome(c).name for c in codes], "outcome_codes": codes,
             "n_det_min": n_det_min, "cuts": {k: list(v) for k, v in cuts.items()},
             "columns": list(columns), "populations": populations, "downsample_label": label,
@@ -660,7 +669,7 @@ def _catalog_slice(spec: dict, path: str, step: int) -> dict:
         if hi is not None:
             keep &= z <= hi
     if spec["line_bits"] is not None:
-        keep &= np.isin(za.line_assigned, spec["line_bits"])
+        keep &= tracer_membership(cols, line_set, spec["lines"], spec["membership"])
     if spec["n_det_min"] is not None:
         keep &= det.n_det >= spec["n_det_min"]
     for col, (lo, hi) in spec["cuts"].items():
@@ -736,16 +745,21 @@ def _thin(results, populations: dict, spec: dict, area: float) -> tuple[np.ndarr
 def line_counts(line_true, line_assigned, outcome, bitmask, n_lines: int) -> dict:
     """Counts behind the line report, for the galaxies of a catalog.
 
-    ``detected[i]``: galaxies in which line ``i`` is detected; ``assigned[j]``: galaxies whose
-    assigned line is ``j``; ``misid[i, j]``: single-line galaxies with true line ``i`` taken for ``j``.
+    ``detected[i]``: galaxies in which line ``i`` is detected; ``identified[i]``: those of them in
+    which it is identified as line ``i`` (galaxies with a correct redshift: every detected line of a
+    multi-line galaxy, the line of a correctly identified single-line galaxy); ``brightest[i]``:
+    galaxies with a correct redshift whose brightest line is ``i``; ``misid[i, j]``: single-line
+    galaxies with true line ``i`` taken for ``j``.
     """
     line_true = np.asarray(line_true, dtype=np.int64)
     line_assigned = np.asarray(line_assigned, dtype=np.int64)
     bitmask = np.asarray(bitmask).astype(np.int64)
     wrong = np.asarray(outcome) == int(IdOutcome.SINGLE_MISID)
     pair = line_true[wrong] * n_lines + line_assigned[wrong]
+    right = np.isin(outcome, [int(IdOutcome.MULTI_LINE), int(IdOutcome.SINGLE_CORRECT)])
     return {"detected": np.array([int(np.count_nonzero((bitmask >> i) & 1)) for i in range(n_lines)], dtype=np.int64),
-            "assigned": np.bincount(line_assigned[line_assigned >= 0], minlength=n_lines).astype(np.int64),
+            "identified": np.array([int(np.count_nonzero((bitmask[right] >> i) & 1)) for i in range(n_lines)], dtype=np.int64),
+            "brightest": np.bincount(line_true[right & (line_true >= 0)], minlength=n_lines).astype(np.int64),
             "misid": np.bincount(pair, minlength=n_lines * n_lines).reshape(n_lines, n_lines).astype(np.int64)}
 
 
@@ -761,7 +775,7 @@ def confusion_probabilities(model) -> np.ndarray | None:
 
 
 def line_report(names, rest_waves, wave_range, z_range, z_column, z_cover, assigned_bits=None, probabilities=None,
-                counts=None, outcome_codes=None) -> dict:
+                counts=None, outcome_codes=None, membership: str = "detected") -> dict:
     """Lines inside the bandpass for a redshift cut, and the interlopers the cut lets in.
 
     A line ``i`` observed at ``wave`` and taken for line ``j`` gets the redshift ``wave / rest_j - 1``.
@@ -793,7 +807,9 @@ def line_report(names, rest_waves, wave_range, z_range, z_column, z_cover, assig
         row = {"line": names[k], "rest_wave": float(rest[k]), "z": z_of(wave, k), "wave_obs": list(map(float, wave)),
                "selected": assigned_bits is None or k in assigned_bits}
         if counts is not None:
-            row.update(n_detected=int(counts["detected"][k]), n_assigned=int(counts["assigned"][k]))
+            row.update(n_detected=int(counts["detected"][k]), n_identified=int(counts["identified"][k]),
+                       n_brightest=int(counts["brightest"][k]), n_mistaken=int(counts["misid"][k].sum()),
+                       n_interlopers=int(counts["misid"][:, k].sum()))
         lines.append(row)
 
     interlopers = []
@@ -808,12 +824,13 @@ def line_report(names, rest_waves, wave_range, z_range, z_column, z_cover, assig
                    "wave_obs": list(map(float, wave)),
                    "probability": None if probabilities is None else float(probabilities[i, j])}
             if counts is not None:
-                row.update(n=int(counts["misid"][i, j]), n_assigned=int(counts["assigned"][j]))
+                own = counts["identified" if membership == "detected" else "brightest"][j]
+                row.update(n=int(counts["misid"][i, j]), n_line=int(own + counts["misid"][:, j].sum()))
             interlopers.append(row)
     kept = outcome_codes is None or int(IdOutcome.SINGLE_MISID) in outcome_codes
     return {"wave_range": list(map(float, wave_range)), "z_range": None if z_range is None else list(z_range),
             "z_column": z_column, "z_cover": list(map(float, z_cover)), "lines": lines, "interlopers": interlopers,
-            "misidentified_kept": bool(kept)}
+            "misidentified_kept": bool(kept), "membership": membership}
 
 
 def format_line_report(report: dict | None) -> str:
@@ -824,22 +841,29 @@ def format_line_report(report: dict | None) -> str:
     cut = f"{report['z_column']} " + ("unrestricted" if lo is None and hi is None else
                                       f">= {lo:g}" if hi is None else f"<= {hi:g}" if lo is None else f"in {lo:g} - {hi:g}")
     band = f"{report['wave_range'][0]:.0f} - {report['wave_range'][1]:.0f} A"
-    counted = bool(report["lines"]) and "n_detected" in report["lines"][0]
+    counted = bool(report["lines"]) and "n_identified" in report["lines"][0]
 
     def span(v, fmt):
         return f"{v[0]:{fmt}} - {v[1]:{fmt}}"
 
     out = [f"[romanmock] lines inside {band} for {cut} (lightcone: z_rsd {span(report['z_cover'], '.2f')})"]
     out.append(f"  {'line':<11s}{'rest [A]':>9s}  {'redshift':^13s}  {'observed [A]':^15s}"
-               + (f"{'detected in':>14s}{'assigned to':>14s}" if counted else ""))
+               + (f"{'detected':>13s}{'identified':>13s}{'brightest':>13s}{'mistaken':>12s}{'interlopers':>13s}" if counted else ""))
     for r in report["lines"]:
         out.append(f"  {r['line']:<11s}{r['rest_wave']:>9.1f}  {span(r['z'], '.3f'):^13s}  {span(r['wave_obs'], '.0f'):^15s}"
-                   + (f"{r['n_detected']:>14,}{r['n_assigned']:>14,}" if counted else "")
+                   + (f"{r['n_detected']:>13,}{r['n_identified']:>13,}{r['n_brightest']:>13,}{r['n_mistaken']:>12,}"
+                      f"{r['n_interlopers']:>13,}" if counted else "")
                    + ("" if r["selected"] else "   not in `lines`"))
     if not report["lines"]:
         out.append("  none")
     elif counted:
-        out.append("  (galaxies of the catalog; a galaxy with several lines is counted in each of them)")
+        out += ["  galaxies of the catalog, a galaxy with several lines counted in each of them:",
+                "    detected     the line is detected",
+                "    identified   ... and identified as this line: the redshift of the galaxy is right (every detected line",
+                "                 of a multi-line galaxy, the line of a correctly identified single-line galaxy)",
+                "    brightest    ... and it is the brightest detected line of the galaxy (`line_assigned`)",
+                "    mistaken     the line is the only one detected and was taken for another line",
+                "    interlopers  galaxies in which another line was taken for this line"]
 
     rows = report["interlopers"]
     likely = [r for r in rows if r["probability"] is None or r["probability"] > 0 or r.get("n", 0) > 0]
@@ -852,13 +876,14 @@ def format_line_report(report: dict | None) -> str:
         text = (f"  {r['line_true']:<11s}{r['line_assigned']:<11s}{span(r['z_true'], '.3f'):^13s}  "
                 f"{span(r['z_assigned'], '.3f'):^13s}  {span(r['wave_obs'], '.0f'):^15s}{p:>7s}")
         if counted:
-            share = f"{100 * r['n'] / r['n_assigned']:.2f}%" if r["n_assigned"] else "-"
+            share = f"{100 * r['n'] / r['n_line']:.2f}%" if r["n_line"] else "-"
             text += f"{r['n']:>13,}{share:>15s}"
         out.append(text)
     if counted:
         total = sum(r["n"] for r in rows)
-        out.append("  (contamination: of the catalog galaxies assigned to the line of `taken for`, the share that are "
-                   "this interloper)")
+        own = "identified" if report.get("membership", "detected") == "detected" else "brightest"
+        out.append(f"  (contamination: this interloper as a share of the sample of the line of `taken for`, which is its "
+                   f"`{own}` galaxies plus its interlopers)")
         out.append(f"  actual interlopers in the catalog: {total:,}"
                    + ("" if report["misidentified_kept"] else " (`outcomes` excludes the misidentified galaxies)"))
     idle = {}

@@ -126,6 +126,17 @@ class PatchFootprint:
         return (f"<PatchFootprint: {self.n_patches} patches, {self.area_deg2:.2f} deg2, "
                 f"{90 - np.degrees(self.theta_hi.max()):.2f} < dec < {90 - np.degrees(self.theta_lo.min()):.2f}>")
 
+    def rectangles(self) -> np.ndarray:
+        """The patches as rows ``(ra_lo, ra_hi, dec_lo, dec_hi)`` in degrees, for drawing. A patch
+        that contains ra = 0 is given as two rectangles."""
+        rows = []
+        for t_lo, t_hi, p_lo, p_hi in zip(self.theta_lo, self.theta_hi, self.phi_lo, self.phi_hi):
+            lo = (np.degrees(p_lo) - self.ra_offset) % 360.0
+            hi = lo + np.degrees(p_hi - p_lo)
+            dec = (90.0 - np.degrees(t_hi), 90.0 - np.degrees(t_lo))
+            rows += [(lo, hi, *dec)] if hi <= 360.0 + 1e-9 else [(lo, 360.0, *dec), (0.0, hi - 360.0, *dec)]
+        return np.array(rows)
+
     def sample(self, n: int, rng: np.random.Generator | None = None) -> tuple[np.ndarray, np.ndarray]:
         """``n`` points uniform on the sky inside the footprint: ``ra, dec`` in degrees."""
         rng = rng if rng is not None else np.random.default_rng()
@@ -138,10 +149,11 @@ class PatchFootprint:
 
     def contains(self, ra, dec) -> np.ndarray:
         """True for the points inside the footprint."""
-        ra, dec = np.asarray(ra, dtype=np.float64), np.asarray(dec, dtype=np.float64)
-        theta = np.radians(90.0 - dec)
-        phi = np.radians((ra + self.ra_offset) % 360.0)
-        inside = np.zeros(ra.shape, dtype=bool)
+        ra, dec = np.broadcast_arrays(np.asarray(ra, dtype=np.float64), np.asarray(dec, dtype=np.float64))
+        shape = ra.shape
+        theta = np.radians(90.0 - dec.ravel())
+        phi = np.radians((ra.ravel() + self.ra_offset) % 360.0)
+        inside = np.zeros(theta.size, dtype=bool)
         rings = np.unique(np.stack([self.theta_lo, self.theta_hi], axis=1), axis=0)
         for lo, hi in rings:                                 # the patches of a ring do not overlap
             ring = (self.theta_lo == lo) & (self.theta_hi == hi)
@@ -151,4 +163,4 @@ class PatchFootprint:
             i = np.searchsorted(p_lo, phi[sel], side="right") - 1
             ok = (i >= 0) & (phi[sel] <= p_hi[np.maximum(i, 0)])
             inside[sel[ok]] = True
-        return inside
+        return inside.reshape(shape)

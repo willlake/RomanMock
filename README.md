@@ -65,7 +65,7 @@ cat = base.make_catalog(
     secondary_flux_limit=8e-17,              # limit for the other lines of such a galaxy (None: no second tier)
     confusion={"Ha": {"OIII_5007": 0.2},     # single-line galaxies: {true line: {assigned line: probability}}
                "OIII_5007": {"Ha": 0.2}},    # None: the package default
-    lines=["Ha"],                            # galaxies whose assigned line is Ha
+    lines=["Ha"],                            # galaxies in which Ha is identified
     z_range=(1.0, 1.9),                      # range of redshift_assigned
     seed=2026,
 )
@@ -79,7 +79,8 @@ cat.write("halpha.hdf5")                          # optional: .hdf5, .fits or .n
 | `flux_limit` | primary limit; cannot be deeper than the base catalog | the base catalog's limit |
 | `secondary_flux_limit` | limit for the other lines of a detected galaxy; `None` = no second tier | 4.0e-17 |
 | `confusion` | rows of the confusion matrix, a full config, or a model object | package default |
-| `lines` | keep galaxies whose assigned line is one of these | every line |
+| `lines` | keep galaxies in which one of these lines is identified | every line |
+| `membership` | multi-line galaxies: `"detected"` = each detected line is identified (a galaxy with Hα and [O III] is in both samples); `"assigned"` = only the brightest line, disjoint samples. `romanmock select` defaults to `assigned` | `"detected"` |
 | `z_range`, `z_column` | redshift range, on `redshift_assigned`, `redshift_rsd` or `redshift_true` | no cut, assigned |
 | `outcomes` | identification outcomes to keep; `None` = all, including failed | every galaxy with a redshift |
 | `n_det_min`, `cuts` | minimum number of detected lines; `{column: (min, max)}` on any column | none |
@@ -94,17 +95,28 @@ that, taken for another, passes the redshift cut, with its probability `P` in th
 the number that is actually in the catalog. `cat.line_report()` returns the same text and
 `cat.info["line_report"]` the numbers.
 
+| column | galaxies of the catalog in which |
+|---|---|
+| detected | the line is detected |
+| identified | it is detected and identified as this line: the redshift of the galaxy is right. Every detected line of a multi-line galaxy counts, also a secondary one |
+| brightest | it is identified and is the brightest detected line (`line_assigned`) |
+| mistaken | it is the only detected line and was taken for another line |
+| interlopers | another line was taken for this line |
+
+detected = identified + mistaken. The sample of a line is its identified galaxies plus its interlopers, and
+`contamination` is the share of one interloper in it.
+
 ```text
 [romanmock] lines inside 10000 - 19300 A for redshift_assigned in 1 - 1.9 (lightcone: z_rsd 0.01 - 4.06)
-  line        rest [A]    redshift      observed [A]     detected in   assigned to
-  Ha            6564.7  1.000 - 1.900   13129 - 19038     22,505,531    21,459,660
-  OIII_5007     5008.3  1.000 - 1.900   10017 - 14524     18,199,510     1,375,573
+  line        rest [A]    redshift      observed [A]       detected   identified    brightest    mistaken  interlopers
+  Ha            6564.7  1.000 - 1.900   13129 - 19038    22,505,531   21,129,958   21,125,951   1,375,573      333,709
+  OIII_5007     5008.3  1.000 - 1.900   10017 - 14524    18,199,510   18,004,823            0     194,687    1,375,573
   ...
 [romanmock] line interlopers: single-line galaxies given a wrong line and so a wrong redshift
   true line  taken for   true z_rsd     assigned z     observed [A]        P   in catalog  contamination
-  OIII_5007  Ha         1.622 - 2.801  1.000 - 1.900   13129 - 19038   0.500      194,687         0.91%
-  SIII_9532  Ha         0.377 - 0.997  1.000 - 1.900   13129 - 19038   0.500      139,022         0.65%
-  Ha         OIII_5007  0.526 - 1.212  1.000 - 1.900   10017 - 14524   0.500    1,375,573       100.00%
+  OIII_5007  Ha         1.622 - 2.801  1.000 - 1.900   13129 - 19038   0.500      194,687          0.91%
+  SIII_9532  Ha         0.377 - 0.997  1.000 - 1.900   13129 - 19038   0.500      139,022          0.65%
+  Ha         OIII_5007  0.526 - 1.212  1.000 - 1.900   10017 - 14524   0.500    1,375,573          7.10%
   ...
 ```
 
@@ -399,6 +411,7 @@ this mock, nominal 2062.6); estimate them from a whole catalog, not from a singl
 7. `07_two_step_workflow.ipynb` – the two-step construction on the full lightcone: base flux catalog, step 2 at three settings of the limits, analysis samples, what step 2 refuses, a join through `gal_id`, disk usage.
 8. `08_dndz_secondary_limit.ipynb` – the single-line / multi-line dN/dz of notebook 06 for secondary flux limits of 8e-17 and 4e-17 next to a single threshold, for primary limits of 1.0e-16 and 1.5e-16.
 9. `09_catalog_from_base.ipynb` – the everyday recipe: `BaseCatalog.make_catalog` with chosen flux limits, confusion matrix, lines and redshift range, returned in memory; changing settings, downsampling to Wang et al. (2022), writing to disk.
+10. `10_random_catalogs.ipynb` – `cat.make_random`: the footprint, randoms for the contaminated catalog, the galaxies and the interlopers, sky and redshift checks, N files on disk.
 
 Notebooks 01 to 04 and 09 run on a login node. Notebooks 05 to 08 read the whole input mock the first time and
 are meant for a compute node: `sbatch scripts/execute_notebooks.sh 05 06 07 08`. Their results are cached, so

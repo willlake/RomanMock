@@ -80,8 +80,8 @@ def test_cuts_and_downsampling_equal_select(base):
     tmp, b = base
     target = {"z": [0.0, 4.0], "dndz": [1500.0, 1500.0]}
     with pytest.warns(RuntimeWarning):
-        cat = b.make_catalog(confusion=ROWS, seed=5, lines=["SIII_9532"], z_range=(0.28, 0.35), columns=ALL,
-                             downsample={"SIII_9532": target}, n_workers=2, verbose=False, **LIMITS)
+        cat = b.make_catalog(confusion=ROWS, seed=5, lines=["SIII_9532"], membership="assigned", z_range=(0.28, 0.35),
+                             columns=ALL, downsample={"SIII_9532": target}, n_workers=2, verbose=False, **LIMITS)
     pipe = _pipeline(tmp, "assigned_thin", PopulationThinningConfig(targets={"SIII_9532": target}, by="line_true",
                                                                     z_column="redshift_rsd"))
     with pytest.warns(RuntimeWarning):
@@ -188,7 +188,14 @@ def test_line_report(base, capsys):
         assert lo <= r["wave_obs"][0] < r["wave_obs"][1] <= hi
         np.testing.assert_allclose(np.array(r["wave_obs"]) / rest[k] - 1, r["z"])
         assert r["n_detected"] == np.sum((cat["line_bitmask"].astype(np.int64) >> k) & 1 > 0)
-        assert r["n_assigned"] == np.sum(cat["line_assigned"] == k)
+        right = np.isin(cat["id_outcome"], [1, 2])
+        assert r["n_identified"] == np.sum(right & ((cat["line_bitmask"].astype(np.int64) >> k) & 1 > 0))
+        assert r["n_brightest"] == np.sum(right & (cat["line_true"] == k))
+        assert r["n_mistaken"] == np.sum(~right & (cat["line_true"] == k))
+        assert r["n_interlopers"] == np.sum(~right & (cat["line_assigned"] == k))
+        assert r["n_detected"] == r["n_identified"] + r["n_mistaken"] and r["n_brightest"] <= r["n_identified"]
+    second = [r for r in rep["lines"] if r["line"] == "SIII_9069"][0]
+    assert second["n_identified"] > second["n_brightest"]            # identified as a secondary line of multi-line galaxies
     detected = {names[k] for k in range(len(names)) if np.any((cat["line_bitmask"].astype(np.int64) >> k) & 1)}
     assert detected <= {r["line"] for r in rep["lines"]}
     # interlopers: the counts are the misidentified galaxies, inside the predicted range of true redshift
@@ -216,6 +223,18 @@ def test_line_report(base, capsys):
     assert rep["lines"] == []                      # no galaxy of these slices is at 0.9 < z < 1.0 itself
     only = b.make_catalog(confusion=ROWS, seed=5, n_workers=1, verbose=False, lines=["Ha"], **LIMITS)
     assert "not in `lines`" in only.line_report() and len(only) == np.sum(cat["line_assigned"] == cat.bit("Ha"))
+    # membership: a secondary line of a multi-line galaxy belongs to the sample of that line
+    bit = (cat["line_bitmask"].astype(np.int64) >> cat.bit("SIII_9069")) & 1 > 0
+    right, wrong = np.isin(cat["id_outcome"], [1, 2]), cat["id_outcome"] == 3
+    kw = dict(confusion=ROWS, seed=5, columns=ALL, n_workers=1, verbose=False, lines=["SIII_9069"], **LIMITS)
+    detected, brightest = b.make_catalog(**kw), b.make_catalog(membership="assigned", **kw)
+    assert len(detected) == np.sum((right & bit) | (wrong & (cat["line_assigned"] == cat.bit("SIII_9069"))))
+    assert len(brightest) == np.sum(cat["line_assigned"] == cat.bit("SIII_9069")) < len(detected)
+    assert detected.settings["membership"] == "detected"
+    row = [r for r in detected.info["line_report"]["lines"] if r["line"] == "SIII_9069"][0]
+    assert row["n_identified"] + row["n_interlopers"] == len(detected)
+    with pytest.raises(ValueError):
+        b.make_catalog(membership="any", verbose=False)
     # without the misidentified galaxies, and with downsampling (counted after the thinning)
     none = b.make_catalog(confusion=ROWS, seed=5, n_workers=1, verbose=False, outcomes=["MULTI_LINE", "SINGLE_CORRECT"], **LIMITS)
     assert sum(r["n"] for r in none.info["line_report"]["interlopers"]) == 0

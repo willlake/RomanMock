@@ -162,7 +162,7 @@ def cmd_catalog(args):
     columns = args.columns if args.columns != ["all"] else "all"
     cat = base.make_catalog(
         flux_limit=args.flux_limit, secondary_flux_limit=secondary, confusion=confusion, z_range=args.z_range,
-        z_column=args.z_column, lines=args.lines, n_det_min=args.n_det_min, downsample=downsample, columns=columns,
+        z_column=args.z_column, lines=args.lines, membership=args.membership, n_det_min=args.n_det_min, downsample=downsample, columns=columns,
         seed=args.seed, n_workers=None if args.workers == "auto" else int(args.workers), verbose=not args.quiet)
     print(cat.summary())
     print(f"[romanmock] written: {cat.write(args.output)}")
@@ -283,7 +283,9 @@ def main(argv=None):
     s.add_argument("--flux-limit", type=float, help="primary flux limit [erg/s/cm^2] (default: the base catalog's)")
     s.add_argument("--secondary-flux-limit", type=float, help="limit for the other lines (default 4e-17; 0 = no second tier)")
     s.add_argument("--confusion", help="YAML file with the rows {true line: {assigned line: probability}}")
-    s.add_argument("--lines", nargs="+", help="keep galaxies assigned one of these lines, e.g. Ha")
+    s.add_argument("--lines", nargs="+", help="keep galaxies in which one of these lines is identified, e.g. Ha")
+    s.add_argument("--membership", default="detected", choices=["detected", "assigned"],
+                   help="multi-line galaxies: every detected line counts (detected), or only the brightest (assigned)")
     s.add_argument("--z-range", nargs=2, type=float, metavar=("ZMIN", "ZMAX"))
     s.add_argument("--z-column", default="redshift_assigned", choices=["redshift_assigned", "redshift_rsd", "redshift_true"])
     s.add_argument("--n-det-min", type=int)

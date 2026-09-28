@@ -1617,7 +1617,7 @@ cat = base.make_catalog(
     flux_limit=1.5e-16,               # primary limit: at least one line of the galaxy above it
     secondary_flux_limit=8.0e-17,     # limit for the other lines of such a galaxy (None: no second tier)
     confusion=confusion,              # None: the package default
-    lines=["Ha"],                     # galaxies whose assigned line is Ha (None: every line)
+    lines=["Ha"],                     # galaxies in which Ha is identified (None: every line)
     z_range=(1.0, 1.9),               # range of redshift_assigned
     seed=2026,
 )
@@ -1627,11 +1627,12 @@ The call prints a **line report** (`verbose=True`, the default; `cat.line_report
 `cat.info["line_report"]` the numbers):
 
 - the lines inside the grism bandpass for the redshift cut, with the number of catalog galaxies in which the
-  line is detected and to which it is assigned;
+  line is detected, identified (the redshift of the galaxy is right; every detected line of a multi-line galaxy
+  counts), the brightest line, mistaken for another line, and the number of interlopers taken for it;
 - the line interlopers, single-line galaxies given a wrong line. Each row is a *potential* interloper: a
   line that, taken for another one, passes the redshift cut, with its probability `P` in the confusion
   matrix and the range of true redshift it comes from. The last columns give the *actual* number in the
-  catalog and its share of the galaxies assigned to that line.
+  catalog and its share of the sample of that line.
 """),
     code("""
 from astropy.table import Table
@@ -1745,6 +1746,207 @@ romanmock catalog $PSCRATCH/romanmock_demo/two_step/base -o halpha.hdf5 \\
 ]
 
 
+NB10 = [
+    md("""
+# 10 — Random catalogs
+
+A clustering measurement needs, for each data catalog, a random catalog with the same angular footprint and
+the same redshift distribution but no clustering. `cat.make_random(...)` makes it for a catalog built with
+`base.make_catalog(...)` (notebook 09).
+
+- **Sky positions** are uniform inside the footprint of the lightcone. The footprint is exact: the lightcone
+  is made of sky patches, rectangles in the angles θ and φ listed in `lc_cores-decomposition.txt`, and each
+  galaxy carries its patch number (`lc_patch`).
+- **Redshifts** are drawn, with replacement, from the redshifts of the data catalog.
+- A contaminated catalog gives **three data catalogs**, each with its own randoms:
+
+| `which` | data catalog | `id_outcome` |
+|---|---|---|
+| `"all"` | galaxies and interlopers | 1, 2, 3 |
+| `"galaxies"` | galaxies with a correct redshift | 1 (multi-line), 2 (single-line, correct) |
+| `"interlopers"` | galaxies with a wrong redshift | 3 (single-line, misidentified) |
+
+Randoms N times as numerous as the data are N catalogs of the size of the data, one file each.
+"""),
+    code(SETUP),
+    md("""
+## The footprint
+"""),
+    code("""
+from romanmock import BaseCatalog, Catalog
+
+base = BaseCatalog(os.path.join(WORK, "two_step", "base"))
+footprint = base.footprint          # built once from the mock, then cached in the base directory
+print(footprint)
+print("patches:", footprint.patches.tolist())
+print(f"area: {footprint.area_deg2:.2f} deg2 (exact)   {base.area_deg2:.2f} deg2 (estimate from the galaxies, used for dN/dz)")"""),
+    md("""
+## A contaminated catalog and its three data catalogs
+
+An Hα sample at 1.0 < z < 1.9. `id_outcome` must be among the columns (it is by default): it tells the
+galaxies with a correct redshift from the interlopers.
+"""),
+    code("""
+confusion = {
+    "Ha":        {"OIII_5007": 0.2},
+    "OIII_5007": {"Ha": 0.2},
+    "SIII_9532": {"Ha": 0.2},
+    "Hb":        {"OIII_5007": 0.2},
+}
+cat = base.make_catalog(flux_limit=1.5e-16, secondary_flux_limit=8.0e-17, confusion=confusion,
+                        lines=["Ha"], z_range=(1.0, 1.9), seed=2026)"""),
+    code("""
+data = {which: cat.subset(which) for which in ("all", "galaxies", "interlopers")}
+for which, d in data.items():
+    z_true, z = d["redshift_rsd"], d["redshift_assigned"]
+    print(f"{which:<12s} {len(d):>11,} galaxies   true redshift {z_true.min():.3f} - {z_true.max():.3f}   "
+          f"assigned redshift {z.min():.3f} - {z.max():.3f}")"""),
+    md("""
+## Randoms in memory
+
+One call for the three kinds; `which="all"` alone returns just the list. Each random catalog has the size of
+its data catalog and the columns `ra`, `dec` and the redshift column of the redshift cut.
+"""),
+    code("""
+%%time
+randoms = cat.make_random(which=["all", "galaxies", "interlopers"], n_times=2, seed=7)"""),
+    code("""
+from astropy.table import Table
+
+ran = randoms["all"][0]
+print(ran)
+print("settings['random']:", ran.settings["random"])
+t = Table({c: ran[c][:6] for c in ran.columns})
+for c in t.colnames:
+    t[c].format = ".5f"
+t"""),
+    md("""
+## On the sky
+
+Number of objects per square degree in cells of right ascension and declination, for the data and for one
+random catalog. The outlines are the 60 patches of the footprint. The data show large-scale structure, the
+randoms only shot noise; both stop at the same edges.
+"""),
+    code("""
+ra_edges = np.linspace(0.0, 360.0, 241)
+sin_edges = np.linspace(np.sin(np.radians(57.0)), np.sin(np.radians(76.0)), 61)      # equal-area cells
+cell = np.degrees(1.0) ** 2 * np.radians(np.diff(ra_edges))[:, None] * np.diff(sin_edges)[None, :]
+dec_edges = np.degrees(np.arcsin(sin_edges))
+
+def density(c):
+    return np.histogram2d(c["ra"], np.sin(np.radians(c["dec"])), bins=(ra_edges, sin_edges))[0] / cell
+
+maps = {"data: galaxies and interlopers": density(cat), "randoms (one catalog)": density(ran)}
+vmax = np.percentile(maps["data: galaxies and interlopers"], 99.5)
+fig, axes = plt.subplots(2, 1, figsize=(10, 6.4), sharex=True, constrained_layout=True)
+for ax, (title, m) in zip(axes, maps.items()):
+    im = ax.pcolormesh(ra_edges, dec_edges, np.where(m > 0, m, np.nan).T, cmap=plotting.sequential_cmap(), vmin=0, vmax=vmax,
+                       rasterized=True)
+    for lo, hi, d_lo, d_hi in footprint.rectangles():
+        ax.plot([lo, hi, hi, lo, lo], [d_lo, d_lo, d_hi, d_hi, d_lo], color=plotting.TEXT_PRIMARY, lw=0.5)
+    ax.set_title(title, loc="left")
+    ax.set_ylabel("dec [deg]")
+axes[-1].set_xlabel("ra [deg]")
+fig.colorbar(im, ax=axes, label="objects per deg$^2$", shrink=0.8)
+plt.show()"""),
+    code("""
+inside = footprint.contains(cat["ra"], cat["dec"])
+print(f"randoms inside the footprint: {footprint.contains(ran['ra'], ran['dec']).mean():.6f}")
+print(f"data inside the footprint:    {inside.mean():.6f}   ({np.sum(~inside):,} galaxies outside: satellites of haloes at the edge)")
+
+d, r = density(cat) * cell, density(ran) * cell
+centre_ra, centre_dec = np.meshgrid(0.5 * (ra_edges[1:] + ra_edges[:-1]), 0.5 * (dec_edges[1:] + dec_edges[:-1]), indexing="ij")
+corners = [footprint.contains(a[:, None], b[None, :]) for a in (ra_edges[:-1], ra_edges[1:]) for b in (dec_edges[:-1], dec_edges[1:])]
+interior = np.all(corners, axis=0) & footprint.contains(centre_ra, centre_dec)      # cells with the four corners inside
+edge = (r > 0) & ~interior
+print(f"data / randoms in the {interior.sum():,} cells inside the footprint: {d[interior].sum() / r[interior].sum():.4f}")
+print(f"data / randoms in the {edge.sum():,} cells on its edge:            {d[edge].sum() / r[edge].sum():.4f}")"""),
+    md("""
+If the galaxies outside the footprint matter for your measurement, remove them with
+`cat = cat[footprint.contains(cat["ra"], cat["dec"])]` before making the randoms.
+
+## In redshift
+
+Each random catalog follows the redshift distribution of its own data catalog. The interlopers have a
+distribution of their own: the Hα sample contains [O III] 5007 emitters from z = 1.94–2.80 and [S III] 9532
+emitters from z = 0.38–1.00, placed at the redshift their line would have as Hα. The [S III] interlopers
+drop at an assigned redshift of 1.21: above z = 0.52 their own Hα line is inside the grism, which makes most of
+them multi-line galaxies with a correct redshift. The [O III] interlopers start at an assigned redshift of 1.24.
+"""),
+    code("""
+z_col = cat.settings["z_column"]
+edges = np.linspace(1.0, 1.9, 37)
+zc = 0.5 * (edges[1:] + edges[:-1])
+fig, axes = plt.subplots(1, 3, figsize=(13, 3.8), constrained_layout=True)
+for ax, which, color in zip(axes, data, plotting.CATEGORICAL):
+    d = data[which].dndz(edges, z_col)
+    r = np.mean([x.dndz(edges, z_col) for x in randoms[which]], axis=0)
+    ax.step(zc, d, where="mid", color=color, lw=1.6, label=f"data ({len(data[which]):,})")
+    ax.plot(zc, r, "o", ms=3, color=plotting.TEXT_PRIMARY, label=f"randoms (mean of {len(randoms[which])})")
+    ax.set_title(which, loc="left")
+    ax.set_xlabel("assigned redshift")
+    ax.set_ylim(0, None)
+    ax.legend(frameon=False)
+axes[0].set_ylabel("dN/dz per deg$^2$")
+plt.show()"""),
+    md("""
+## Randoms on disk: N files
+
+With `write_to` the randoms are written one after the other instead of being returned, so that a large
+multiple of the data never sits in memory at once. `name.hdf5` gives `name_<which>_00.hdf5`,
+`name_<which>_01.hdf5`, ... (without `<which>` when a single kind is asked for).
+"""),
+    code("""
+del randoms
+out = os.path.join(WORK, "two_step", "randoms", "halpha_z1p0_1p9.hdf5")
+cat.write(out)                                                                   # the data catalog, next to its randoms
+files = cat.make_random(which=["all", "galaxies", "interlopers"], n_times=2, seed=7, write_to=out)
+for which, paths in files.items():
+    print(which, [f"{p.name} ({os.path.getsize(p) / 1e6:.0f} MB)" for p in paths])"""),
+    code("""
+back = Catalog.read(files["interlopers"][1])
+print(back)
+print(back.settings["random"], "| footprint area", round(back.area_deg2, 2), "deg2")"""),
+    md("""
+Random catalog `k` of a kind depends on `(seed, which, k)` only. It can be made again on its own, and more
+can be added later with `first=` without remaking the existing ones.
+"""),
+    code("""
+again = cat.make_random(which="interlopers", n_times=1, first=1, seed=7, verbose=False)[0]
+print("catalog 1 made again equals the file:", all(np.array_equal(again[c], back[c]) for c in back.columns))
+
+more = cat.make_random(which="interlopers", n_times=2, first=2, seed=7, write_to=out.replace(".hdf5", "_interlopers.hdf5"))
+print([p.name for p in more])"""),
+    md("""
+## Cuts on the sky
+
+A cut on `ra` or `dec` made with `cuts=` in `make_catalog` is applied to the randoms as well.
+"""),
+    code("""
+part = base.make_catalog(flux_limit=1.5e-16, secondary_flux_limit=8.0e-17, confusion=confusion, lines=["Ha"],
+                         z_range=(1.0, 1.9), cuts={"ra": (200.0, 300.0), "dec": (60.0, 70.0)}, seed=2026, verbose=False)
+r = part.make_random(n_times=1)[0]
+print(f"data:    {len(part):,}  ra {part['ra'].min():.2f} - {part['ra'].max():.2f}  dec {part['dec'].min():.2f} - {part['dec'].max():.2f}")
+print(f"randoms: {len(r):,}  ra {r['ra'].min():.2f} - {r['ra'].max():.2f}  dec {r['dec'].min():.2f} - {r['dec'].max():.2f}")"""),
+    md("""
+## From the command line
+
+```bash
+romanmock catalog /path/to/base -o halpha.hdf5 --flux-limit 1.5e-16 --secondary-flux-limit 8e-17 \\
+          --confusion my_confusion.yaml --lines Ha --z-range 1.0 1.9
+romanmock random halpha.hdf5 -n 10 --which all galaxies interlopers -o randoms/halpha.hdf5
+```
+
+## Notes
+
+- Redshifts drawn from the data carry the radial structure of the data into the randoms, which slightly
+  suppresses the clustering of the modes along the line of sight. The effect is small for 2063 deg².
+- The randoms of `"all"` are not the sum of the randoms of `"galaxies"` and `"interlopers"`: each set is drawn
+  on its own, from the redshifts of its own data catalog.
+"""),
+]
+
+
 NOTEBOOKS = {
     "01_explore_diffsky_catalog.ipynb": NB01,
     "02_pipeline_step_by_step.ipynb": NB02,
@@ -1755,6 +1957,7 @@ NOTEBOOKS = {
     "07_two_step_workflow.ipynb": NB07,
     "08_dndz_secondary_limit.ipynb": NB08,
     "09_catalog_from_base.ipynb": NB09,
+    "10_random_catalogs.ipynb": NB10,
 }
 
 
