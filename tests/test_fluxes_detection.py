@@ -97,6 +97,93 @@ def test_gaussian_noise_detection_scatters_near_limit():
 def test_default_flux_limit_is_project_default():
     from romanmock.roman import DEFAULT_LINE_FLUX_LIMIT
 
-    assert DEFAULT_LINE_FLUX_LIMIT == 1.5e-16
-    assert ConstantFluxLimit().flux_limit_value == 1.5e-16
-    assert ThresholdDetection().sensitivity.flux_limit_value == 1.5e-16
+    from romanmock.roman import DEFAULT_SECONDARY_LINE_FLUX_LIMIT
+
+    assert DEFAULT_LINE_FLUX_LIMIT == 1.0e-16
+    assert DEFAULT_SECONDARY_LINE_FLUX_LIMIT == 4.0e-17
+    assert ConstantFluxLimit().flux_limit_value == 1.0e-16
+    assert ConstantFluxLimit().secondary_flux_limit_value == 4.0e-17
+    assert ThresholdDetection().sensitivity.flux_limit_value == 1.0e-16
+    from romanmock import RomanMockConfig, RomanMockPipeline
+
+    pipe = RomanMockPipeline(RomanMockConfig())
+    assert pipe.sensitivity.flux_limit_value == 1.0e-16
+    assert pipe.sensitivity.secondary_flux_limit_value == 4.0e-17
+
+
+def test_secondary_flux_limit_options():
+    assert ConstantFluxLimit(1e-16, secondary_flux_limit=None).secondary_flux_limit_value == 1e-16
+    assert not ConstantFluxLimit(1e-16, secondary_flux_limit=None).two_tier
+    assert ConstantFluxLimit(2e-16, secondary_flux_limit=5e-17).secondary_flux_limit_value == 5e-17
+    # the default secondary limit never exceeds the primary one
+    assert ConstantFluxLimit(1e-17).secondary_flux_limit_value == 1e-17
+    with pytest.raises(ValueError):
+        ConstantFluxLimit(1e-16, secondary_flux_limit=2e-16)
+    with pytest.raises(ValueError):
+        ConstantFluxLimit(1e-16, secondary_flux_limit="half")
+    s = ConstantFluxLimit(1e-16, (10000.0, 19300.0))
+    lim = s.secondary_flux_limit(np.array([9000.0, 12000.0, 20000.0]))
+    assert np.isinf(lim[0]) and lim[1] == 4e-17 and np.isinf(lim[2])
+    cfg = s.to_config()
+    assert cfg["secondary_flux_limit"] == 4e-17
+    from romanmock.sensitivity import build_sensitivity
+
+    assert build_sensitivity(cfg).secondary_flux_limit_value == 4e-17
+    assert build_sensitivity(ConstantFluxLimit(1e-16, secondary_flux_limit=None).to_config()).two_tier is False
+    t = TabulatedFluxLimit([10000.0, 20000.0], [1e-16, 1e-15], secondary_ratio=0.4)
+    np.testing.assert_allclose(t.secondary_flux_limit(np.array([10000.5])), 0.4 * t.flux_limit(np.array([10000.5])))
+    assert not TabulatedFluxLimit([10000.0, 20000.0], [1e-16, 1e-15]).two_tier
+
+
+def test_two_tier_threshold_detection():
+    ha, o3 = ROMAN_TRANSITIONS.bit("Ha"), ROMAN_TRANSITIONS.bit("OIII_5007")
+    #             anchored    no anchor   too faint   anchor out of band (Ha at 2.30 um)
+    z = np.array([1.5,        1.5,        1.5,        2.5])
+    flux = np.zeros((4, len(ROMAN_TRANSITIONS)))
+    flux[:, ha] = [2e-16, 8e-17, 2e-16, 5e-16]
+    flux[:, o3] = [5e-17, 5e-17, 3e-17, 5e-17]
+    det = detect_lines(flux, z, ROMAN_TRANSITIONS, ThresholdDetection(ConstantFluxLimit(1e-16, secondary_flux_limit=4e-17)))
+    np.testing.assert_array_equal(det.detected[:, ha], [True, False, True, False])
+    np.testing.assert_array_equal(det.detected[:, o3], [True, False, False, False])
+    np.testing.assert_array_equal(det.n_det, [2, 0, 1, 0])
+    np.testing.assert_array_equal(det.primary[:, o3], [False, False, False, False])
+    np.testing.assert_array_equal(det.primary[:, ha], [True, False, True, False])
+    # every detected galaxy has at least one primary line
+    assert (det.primary.any(axis=1) == (det.n_det > 0)).all()
+    # the default model is the two-tier rule with 1e-16 / 4e-17
+    np.testing.assert_array_equal(detect_lines(flux, z, ROMAN_TRANSITIONS).bitmask, det.bitmask)
+    # without the second tier only lines above 1e-16 remain
+    single = detect_lines(flux, z, ROMAN_TRANSITIONS, ThresholdDetection(ConstantFluxLimit(1e-16, secondary_flux_limit=None)))
+    np.testing.assert_array_equal(single.n_det, [1, 0, 1, 0])
+
+
+def test_two_tier_random_consistency(synthetic, cosmo):
+    from romanmock.fluxes import feature_fluxes
+
+    flux = feature_fluxes(synthetic, ROMAN_TRANSITIONS, synthetic["redshift_true"], cosmo)
+    z = synthetic["redshift_obs"]
+    one = detect_lines(flux, z, ROMAN_TRANSITIONS, ThresholdDetection(ConstantFluxLimit(1e-16, secondary_flux_limit=None)))
+    low = detect_lines(flux, z, ROMAN_TRANSITIONS, ThresholdDetection(ConstantFluxLimit(4e-17, secondary_flux_limit=None)))
+    two = detect_lines(flux, z, ROMAN_TRANSITIONS, ThresholdDetection(ConstantFluxLimit(1e-16, secondary_flux_limit=4e-17)))
+    # same galaxies as the primary-only selection, lines of the deep selection for those galaxies
+    np.testing.assert_array_equal(two.n_det > 0, one.n_det > 0)
+    np.testing.assert_array_equal(two.primary, one.detected)
+    np.testing.assert_array_equal(two.detected, low.detected & (one.n_det > 0)[:, None])
+    assert two.n_det.sum() > one.n_det.sum()
+
+
+def test_two_tier_gaussian_noise_detection():
+    rng = np.random.default_rng(5)
+    n = 20000
+    z = np.full(n, 1.5)
+    ha, o3 = ROMAN_TRANSITIONS.bit("Ha"), ROMAN_TRANSITIONS.bit("OIII_5007")
+    flux = np.zeros((n, len(ROMAN_TRANSITIONS)))
+    flux[:, ha] = 5e-16          # always a primary detection
+    flux[:, o3] = 4e-17          # exactly at the secondary limit -> detected ~50% of the time
+    model = GaussianNoiseDetection(ConstantFluxLimit(1e-16, secondary_flux_limit=4e-17))
+    det = detect_lines(flux, z, ROMAN_TRANSITIONS, model, rng)
+    assert det.detected[:, ha].all()
+    assert 0.47 < det.detected[:, o3].mean() < 0.53
+    flux[:, ha] = 0.0            # no anchor: [O III] at 4e-17 is 9 sigma below the primary cut
+    det = detect_lines(flux, z, ROMAN_TRANSITIONS, model, rng)
+    assert det.detected[:, o3].mean() < 1e-3

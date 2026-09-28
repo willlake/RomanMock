@@ -152,12 +152,24 @@ def test_provenance_manifest_and_stale_samples(tmp_path):
 
     pipe.config.output.overwrite = True
     s_full = SampleConfig(name="s", outcomes=["MULTI_LINE", "SINGLE_CORRECT", "SINGLE_MISID"])
-    assert pipe.build_samples(samples=[s_full], verbose=False) == [tmp_path / "samples" / "s.hdf5"]
+    # samples are written slice by slice: a directory per sample (one file per slice) by default
+    from romanmock.io import open_sample
+
+    assert pipe.build_samples(samples=[s_full], verbose=False) == [tmp_path / "samples" / "s"]
+    n_slices = len(open_sample(tmp_path / "samples" / "s"))
     s_empty = SampleConfig(name="s", z_min=9.0, z_max=10.0)
     with pytest.warns(UserWarning, match="empty"):
         assert pipe.build_samples(samples=[s_empty], verbose=False) == []
-    assert not (tmp_path / "samples" / "s.hdf5").exists()
+    assert not (tmp_path / "samples" / "s").exists()
     assert yaml.safe_load((tmp_path / "samples" / "s_metadata.yaml").read_text())["empty"] is True
+    # the single-file layout is still available and holds the same rows
+    pipe.config.output.sample_layout = "single"
+    assert pipe.build_samples(samples=[s_full], verbose=False) == [tmp_path / "samples" / "s.hdf5"]
+    assert len(oc.open(tmp_path / "samples" / "s.hdf5")) == n_slices
+    with pytest.warns(UserWarning, match="empty"):
+        assert pipe.build_samples(samples=[s_empty], verbose=False) == []
+    assert not (tmp_path / "samples" / "s.hdf5").exists() and not (tmp_path / "samples" / ".s_slices").exists()
+    pipe.config.output.sample_layout = "slices"
 
     # overwrite with a changed configuration discards the old outputs and starts over
     changed.config.output.overwrite = True

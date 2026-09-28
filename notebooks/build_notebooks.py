@@ -129,14 +129,17 @@ with_flux = add_line_fluxes(sub, line_set)
 flux = with_flux.select(*[f"{f.name}_flux" for f in line_set]).get_data("numpy", wrap_single=True)
 print(with_flux.units["Ha_flux"], "|", with_flux.descriptions["OII_3727_flux"])'''),
     code('''
-from romanmock.roman import DEFAULT_LINE_FLUX_LIMIT
+from romanmock.roman import DEFAULT_LINE_FLUX_LIMIT, DEFAULT_SECONDARY_LINE_FLUX_LIMIT
 
 fig, ax = plt.subplots()
 bins = np.linspace(-19, -14.5, 70)
 for name in ["Ha", "OIII_5007", "OII_3727"]:
     ax.hist(np.log10(flux[f"{name}_flux"]), bins=bins, histtype="step", color=plotting.feature_color(name), label=name)
-ax.axvline(np.log10(DEFAULT_LINE_FLUX_LIMIT), color=plotting.TEXT_SECONDARY, lw=1, ls="--")
-ax.text(np.log10(DEFAULT_LINE_FLUX_LIMIT) + 0.05, ax.get_ylim()[1] * 0.95, f"{DEFAULT_LINE_FLUX_LIMIT:.1e} erg/s/cm² (default limit)", color=plotting.TEXT_SECONDARY, fontsize=8, va="top")
+ymax = ax.get_ylim()[1]
+for lim, ls, y, text in [(DEFAULT_LINE_FLUX_LIMIT, "--", 0.95, "default limit"),
+                         (DEFAULT_SECONDARY_LINE_FLUX_LIMIT, ":", 0.85, "secondary limit, galaxies with a line above the default")]:
+    ax.axvline(np.log10(lim), color=plotting.TEXT_SECONDARY, lw=1, ls=ls)
+    ax.text(np.log10(lim) + 0.05, ymax * y, f"{lim:.1e} erg/s/cm² ({text})", color=plotting.TEXT_SECONDARY, fontsize=8, va="top")
 ax.set_xlabel("log10 observed line flux [erg/s/cm²]"); ax.set_ylabel("galaxies")
 ax.set_title("Observed line fluxes at z ≈ 1.2"); ax.legend(); plt.show()'''),
     md('''
@@ -220,20 +223,38 @@ for i, feat in enumerate(line_set):
 ## 2. Detection and the bitmask
 
 A line is detectable if `F > F_lim(λ_obs)` with `λ_obs = λ₀ (1 + z_rsd)` inside the bandpass.
-`ConstantFluxLimit` is the plan's initial model. Bit *i* of the bitmask is feature *i* of the
-line set; `n_det = popcount(bitmask)`.
+`ConstantFluxLimit` is the plan's initial model, with two tiers: a galaxy needs one line above the
+primary limit (default 1.0e-16 erg/s/cm²); once it has one, its other lines inside the bandpass count as
+detected above the lower secondary limit (default 4.0e-17). A galaxy without a primary line has no
+detected line at all. Bit *i* of the bitmask is feature *i* of the line set; `n_det = popcount(bitmask)`.
 '''),
     code('''
 from romanmock import ConstantFluxLimit, ThresholdDetection, detect_lines, unpack_bitmask
 
 rng = np.random.default_rng(0)
-from romanmock.roman import DEFAULT_LINE_FLUX_LIMIT
-model = ThresholdDetection(ConstantFluxLimit(flux_limit=DEFAULT_LINE_FLUX_LIMIT, wave_range=(10000.0, 19300.0)))
+from romanmock.roman import DEFAULT_LINE_FLUX_LIMIT, DEFAULT_SECONDARY_LINE_FLUX_LIMIT
+sens = ConstantFluxLimit(flux_limit=DEFAULT_LINE_FLUX_LIMIT, wave_range=(10000.0, 19300.0),
+                         secondary_flux_limit=DEFAULT_SECONDARY_LINE_FLUX_LIMIT)
+print(sens)
+model = ThresholdDetection(sens)
 det = detect_lines(flux, z_rsd, line_set, model, rng)
 
 print("bitmask dtype", det.bitmask.dtype, "| example bitmasks", det.bitmask[:8])
 print("n_det       ", det.n_det[:8])
 print("bit 0 (Ha) of the first 8:", unpack_bitmask(det.bitmask[:8], len(line_set))[:, 0].astype(int))'''),
+    code('''
+# effect of the second tier: same galaxies, more lines per galaxy
+single_tier = detect_lines(flux, z_rsd, line_set, ThresholdDetection(
+    ConstantFluxLimit(DEFAULT_LINE_FLUX_LIMIT, (10000.0, 19300.0), secondary_flux_limit=None)))
+print("same detected galaxies:", np.array_equal(det.n_det > 0, single_tier.n_det > 0),
+      "| lines above the primary limit identical:", np.array_equal(det.primary, single_tier.detected))
+n = (det.n_det > 0).sum()
+print(f"detected galaxies {n:,}; multi-line fraction {np.mean(single_tier.n_det[det.n_det > 0] > 1):.3f} "
+      f"(primary limit only) -> {np.mean(det.n_det[det.n_det > 0] > 1):.3f} (with the secondary limit)")
+for i, name in enumerate(line_set.names):
+    a, b = single_tier.detected[:, i].sum(), det.detected[:, i].sum()
+    if b:
+        print(f"  {name:<10s} {a:>8,} -> {b:>8,} detected lines ({b - a:,} between the two limits)")'''),
     code('''
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 3.8))
 counts = np.bincount(det.n_det, minlength=5)
@@ -305,11 +326,12 @@ output columns of the catalog.
 '''),
     code('''
 from romanmock import RomanMockConfig, RomanMockPipeline
-from romanmock.roman import DEFAULT_LINE_FLUX_LIMIT as FLUX_LIMIT
+from romanmock.roman import DEFAULT_LINE_FLUX_LIMIT as FLUX_LIMIT, DEFAULT_SECONDARY_LINE_FLUX_LIMIT as SECONDARY_LIMIT
 
 cfg = RomanMockConfig.from_dict({
     "line_set": "roman_transitions",
-    "sensitivity": {"type": "constant", "flux_limit": FLUX_LIMIT, "wave_range": [10000.0, 19300.0]},
+    "sensitivity": {"type": "constant", "flux_limit": FLUX_LIMIT, "secondary_flux_limit": SECONDARY_LIMIT,
+                    "wave_range": [10000.0, 19300.0]},
     "confusion": {"type": "matrix", "default_p_fail": 0.0, "rows": cm.to_dict()["rows"]},   # same as the package default
     "output": {"store_snr": True},
 })
@@ -340,14 +362,17 @@ object drives the CLI. Each slice gets a random stream seeded by `(seed, step)`.
 '''),
     code('''
 from romanmock import RomanMockConfig, RomanMockPipeline
-from romanmock.roman import DEFAULT_LINE_FLUX_LIMIT as FLUX_LIMIT
+from romanmock.roman import DEFAULT_LINE_FLUX_LIMIT as FLUX_LIMIT, DEFAULT_SECONDARY_LINE_FLUX_LIMIT as SECONDARY_LIMIT
 
+# one output directory per pair of limits, so runs with different thresholds never mix
+PARENT_DIR = os.path.join(WORK, f"parent_F{FLUX_LIMIT:.1e}_S{SECONDARY_LIMIT:.1e}")
 cfg = RomanMockConfig.from_dict({
     "catalog": {"path": CATALOG, "steps": [148, 219, 224]},   # the intended parent catalog: three slices
-    "output": {"dir": os.path.join(WORK, "parent"), "overwrite": False, "store_fluxes": True,   # fluxes are optional; kept here to show them
+    "output": {"dir": PARENT_DIR, "overwrite": False, "store_fluxes": True,   # fluxes are optional; kept here to show them
                "passthrough_columns": ["gal_id", "ra", "dec", "redshift_true", "logsm_obs", "roman_F158"]},
     "line_set": "roman_transitions",
-    "sensitivity": {"type": "constant", "flux_limit": FLUX_LIMIT, "wave_range": [10000.0, 19300.0]},
+    "sensitivity": {"type": "constant", "flux_limit": FLUX_LIMIT, "secondary_flux_limit": SECONDARY_LIMIT,
+                    "wave_range": [10000.0, 19300.0]},
     # confusion: omitted -> the package default scenario (romanmock.config.DEFAULT_CONFUSION_ROWS)
     "seed": 2026,
 })
@@ -443,10 +468,12 @@ samples = [
                  downsample=DownsampleConfig(target=target, z_edges=edges.tolist(), smooth_bins=1.0)),
 ]
 cfg.output.overwrite = True
-sample_files = pipe.build_samples(samples=samples)
+sample_files = pipe.build_samples(samples=samples)      # one directory per sample, one file per slice inside
 sample_files'''),
     code('''
-ds_sample = oc.open(sample_files[1])
+from romanmock.io import open_sample
+
+ds_sample = open_sample(sample_files[1])                # the slice files of a sample, as one lightcone
 zs = ds_sample.select("redshift_assigned").get_data("numpy")
 fig, ax = plt.subplots()
 ax.step(zc, mock, where="mid", color=plotting.CATEGORICAL[0], label="mock, assigned Hα in box")
@@ -454,7 +481,7 @@ ax.plot(zc, target["dndz"], color=plotting.CATEGORICAL[1], label="target")
 ax.step(zc, dndz(zs, edges, fp_area), where="mid", color=plotting.CATEGORICAL[2], label="downsampled sample")
 ax.set_xlabel("redshift_assigned"); ax.set_ylabel("dN/dz per deg²"); ax.set_title(f"Downsampling to a target dN/dz (footprint {fp_area:.0f} deg²)")
 ax.legend(); plt.show()
-print(open(os.path.join(WORK, "parent", "samples", "halpha_box_downsampled_metadata.yaml")).read()[-400:])'''),
+print(open(os.path.join(PARENT_DIR, "samples", "halpha_box_downsampled_metadata.yaml")).read()[-400:])'''),
     md('''
 The sample file keeps `ra`, `dec`, `redshift_true`, `redshift_rsd`, `redshift_assigned` and `id_outcome`
 (configurable with `output.sample_columns`); the parent catalog also has `line_bitmask`, `line_true`, `line_assigned`,
@@ -491,12 +518,14 @@ z_rsd = data["redshift_obs"]'''),
 `TabulatedFluxLimit` interpolates a flux-limit curve (log-linear) and is infinite outside its
 range. Any object with `wave_range` and `flux_limit(wave_obs)` works; register it in
 `romanmock.sensitivity.SENSITIVITY_MODELS` to select it by name from YAML (`type: tabulated`,
-with `file:` for a two-column text file).
+with `file:` for a two-column text file). A model that also defines `secondary_flux_limit(wave_obs)`
+gets the two-tier rule (lower limit for the other lines of a galaxy with one line above `flux_limit`);
+`TabulatedFluxLimit` takes it as a ratio, `secondary_ratio=0.4` being the equivalent of 4e-17 at 1e-16.
 '''),
     code('''
 wave = np.linspace(10000, 19300, 50)
 curve = 1e-16 * (1 + 2.0 * ((wave - 14650) / 4650) ** 2)      # toy: worse sensitivity towards the band edges
-tab = TabulatedFluxLimit(wave, curve)
+tab = TabulatedFluxLimit(wave, curve, secondary_ratio=0.4)      # same two tiers as the constant default (1e-16, 4e-17)
 
 fig, ax = plt.subplots()
 w = np.linspace(9500, 20000, 300)
@@ -507,7 +536,8 @@ ax.set_title("Sensitivity models"); ax.legend(); plt.show()
 
 for name, model in [("constant", ConstantFluxLimit(1e-16)), ("tabulated", tab)]:
     det = detect_lines(flux, z_rsd, line_set, ThresholdDetection(model))
-    print(f"{name:<10s} detected fraction (any line): {np.mean(det.n_det > 0):.3f}")'''),
+    print(f"{name:<10s} detected fraction (any line): {np.mean(det.n_det > 0):.3f}   multi-line among detected: "
+          f"{np.mean(det.n_det[det.n_det > 0] > 1):.3f}")'''),
     md('''
 ## Detection scatter
 
@@ -622,7 +652,7 @@ The same run from the command line is
     code("""
 import time
 from romanmock import RomanMockConfig, RomanMockPipeline
-from romanmock.roman import DEFAULT_LINE_FLUX_LIMIT as FLUX_LIMIT
+from romanmock.roman import DEFAULT_LINE_FLUX_LIMIT as FLUX_LIMIT, DEFAULT_SECONDARY_LINE_FLUX_LIMIT as SECONDARY_LIMIT
 
 from romanmock.io import memory_budget_gb, suggest_n_workers
 
@@ -630,14 +660,16 @@ from romanmock.io import memory_budget_gb, suggest_n_workers
 # (node memory, or the per-user cgroup cap on a NERSC login node)
 N_WORKERS = suggest_n_workers(max_workers=32)
 print(f"memory budget {memory_budget_gb():.0f} GB -> {N_WORKERS} worker(s)")
-OUT_DIR = os.path.join(WORK, "full")
+OUT_DIR = os.path.join(WORK, f"full_F{FLUX_LIMIT:.1e}_S{SECONDARY_LIMIT:.1e}")   # one directory per pair of limits
 
 cfg = RomanMockConfig.from_dict({
     "catalog": {"path": CATALOG},                        # every slice, z = 0-4
     "output": {"dir": OUT_DIR, "overwrite": False,
                "passthrough_columns": ["ra", "dec", "redshift_true"]},          # plus redshift_rsd, redshift_assigned, id_outcome, identification columns
     "line_set": "roman_transitions",
-    "sensitivity": {"type": "constant", "flux_limit": FLUX_LIMIT, "wave_range": [10000.0, 19300.0]},
+    # primary limit for the first line of a galaxy, lower secondary limit for its other lines
+    "sensitivity": {"type": "constant", "flux_limit": FLUX_LIMIT, "secondary_flux_limit": SECONDARY_LIMIT,
+                    "wave_range": [10000.0, 19300.0]},
     "detection": {"type": "threshold"},
     # confusion: omitted -> the package default scenario (romanmock.config.DEFAULT_CONFUSION_ROWS):
     #   true Ha called [O III] 5007 with p = 0.005; true [O III] 5007, [S III] 9532 called Ha with p = 0.05;
@@ -696,7 +728,7 @@ for name in ["Ha", "OIII_5007", "OII_3727", "Hb", "OIII_4959", "SIII_9532"]:
     y = dndz(pdata["redshift_assigned"][sel], z_edges, area)
     ax.step(zc, y, where="mid", color=plotting.feature_color(name), label=f"{name} ({sel.sum():,})")
 ax.set_yscale("log"); ax.set_ylim(1, None)
-ax.set_xlabel("redshift_assigned"); ax.set_ylabel("dN/dz per deg²"); ax.set_title(f"Assigned-line samples, F > {FLUX_LIMIT:.1e} erg/s/cm², 1.00–1.93 μm")
+ax.set_xlabel("redshift_assigned"); ax.set_ylabel("dN/dz per deg²"); ax.set_title(f"Assigned-line samples, F > {FLUX_LIMIT:.1e} (other lines > {SECONDARY_LIMIT:.1e}) erg/s/cm², 1.00–1.93 μm")
 ax.legend(fontsize=8); plt.show()"""),
     md("""
 ## True versus assigned redshift
@@ -773,7 +805,9 @@ emitters above a given line-flux limit (Tables 1–2, Galacticus on the UNIT lig
 numbers describe *true emitters before observational efficiency*, so the right quantity to match
 is the mock's detected-line population in bins of true redshift, before any redshift assignment
 or sample selection. `romanmock.reference_dndz` carries the tables; the comparison below uses the
-run's flux limit (the package default, 1.5e-16) and the A_V = 1.65 dust model.
+run's primary flux limit (the package default, 1.0e-16) and the A_V = 1.65 dust model. Populations are
+defined by the brightest detected line, which is always above the primary limit, so the lower secondary
+limit (4.0e-17, for the other lines of a detected galaxy) does not enter this comparison.
 """),
     code("""
 from romanmock.reference_dndz import wang2022_bins
@@ -810,13 +844,15 @@ cfg.output.overwrite = True
 print("default sample columns:", cfg.output.sample_columns)
 cfg.output.sample_columns = None    # keep every parent column here: the composition plots below need line_true
 t0 = time.time()
-sample_files = pipe.build_samples(samples=samples)
+sample_files = pipe.build_samples(samples=samples, n_workers=min(N_WORKERS, 16))   # slice by slice, ~1.7 GB per worker
 print(f"{(time.time() - t0) / 60:.1f} min")
 sample_files"""),
     code("""
+from romanmock.io import open_sample
+
 fig, axes = plt.subplots(1, 2, figsize=(12, 4))
 for ax, path, name in zip(axes, sample_files, ["Ha", "OIII_5007"]):
-    d = oc.open(path).select("redshift_assigned", "redshift_rsd", "id_outcome", "line_true").get_data("numpy", wrap_single=True)
+    d = open_sample(path).select("redshift_assigned", "redshift_rsd", "id_outcome", "line_true").get_data("numpy", wrap_single=True)
     edges, ref = wang2022_bins(name, FLUX_LIMIT, 1.65)
     zc = 0.5 * (edges[1:] + edges[:-1])
     sel = pdata["line_assigned"] == pipe.line_set.bit(name)
@@ -876,7 +912,7 @@ interloper fraction.
 from romanmock import IdOutcome
 
 i_ha, i_o3 = pipe.line_set.bit("Ha"), pipe.line_set.bit("OIII_5007")
-d = oc.open(sample_files[1]).select("redshift_assigned", "redshift_rsd", "line_true", "id_outcome").get_data("numpy", wrap_single=True)
+d = open_sample(sample_files[1]).select("redshift_assigned", "redshift_rsd", "line_true", "id_outcome").get_data("numpy", wrap_single=True)
 edges = np.linspace(2.0, 2.9, 10)
 zc = 0.5 * (edges[1:] + edges[:-1])
 true_o3 = d["line_true"] == i_o3
@@ -904,7 +940,7 @@ print(f"[O III] sample: {n_all.sum():,} galaxies; true [O III] {n_true.sum():,};
       f"({100 * n_int.sum() / n_all.sum():.1f}%), from a source population of single-line Hα emitters at z_rsd ~ {src_edges[0]:.2f}-{src_edges[-1]:.2f}")
 n_src = np.sum((pdata['line_true'] == i_ha) & (pdata['n_det'] == 1) & (pdata['redshift_rsd'] >= src_edges[0]) & (pdata['redshift_rsd'] <= src_edges[-1]))
 print(f"single-line Hα emitters in the parent at those redshifts (before thinning): {n_src:,}; "
-      f"x C(Hα→[O III]) = {c_ha_o3:.2f} -> {n_src * c_ha_o3:,.0f} interlopers before thinning, versus {n_true.sum():,} true [O III] emitters kept")"""),
+      f"x C(Hα→[O III]) = {c_ha_o3:.3f} -> {n_src * c_ha_o3:,.0f} interlopers before thinning, versus {n_true.sum():,} true [O III] emitters kept")"""),
     md("""
 So the 5 % matrix entry becomes a ~30 % contamination because the source population is an order of
 magnitude larger than the target population. Lowering the interloper fraction in this scenario
@@ -983,9 +1019,9 @@ print(f"area = {area:.1f} deg² (nominal 5 % of the sky = {0.05 * 41252.96:.1f})
     md("""
 ## dN/dz per line at both flux limits
 
-Solid steps: the mock. Dashed steps with shaded ±1σ bands: Wang et al. (2022) Tables 1–2 (Galacticus, A_V = 1.65)
-for Hα and [O III] 5007 at the same flux limit; the tabulated uncertainties combine jackknife resampling and cosmic
-variance. Every galaxy with the line above the limit is counted, whatever its other lines do. All nine lines of
+Solid steps: the mock. Dashed and dotted steps with shaded ±1σ bands: Wang et al. (2022) Tables 1–2 (Galacticus)
+for Hα and [O III] 5007 at the same flux limit, for their two dust models, A_V = 1.65 (dashed) and A_V = 1.92
+(dotted); the tabulated uncertainties combine jackknife resampling and cosmic variance. Every galaxy with the line above the limit is counted, whatever its other lines do. All nine lines of
 the `roman_transitions` set are counted; lines with fewer than one galaxy per deg² above the limit (the auroral
 [O III] 4363, never, and [S III] 6312, ~150 galaxies in the whole footprint) are left out of the legends and the table.
 """),
@@ -998,15 +1034,17 @@ for ax, lim in zip(axes, FLUX_LIMITS):
             continue
         ax.step(ZC, y, where="mid", color=plotting.feature_color(name), label=f"{name} ({census.integrated(name, lim, area):,.0f} /deg²)")
     for name in ["Ha", "OIII_5007"]:
-        edges, ref = wang2022_bins(name, lim)
-        err = wang2022_errors(name, lim)
-        zc_ref = 0.5 * (edges[1:] + edges[:-1])
-        ax.step(zc_ref, ref, where="mid", color=plotting.feature_color(name), ls="--", lw=1.2, label=f"{name} Wang+22 ±1σ")
-        ax.fill_between(edges, np.append(ref - err, ref[-1] - err[-1]), np.append(ref + err, ref[-1] + err[-1]),
-                        step="post", color=plotting.feature_color(name), alpha=0.18, lw=0)
+        for dust_av, ls in [(1.65, "--"), (1.92, ":")]:
+            edges, ref = wang2022_bins(name, lim, dust_av)
+            err = wang2022_errors(name, lim, dust_av)
+            zc_ref = 0.5 * (edges[1:] + edges[:-1])
+            ax.step(zc_ref, ref, where="mid", color=plotting.feature_color(name), ls=ls, lw=1.2,
+                    label=f"{name} Wang+22 A$_V$={dust_av} ±1σ")
+            ax.fill_between(edges, np.append(ref - err, ref[-1] - err[-1]), np.append(ref + err, ref[-1] + err[-1]),
+                            step="post", color=plotting.feature_color(name), alpha=0.15, lw=0)
     ax.set_yscale("log"); ax.set_ylim(10, None); ax.set_xlim(Z_EDGES[0], Z_EDGES[-1])
     ax.set_xlabel("redshift"); ax.set_title(f"F > {lim:.1e} erg/s/cm²")
-    ax.legend(fontsize=7.5, ncol=2)
+    ax.legend(fontsize=7.5, ncol=2, loc="upper center", bbox_to_anchor=(0.5, -0.16), frameon=False)
 axes[0].set_ylabel("dN/dz per deg²")
 fig.suptitle("Emitters above the flux limit in 1.00–1.93 μm, no confusion, no downsampling", y=1.02)
 plt.show()"""),
@@ -1098,6 +1136,615 @@ Files written to `WORK`: `census_z0p5_3p0.npz` (all counts, reloadable with `Lin
 ]
 
 
+# =====================================================================================
+# 07 - two-step catalog construction: base flux catalog, then limits and redshifts
+# =====================================================================================
+NB07 = [
+    md("""
+# 07 — Two-step catalog construction
+
+Reading the input mock (340 GB) is the expensive part of building a catalog, and it does not depend on
+the choices one wants to vary afterwards. The two-step routine reads it once:
+
+1. **Base flux catalog** (`romanmock base`, `pipe.build_base()`): every galaxy with at least one line above the
+   primary flux limit inside the grism bandpass, with `gal_id`, `ra`, `dec`, `redshift_true`, `redshift_rsd`, the
+   flux of **all** lines of the line set, and the bitmask at the base limits (`line_bitmask_base`). The copied
+   columns are configurable.
+2. **Detection and redshifts** (`romanmock assign`, `source: "base"`): read the base catalog, apply the flux
+   limits of your choice (not deeper than the base), rebuild the bitmask and assign redshifts. The output is an
+   ordinary parent catalog, so sample building and the diagnostics work as in the other notebooks.
+
+This notebook follows the file-based route, which writes OpenCosmo lightcones. For everyday use there is a
+shorter one, shown in notebook 09: `BaseCatalog(base_dir).make_catalog(...)` returns the catalog in memory in
+15–20 s, with the same galaxies for the same settings.
+
+Measured on the full lightcone with a base limit of 1.0e-16 erg/s/cm²: step 1 takes about one minute on a CPU
+node (32 workers, 5.7 GB each) and 7.6 GB of disk; step 2 takes 1.5–2 minutes on a **login node** with 4
+workers at 2.4 GB each.
+"""),
+    code(SETUP),
+    md("""
+## Step 1: the base flux catalog
+
+The base limits are the `sensitivity` block of the configuration (here the package defaults), and `base.columns`
+lists the columns copied from the input mock. Slices already built with the same settings are reused, so this
+cell is fast the second time.
+"""),
+    code("""
+import time, glob
+from romanmock import RomanMockConfig, RomanMockPipeline
+from romanmock.io import suggest_n_workers, memory_budget_gb, read_manifest, spatial_index_nbytes
+from romanmock.roman import (DEFAULT_LINE_FLUX_LIMIT as BASE_LIMIT, DEFAULT_SECONDARY_LINE_FLUX_LIMIT as SECONDARY_LIMIT,
+                             GRISM_WAVE_RANGE_ANGSTROM as GRISM)
+
+TWO = os.path.join(WORK, "two_step")
+BASE_DIR = os.path.join(TWO, "base")
+
+base_cfg = RomanMockConfig.from_dict({
+    "catalog": {"path": CATALOG},                                   # every slice, z = 0-4
+    "line_set": "roman_transitions",
+    "sensitivity": {"type": "constant", "flux_limit": BASE_LIMIT, "secondary_flux_limit": SECONDARY_LIMIT,
+                    "wave_range": list(GRISM)},
+    "base": {"dir": BASE_DIR, "columns": ["gal_id", "ra", "dec", "redshift_true"]},
+})
+base_pipe = RomanMockPipeline(base_cfg)
+n1 = suggest_n_workers(max_workers=32, per_worker_gb=6.0)
+print(f"memory budget {memory_budget_gb():.0f} GB -> {n1} worker(s) for step 1")
+t0 = time.time()
+base_files = base_pipe.build_base(n_workers=n1, verbose=False)
+manifest = read_manifest(BASE_DIR, base_cfg.base.tag)
+n_in = sum(v["n_input"] for v in manifest["slices"].values())
+n_base = sum(v["n_galaxies"] for v in manifest["slices"].values())
+print(f"{len(base_files)} files in {time.time() - t0:.0f} s; {n_base:,} of {n_in:,} galaxies ({100 * n_base / n_in:.1f}%) "
+      f"have a line above {BASE_LIMIT:.1e} erg/s/cm² in the bandpass")"""),
+    code("""
+base = oc.open(*base_files)
+print(f"{len(base):,} galaxies, z_range {base.z_range}")
+for c in ["gal_id", "ra", "dec", "redshift_true", "redshift_rsd", "line_bitmask_base", "Ha_flux", "OIII_5007_flux"]:
+    unit = str(base.units.get(c) or "-")
+    print(f"  {c:<16s} [{unit:^14s}] {(base.descriptions.get(c) or '(no description in the input mock)')[:95]}")
+print("flux columns:", [c for c in base.columns if c.endswith("_flux")])
+
+one = oc.open(base_files[len(base_files) // 2]).select("gal_id", "redshift_rsd", "line_bitmask_base", "Ha_flux", "Hb_flux",
+                                                         "OIII_5007_flux").get_data("numpy")
+from astropy.table import Table
+t = Table({k: one[k][:6] for k in one}); t["Ha_flux"].format = t["Hb_flux"].format = t["OIII_5007_flux"].format = ".2e"
+t"""),
+    md("""
+Every line flux is stored, also for lines below the limits or outside the bandpass. That is what lets step 2
+choose any secondary limit. The histogram shows the base selection: the brightest in-band line of every
+galaxy is above the base limit, while the individual lines extend far below it.
+"""),
+    code("""
+flux_cols = base_pipe.flux_columns
+d = oc.open(base_files[len(base_files) // 2]).select(*flux_cols, "redshift_rsd").get_data("numpy")
+flux = np.stack([d[c] for c in flux_cols], axis=1)
+wave = base_pipe.line_set.rest_waves[None, :] * (1 + d["redshift_rsd"][:, None])
+inband = (wave > GRISM[0]) & (wave < GRISM[1])
+brightest = np.where(inband, flux, 0).max(axis=1)
+
+fig, ax = plt.subplots(figsize=(8.5, 4.2))
+bins = np.linspace(-18.5, -14.5, 80)
+ax.hist(np.log10(brightest), bins=bins, histtype="step", color=plotting.TEXT_PRIMARY, lw=1.6, label="brightest in-band line")
+for name in ["Ha", "OIII_5007", "Hb"]:
+    i = base_pipe.line_set.bit(name)
+    ax.hist(np.log10(flux[inband[:, i], i]), bins=bins, histtype="step", color=plotting.feature_color(name), label=f"{name} (in band)")
+for lim, ls in [(BASE_LIMIT, "--"), (SECONDARY_LIMIT, ":")]:
+    ax.axvline(np.log10(lim), color=plotting.TEXT_SECONDARY, lw=1, ls=ls)
+ax.set_xlabel("log10 line flux [erg/s/cm²]"); ax.set_ylabel("galaxies"); ax.set_yscale("log")
+ax.set_title("One slice of the base catalog: dashed = primary limit, dotted = secondary limit"); ax.legend(fontsize=8); plt.show()"""),
+    md("""
+## Step 2: flux limits, bitmask and redshifts from the base catalog
+
+A configuration with `source: "base"` makes `RomanMockPipeline.run` read the base catalog instead of the input
+mock. Three settings are run here: the base limits themselves, a brighter primary limit, and the brighter
+limit without the second tier. Each writes its own parent catalog and the effective `config.yaml` next to it.
+"""),
+    code("""
+def assign(flux_limit, secondary):
+    tag = f"nb_F{flux_limit:.1e}_S" + ("none" if secondary is None else f"{secondary:.1e}")
+    cfg = RomanMockConfig.from_dict({
+        "source": "base",
+        "base": {"dir": BASE_DIR},
+        "output": {"dir": os.path.join(TWO, tag), "passthrough_columns": ["gal_id", "ra", "dec", "redshift_true"]},
+        "sensitivity": {"type": "constant", "flux_limit": flux_limit, "secondary_flux_limit": secondary,
+                        "wave_range": list(GRISM)},
+        # confusion: omitted -> the package default scenario
+        "seed": 2026,
+    })
+    pipe = RomanMockPipeline(cfg)
+    t0 = time.time()
+    files = pipe.run(n_workers=N2, verbose=False)
+    cfg.to_yaml(os.path.join(cfg.output.dir, "config.yaml"))       # for `romanmock select` / `romanmock summary`
+    print(f"{str(pipe.sensitivity):<75s} {len(files)} files, {time.time() - t0:5.0f} s -> {tag}")
+    return pipe
+
+N2 = suggest_n_workers(max_workers=16, per_worker_gb=2.5)
+print(f"memory budget {memory_budget_gb():.0f} GB -> {N2} worker(s) for step 2")
+SETTINGS = {"1.0e-16 / 4.0e-17": (BASE_LIMIT, SECONDARY_LIMIT), "1.5e-16 / 4.0e-17": (1.5e-16, SECONDARY_LIMIT),
+            "1.5e-16, single tier": (1.5e-16, None)}
+runs = {label: assign(*limits) for label, limits in SETTINGS.items()}"""),
+    code("""
+from romanmock.diagnostics import outcome_summary
+from romanmock.selection import sky_area_deg2
+
+cols = ["redshift_assigned", "id_outcome", "n_det", "line_assigned"]
+data, rows = {}, []
+for label, pipe in runs.items():
+    parent = pipe.open_parent()
+    data[label] = parent.select(*cols).get_data("numpy")
+    s = outcome_summary(data[label]); n = len(parent)
+    files = glob.glob(os.path.join(pipe.config.output.dir, "*.hdf5"))
+    rows.append({"limits (primary / secondary)": label, "galaxies": n, "multi-line %": round(100 * s["MULTI_LINE"] / n, 2),
+                 "single correct %": round(100 * s["SINGLE_CORRECT"] / n, 2), "interlopers %": round(100 * s["SINGLE_MISID"] / n, 3),
+                 "disk GB": round(sum(os.path.getsize(f) for f in files) / 1e9, 2)})
+area = sky_area_deg2(parent)
+print(f"area = {area:.1f} deg²")
+Table(rows)"""),
+    md("""
+The brighter primary limit removes galaxies; the second tier does not change which galaxies are detected, only how
+many of their lines count, and therefore how many galaxies need a single-line identification.
+"""),
+    code("""
+from romanmock.diagnostics import dndz
+
+z_edges = np.round(np.arange(0.5, 3.0 + 1e-9, 0.1), 2); zc = 0.5 * (z_edges[1:] + z_edges[:-1])
+line_set = runs["1.0e-16 / 4.0e-17"].line_set
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12.5, 4.4))
+for (label, d), col in zip(data.items(), plotting.CATEGORICAL):
+    for name, ls in [("Ha", "-"), ("OIII_5007", "--")]:
+        sel = (d["line_assigned"] == line_set.bit(name)) & np.isfinite(d["redshift_assigned"])
+        ax1.step(zc, dndz(d["redshift_assigned"][sel], z_edges, area), where="mid", color=col, ls=ls,
+                 label=f"{label}: {name}")
+    counts = np.bincount(d["n_det"], minlength=8)[1:8] / len(d["n_det"])
+    ax2.step(np.arange(1, 8), counts, where="mid", color=col, label=label)
+ax1.set_yscale("log"); ax1.set_ylim(30, None); ax1.set_xlabel("redshift_assigned"); ax1.set_ylabel("dN/dz per deg²")
+ax1.set_title("Assigned Hα (solid) and [O III] 5007 (dashed)"); ax1.legend(fontsize=7.5, ncol=1)
+ax2.set_xlabel("number of detected lines"); ax2.set_ylabel("fraction of detected galaxies")
+ax2.set_title("Lines per galaxy"); ax2.legend(fontsize=8)
+plt.tight_layout(); plt.show()"""),
+    md("""
+## Analysis samples from a step-2 catalog
+
+`build_samples` (`romanmock select`) works on any step-2 output. It is built slice by slice as well: the
+redshift histograms behind the thinning probabilities are accumulated in passes over the slices, and each
+sample is written as one small file per slice in `samples/<name>/`. On the full catalog this takes about
+three minutes on a login node with 4 workers at 1.7 GB each. `open_sample` opens a sample as one lightcone.
+"""),
+    code("""
+from romanmock.config import PopulationThinningConfig, SampleConfig
+from romanmock.io import open_sample
+
+pipe = runs["1.0e-16 / 4.0e-17"]
+pipe.config.population_thinning = PopulationThinningConfig(
+    targets={"Ha": {"reference": "wang2022", "dust_av": 1.65}, "OIII_5007": {"reference": "wang2022", "dust_av": 1.65}},
+    by="line_true", z_column="redshift_rsd", outside_range="keep")
+pipe.config.output.overwrite = True
+t0 = time.time()
+sample_paths = pipe.build_samples(samples=[
+    SampleConfig(name="halpha_z1p0_1p9", z_min=1.0, z_max=1.9, assigned_lines=["Ha"]),
+    SampleConfig(name="oiii_z2p0_2p9", z_min=2.0, z_max=2.9, assigned_lines=["OIII_5007"]),
+], n_workers=N2)
+print(f"{time.time() - t0:.0f} s")
+for p in sample_paths:
+    s = open_sample(p)
+    print(f"{os.path.basename(p):<18s} {len(s):>12,} galaxies in {len(glob.glob(os.path.join(p, '*.hdf5')))} slice files; columns {s.columns}")"""),
+    md("""
+## What step 2 can and cannot do
+
+The requested selection must be contained in the base catalog. A primary limit deeper than the base, a wider
+bandpass, or a column that was not stored is refused when the pipeline is created, before anything is written.
+The secondary limit is free, and so are the confusion model and the seed.
+"""),
+    code("""
+attempts = {
+    "primary limit 5e-17 (deeper than the base)": {"sensitivity": {"type": "constant", "flux_limit": 5e-17, "wave_range": list(GRISM)}},
+    "bandpass 0.75-1.93 um (wider than the base)": {"sensitivity": {"type": "constant", "flux_limit": 2e-16, "wave_range": [7500.0, 19300.0]}},
+    "passthrough column logsm_obs (not stored)": {"output": {"dir": os.path.join(TWO, "nb_refused"), "passthrough_columns": ["ra", "dec", "logsm_obs"]}},
+    "secondary limit 1e-17 (allowed)": {"sensitivity": {"type": "constant", "flux_limit": 1e-16, "secondary_flux_limit": 1e-17, "wave_range": list(GRISM)}},
+}
+for what, over in attempts.items():
+    cfg = {"source": "base", "base": {"dir": BASE_DIR}, "output": {"dir": os.path.join(TWO, "nb_refused")}, **over}
+    try:
+        RomanMockPipeline(RomanMockConfig.from_dict(cfg))
+        print(f"OK       {what}")
+    except (ValueError, KeyError) as err:
+        print(f"REFUSED  {what}\\n         {str(err)[:150]}")"""),
+    md("""
+## Recovering other columns through `gal_id`
+
+Anything that was not stored can be joined from the input mock slice by slice. Here the stellar mass of the
+detected galaxies of one slice is fetched and compared with all galaxies of that slice.
+"""),
+    code("""
+from romanmock.io import select_files
+
+step = 219
+pipe = runs["1.0e-16 / 4.0e-17"]
+det = oc.open(os.path.join(pipe.config.output.dir, f"lc_cores-{step}.romanmock.hdf5")).select("gal_id", "n_det").get_data("numpy")
+src = oc.open(select_files(CATALOG, steps=[step])[0], synth_cores=False, keep_top_host=True).select("gal_id", "logsm_obs").get_data("numpy")
+order = np.argsort(src["gal_id"])
+pos = order[np.searchsorted(src["gal_id"][order], det["gal_id"])]
+assert np.array_equal(src["gal_id"][pos], det["gal_id"])            # every detected galaxy is found, ids are unique
+logsm = src["logsm_obs"][pos]
+
+fig, ax = plt.subplots(figsize=(8, 4))
+bins = np.linspace(7, 12, 60)
+ax.hist(src["logsm_obs"], bins=bins, histtype="step", color=plotting.TEXT_SECONDARY, label=f"all galaxies of the slice ({len(order):,})")
+ax.hist(logsm, bins=bins, histtype="step", color=plotting.CATEGORICAL[0], label=f"detected ({len(logsm):,})")
+ax.hist(logsm[det["n_det"] == 1], bins=bins, histtype="step", color=plotting.CATEGORICAL[1], label="detected, single line")
+ax.set_yscale("log"); ax.set_xlabel("log10 stellar mass [Msun]"); ax.set_ylabel("galaxies")
+ax.set_title(f"Slice {step}: stellar mass joined through gal_id"); ax.legend(fontsize=8); plt.show()"""),
+    md("""
+## Disk usage
+
+OpenCosmo writes the HEALPix index of a lightcone uncompressed (268 MB per file). `romanmock` stores it
+gzip-compressed and leaves the data untouched (`compress_index`, on by default); files written before can be
+converted in place with `romanmock compress-index <dir>`.
+"""),
+    code("""
+def usage(d):
+    files = glob.glob(os.path.join(d, "*.hdf5"))
+    return len(files), sum(os.path.getsize(f) for f in files) / 1e9, sum(spatial_index_nbytes(f) for f in files) / 1e9
+
+rows = []
+for label, d in [("base catalog", BASE_DIR), *[(f"step 2, {k}", p.config.output.dir) for k, p in runs.items()]]:
+    n, total, index = usage(d)
+    rows.append({"catalog": label, "files": n, "total GB": round(total, 2), "of which index GB": round(index, 3),
+                 "with an uncompressed index GB": round(total - index + 0.268 * n, 1)})
+Table(rows)"""),
+    md("""
+## The same from the command line
+
+```bash
+romanmock base   cfg.yaml --workers 32                       # step 1, once (sbatch scripts/run_base.sh cfg.yaml)
+romanmock assign cfg.yaml --flux-limit 1.5e-16 --secondary-flux-limit 4e-17 \\
+                 --output-dir $PSCRATCH/mock_F1.5e-16 --workers 4      # step 2, on a login node
+romanmock summary $PSCRATCH/mock_F1.5e-16/config.yaml        # outcome counts, empirical confusion
+romanmock select  $PSCRATCH/mock_F1.5e-16/config.yaml --workers 4   # analysis samples (add a `samples:` block first)
+```
+
+`cfg.yaml` needs `catalog.path`, the `sensitivity` block with the base limits, and `base.dir`
+(see `configs/roman_grism_baseline.yaml`). `--secondary-flux-limit 0` switches the second tier off.
+"""),
+]
+
+
+# =====================================================================================
+# 08 - dN/dz of single- and multi-line galaxies for different secondary flux limits
+# =====================================================================================
+NB08 = [
+    md("""
+# 08 — Single-line and multi-line dN/dz versus the secondary flux limit
+
+Notebook 06 counts emitters with one flux limit for every line. The pipeline uses two: a galaxy needs one line
+above the **primary** limit inside the grism bandpass, and its other lines then count as detected above a lower
+**secondary** limit. This notebook repeats the single-line / multi-line comparison of notebook 06 for secondary
+limits of 8e-17 and 4e-17 erg/s/cm², next to the single-threshold case.
+
+Same cuts as in notebook 06 otherwise: observed wavelength in 1.00–1.93 μm, 0.5 < z < 3.0, no confusion matrix,
+no interlopers, no downsampling. Definitions, for a line X and limits (primary P, secondary S):
+
+- **all**: galaxies in which X is detected, i.e. X > P, or X > S while another line of the galaxy is above P;
+- **single**: X > P and no other line above S, the galaxies whose redshift rests on identifying one line;
+- **multi**: X detected and at least one other line detected.
+
+The secondary limit does not change which galaxies are detected. It moves galaxies from single to multi, and it
+adds faint lines of already detected galaxies to the "all" counts of those lines.
+"""),
+    code(SETUP),
+    code("""
+import time
+from romanmock.census import LineCensus, line_census
+from romanmock.io import select_files, suggest_n_workers, memory_budget_gb, open_catalog
+from romanmock.roman import GRISM_WAVE_RANGE_ANGSTROM
+from romanmock.selection import sky_area_deg2
+
+PRIMARY_LIMITS = [1.0e-16, 1.5e-16]                  # erg/s/cm²; 1.0e-16 is the package default
+SECONDARY_LIMITS = [None, 8.0e-17, 4.0e-17]          # None = single threshold (secondary = primary)
+LIMITS = [(p, s) for p in PRIMARY_LIMITS for s in SECONDARY_LIMITS]
+Z_EDGES = np.round(np.arange(0.5, 3.0 + 1e-9, 0.1), 2)
+ZC = 0.5 * (Z_EDGES[1:] + Z_EDGES[:-1])
+CENSUS_FILE = os.path.join(WORK, "census_secondary_z0p5_3p0.npz")
+
+# one colour per secondary limit, one line style per class, in every figure
+COLOR = dict(zip(SECONDARY_LIMITS, plotting.CATEGORICAL))
+STYLE = {"all": "-", "single": "--", "multi": ":"}
+def label(s):
+    return "single threshold" if s is None else f"secondary {s:.0e}"
+
+files = select_files(CATALOG, z_min=Z_EDGES[0], z_max=Z_EDGES[-1])
+N_WORKERS = suggest_n_workers(max_workers=32, per_worker_gb=5.0)
+print(f"{len(files)} slices overlap 0.5 < z < 3.0; memory budget {memory_budget_gb():.0f} GB -> {N_WORKERS} worker(s)")"""),
+    code("""
+if os.path.exists(CENSUS_FILE):
+    census = LineCensus.load(CENSUS_FILE)
+    print(f"loaded {CENSUS_FILE} ({len(census.steps)} slices)")
+else:
+    t0 = time.time()
+    census = line_census(CATALOG, LIMITS, Z_EDGES, line_set="roman_transitions", n_workers=N_WORKERS, verbose=False)
+    census.save(CENSUS_FILE)
+    print(f"{len(census.steps)} slices in {(time.time() - t0) / 60:.1f} min -> {CENSUS_FILE}")
+print("limits (primary, secondary):", census.limits)
+t0 = time.time()
+area = sky_area_deg2(open_catalog(files))
+print(f"area = {area:.1f} deg² ({time.time() - t0:.0f} s)")"""),
+    md("""
+## dN/dz per line: all, single-line and multi-line
+
+One panel per line, one colour per secondary limit. Solid: all galaxies with the line detected. Dashed: those
+with no other detected line. Dotted: those with at least one other detected line.
+"""),
+    code("""
+SHOW = ["Ha", "OIII_5007", "Hb", "OII_3727"]
+
+def plot_lines(primary, lines=SHOW, ylim=(10, None)):
+    fig, axes = plt.subplots(2, 2, figsize=(12.5, 8.4), sharex=True)
+    for ax, name in zip(axes.ravel(), lines):
+        for s in SECONDARY_LIMITS:
+            for which, ls in STYLE.items():
+                ax.step(ZC, census.dndz(name, primary, area, which, secondary=s), where="mid", color=COLOR[s], ls=ls,
+                        lw=1.6 if which == "all" else 1.3, label=f"{label(s)}, {which}")
+        ax.set_yscale("log"); ax.set_ylim(*ylim); ax.set_xlim(Z_EDGES[0], Z_EDGES[-1])
+        ax.set_title(name); ax.set_ylabel("dN/dz per deg²")
+    for ax in axes[1]:
+        ax.set_xlabel("redshift")
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=3, fontsize=9, frameon=False, bbox_to_anchor=(0.5, -0.07))
+    fig.suptitle(f"Primary limit {primary:.1e} erg/s/cm², 1.00–1.93 μm, no confusion, no downsampling", y=1.0)
+    plt.tight_layout(); plt.show()
+
+plot_lines(1.0e-16)"""),
+    code("""
+plot_lines(1.5e-16)"""),
+    md("""
+Reading the panels:
+
+- **Hα.** The solid curves coincide: Hα is almost always the brightest line, so a secondary limit adds very few
+  Hα lines. What changes is the split. With a secondary limit of 8e-17 about a quarter of the single-line Hα
+  emitters become multi-line; with 4e-17 nearly all of them do, because [O III] 5007 and Hβ (z > 1) or
+  [S III] 9532/9069 (z < 1.1) are then detected as well.
+- **[O III] 5007, Hβ, [O II].** Here the solid curves rise with a lower secondary limit: these lines are often
+  fainter than the primary limit in galaxies that Hα (or [O III]) has already anchored.
+- **[O III] 5007 at z > 1.94**, where Hα has left the grism: single-line with one threshold, still mostly
+  single-line at 8e-17, never at 4e-17. Two properties of the mock cause this. The doublet ratio
+  5007/4959 is fixed near 3.04, so [O III] 4959 exceeds 4e-17 as soon as 5007 exceeds 1.2e-16, and Hβ is above
+  4e-17 in the remaining galaxies. The same happens for [S III] 9532/9069 (ratio 2.53).
+
+Keep in mind that 4e-17 is 2.6σ for a 6.5σ limit of 1e-16: these counts assume that such a line is usable
+once the galaxy is anchored, and they contain no noise.
+"""),
+    md("""
+## Single-line fraction of each line's emitters
+"""),
+    code("""
+fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.4), sharey=True)
+for ax, primary in zip(axes, PRIMARY_LIMITS):
+    for name in ["Ha", "OIII_5007"]:
+        for s, ls in zip(SECONDARY_LIMITS, ["-", "--", ":"]):
+            ax.step(ZC, census.single_fraction(name, primary, secondary=s), where="mid", color=plotting.feature_color(name),
+                    ls=ls, label=f"{name}, {label(s)}")
+    ax.set_ylim(0, 1); ax.set_xlim(Z_EDGES[0], Z_EDGES[-1]); ax.set_xlabel("redshift")
+    ax.set_title(f"Primary limit {primary:.1e} erg/s/cm²"); ax.legend(fontsize=8)
+axes[0].set_ylabel("fraction with no other detected line")
+plt.tight_layout(); plt.show()"""),
+    md("""
+## Distinct galaxies
+
+Each galaxy counted once, whatever its lines. The detected population (solid black) is the same for every
+secondary limit; what changes is how much of it is single-line.
+"""),
+    code("""
+fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.4), sharey=True)
+norm = np.diff(Z_EDGES) * area
+for ax, primary in zip(axes, PRIMARY_LIMITS):
+    ax.step(ZC, census.galaxies(primary) / norm, where="mid", color=plotting.TEXT_PRIMARY, lw=1.8, label="detected galaxies")
+    for s in SECONDARY_LIMITS:
+        ax.step(ZC, census.galaxies(primary, "single", secondary=s) / norm, where="mid", color=COLOR[s], ls="--",
+                label=f"single-line, {label(s)}")
+    ax.set_yscale("log"); ax.set_ylim(10, None); ax.set_xlim(Z_EDGES[0], Z_EDGES[-1]); ax.set_xlabel("redshift")
+    ax.set_title(f"Primary limit {primary:.1e} erg/s/cm²"); ax.legend(fontsize=8)
+axes[0].set_ylabel("dN/dz per deg²")
+plt.tight_layout(); plt.show()"""),
+    code("""
+from astropy.table import Table
+
+rows = []
+for primary in PRIMARY_LIMITS:
+    for s in SECONDARY_LIMITS:
+        g, gs = census.galaxies(primary, secondary=s).sum(), census.galaxies(primary, "single", secondary=s).sum()
+        rows.append({"primary": f"{primary:.1e}", "secondary": "-" if s is None else f"{s:.1e}", "line": "any (distinct galaxies)",
+                     "all /deg²": round(g / area), "single /deg²": round(gs / area), "multi /deg²": round((g - gs) / area),
+                     "single fraction": round(gs / g, 3)})
+        for name in census.line_names:
+            tot = census.integrated(name, primary, area, secondary=s)
+            if tot < 1:
+                continue
+            single = census.integrated(name, primary, area, "single", secondary=s)
+            rows.append({"primary": f"{primary:.1e}", "secondary": "-" if s is None else f"{s:.1e}", "line": name,
+                         "all /deg²": round(tot), "single /deg²": round(single), "multi /deg²": round(tot - single),
+                         "single fraction": round(single / tot, 3)})
+table = Table(rows)
+table.write(os.path.join(WORK, "census_secondary_z0p5_3p0.csv"), format="csv", overwrite=True)
+table[[r["line"] in ("any (distinct galaxies)", "Ha", "OIII_5007", "Hb") for r in rows]]"""),
+    md("""
+Files written to `WORK`: `census_secondary_z0p5_3p0.npz` (reload with `LineCensus.load`; limits are
+`(primary, secondary)` pairs, e.g. `census.dndz("Ha", 1e-16, area, "single", secondary=4e-17)`) and
+`census_secondary_z0p5_3p0.csv` with every line. To try other limits, edit `PRIMARY_LIMITS` /
+`SECONDARY_LIMITS`, delete the `.npz` and rerun.
+"""),
+]
+
+
+# =====================================================================================
+# 09 - catalogs from the base catalog, in memory
+# =====================================================================================
+NB09 = [
+    md("""
+# 09 — Catalogs from the base catalog
+
+The two-step routine in its simplest form.
+
+1. **Step 1, once** (`romanmock base`, notebook 07): the base catalog stores every galaxy with a line above
+   1.0e-16 erg/s/cm² in the grism bandpass, with positions, redshifts and the flux of all nine lines.
+2. **Step 2, as often as you like**: one call, `base.make_catalog(...)`, with the flux limits, the confusion
+   matrix, the lines and the redshift range of your choice. It returns the catalog in memory as numpy arrays.
+
+Nothing is written unless you ask for it, and nothing is remembered between calls: change a setting and run the
+cell again. A call takes 15–20 s on a login node.
+"""),
+    code(SETUP),
+    code("""
+from romanmock import BaseCatalog
+
+base = BaseCatalog(os.path.join(WORK, "two_step", "base"))
+print(base)
+print("columns a catalog can contain:", base.columns)"""),
+    md("""
+## Make a catalog
+
+Every argument is optional; `help(base.make_catalog)` lists them all.
+"""),
+    code("""
+confusion = {                                   # single-line galaxies: {true line: {assigned line: probability}}
+    "Ha":        {"OIII_5007": 0.2},            # lines that are not listed are identified correctly
+    "OIII_5007": {"Ha": 0.2},
+    "SIII_9532": {"Ha": 0.2},
+    "Hb":        {"OIII_5007": 0.2},
+}
+
+cat = base.make_catalog(
+    flux_limit=1.5e-16,               # primary limit: at least one line of the galaxy above it
+    secondary_flux_limit=8.0e-17,     # limit for the other lines of such a galaxy (None: no second tier)
+    confusion=confusion,              # None: the package default
+    lines=["Ha"],                     # galaxies whose assigned line is Ha (None: every line)
+    z_range=(1.0, 1.9),               # range of redshift_assigned
+    seed=2026,
+)
+print(cat.summary())"""),
+    md("""
+The call prints a **line report** (`verbose=True`, the default; `cat.line_report()` returns the text and
+`cat.info["line_report"]` the numbers):
+
+- the lines inside the grism bandpass for the redshift cut, with the number of catalog galaxies in which the
+  line is detected and to which it is assigned;
+- the line interlopers, single-line galaxies given a wrong line. Each row is a *potential* interloper: a
+  line that, taken for another one, passes the redshift cut, with its probability `P` in the confusion
+  matrix and the range of true redshift it comes from. The last columns give the *actual* number in the
+  catalog and its share of the galaxies assigned to that line.
+"""),
+    code("""
+from astropy.table import Table
+
+print(type(cat["ra"]), cat["ra"].dtype, cat["ra"].shape)      # columns are numpy arrays
+t = Table({c: cat[c][:8] for c in cat.columns})
+for c in ("ra", "dec", "redshift_true", "redshift_rsd", "redshift_assigned"):
+    t[c].format = ".5f"
+t"""),
+    md("""
+`redshift_assigned` is the measured redshift. For a galaxy with more than one detected line it equals
+`redshift_rsd` (the true redshift including the peculiar velocity), not `redshift_true`. For a single-line
+galaxy it follows from the line identity drawn from the confusion matrix: equal to `redshift_rsd` when the
+identification is right (`id_outcome` 2), displaced when it is wrong (`id_outcome` 3, an interloper).
+"""),
+    code("""
+multi, right, wrong = (cat["id_outcome"] == k for k in (1, 2, 3))
+print("multi-line:        redshift_assigned == redshift_rsd for all:", np.array_equal(cat["redshift_assigned"][multi], cat["redshift_rsd"][multi]),
+      "| == redshift_true for", f"{np.mean(cat['redshift_assigned'][multi] == cat['redshift_true'][multi]):.4f}")
+print("single, correct:   max |redshift_assigned - redshift_rsd| =", f"{np.abs(cat['redshift_assigned'][right] - cat['redshift_rsd'][right]).max():.1e}")
+print("single, interloper: true redshifts", f"{cat['redshift_rsd'][wrong].min():.2f}-{cat['redshift_rsd'][wrong].max():.2f}",
+      "assigned", f"{cat['redshift_assigned'][wrong].min():.2f}-{cat['redshift_assigned'][wrong].max():.2f}")"""),
+    md("""
+## Change anything and run again
+
+Each call is independent. Here the same selection for three confusion matrices and two pairs of flux limits.
+"""),
+    code("""
+import time
+
+rows = []
+for label, conf in [("package default", None), ("20 % (the matrix above)", confusion), ("perfect identification", {})]:
+    for primary, secondary in [(1.0e-16, 4.0e-17), (1.5e-16, 8.0e-17)]:
+        t0 = time.time()
+        c = base.make_catalog(flux_limit=primary, secondary_flux_limit=secondary, confusion=conf, lines=["Ha"],
+                              z_range=(1.0, 1.9), seed=2026, verbose=False)
+        o = c.outcomes()
+        rows.append({"confusion": label, "primary": f"{primary:.1e}", "secondary": f"{secondary:.1e}", "galaxies": len(c),
+                     "multi-line %": round(100 * o["MULTI_LINE"] / len(c), 2),
+                     "interlopers %": round(100 * o["SINGLE_MISID"] / len(c), 3), "seconds": round(time.time() - t0)})
+Table(rows)"""),
+    md("""
+Other cuts work the same way: `z_column="redshift_true"` to cut on another redshift, `n_det_min=2` for
+multi-line galaxies only, `outcomes=None` to keep galaxies without a redshift, `cuts={"dec": (60, 70)}` on any
+column, and `columns=[...]` or `columns="all"` (line fluxes, bitmask, `gal_id`, ...) for what is returned.
+"""),
+    code("""
+o3 = base.make_catalog(flux_limit=1.0e-16, lines=["OIII_5007"], z_range=(2.0, 2.9), cuts={"dec": (60.0, 70.0)},
+                       columns=["gal_id", "ra", "dec", "redshift_assigned", "id_outcome", "n_det", "line_bitmask",
+                                "OIII_5007_flux", "Hb_flux"], seed=2026, verbose=False)
+print(o3)
+print("median [O III] 5007 flux:", f"{np.median(o3['OIII_5007_flux']):.2e}", "erg/s/cm²; detected lines per galaxy:",
+      {int(k): int(v) for k, v in zip(*np.unique(o3["n_det"], return_counts=True))})"""),
+    md("""
+## Downsampling to the Wang et al. (2022) forecast
+
+Off by default. `downsample="wang2022"` thins the Hα and [O III] emitter populations to the forecast at the
+primary flux limit, in bins of true redshift, before the cuts are applied (so interlopers are thinned with the
+population they belong to). The flux limit must be one of the tabulated ones (5e-17, 7e-17, 8.5e-17, 1e-16,
+1.5e-16, 2e-16). `downsample={"reference": "wang2022", "dust_av": 1.92}` selects the other dust model.
+"""),
+    code("""
+from romanmock.reference_dndz import wang2022_bins, wang2022_errors
+
+kw = dict(flux_limit=1.5e-16, secondary_flux_limit=8.0e-17, confusion=confusion, lines=["Ha"], z_range=(1.0, 1.9),
+          seed=2026, verbose=False)
+full = base.make_catalog(**kw)
+thin = base.make_catalog(downsample="wang2022", **kw)        # warns where the mock has fewer emitters than the forecast
+print(thin.summary())
+
+edges, ref = wang2022_bins("Ha", 1.5e-16)
+err = wang2022_errors("Ha", 1.5e-16)
+zc = 0.5 * (edges[1:] + edges[:-1])
+fig, ax = plt.subplots(figsize=(8.5, 4.2))
+ax.step(zc, full.dndz(edges), where="mid", color=plotting.CATEGORICAL[0], label=f"no downsampling ({len(full):,})")
+ax.step(zc, thin.dndz(edges), where="mid", color=plotting.CATEGORICAL[2], label=f'downsample="wang2022" ({len(thin):,})')
+ax.errorbar(zc, ref, yerr=err, fmt="o", ms=3.5, color=plotting.TEXT_PRIMARY, label="Wang et al. (2022), true Hα emitters")
+ax.set_xlim(0.95, 1.95); ax.set_yscale("log"); ax.set_ylim(300, None)
+ax.set_xlabel("redshift_assigned"); ax.set_ylabel("dN/dz per deg²")
+ax.set_title("Assigned Hα, F > 1.5e-16 erg/s/cm²"); ax.legend(fontsize=8); plt.show()"""),
+    md("""
+## Writing to disk
+
+`cat.write(path)` writes `.hdf5` (one dataset per column, the settings in the file attributes), `.fits` or
+`.npz`, replacing an existing file. Random catalogs come from `cat.make_random(which="all", n_times=10,
+write_to=...)`: uniform inside the footprint, redshifts drawn from the data, one file per multiple of the
+data size, for `which` = `"all"`, `"galaxies"` (correct redshift) or `"interlopers"` (wrong redshift).
+`make_catalog(..., write_to=path)` does both in one call, and
+`Catalog.read(path)` brings a catalog back with its settings.
+"""),
+    code("""
+from romanmock import Catalog
+
+path = thin.write(os.path.join(WORK, "two_step", "halpha_z1p0_1p9.hdf5"))
+print(path, f"{os.path.getsize(path) / 1e9:.2f} GB")
+back = Catalog.read(path)
+print(back)
+print({k: back.settings[k] for k in ("flux_limit", "secondary_flux_limit", "lines", "z_range", "downsample", "seed")})"""),
+    md("""
+## From the command line
+
+```bash
+romanmock catalog $PSCRATCH/romanmock_demo/two_step/base -o halpha.hdf5 \\
+          --flux-limit 1.5e-16 --secondary-flux-limit 8e-17 --confusion my_confusion.yaml \\
+          --lines Ha --z-range 1.0 1.9 --downsample wang2022
+```
+
+`my_confusion.yaml` holds the rows, e.g. `Ha: {OIII_5007: 0.2}`. Inside a script, call `make_catalog` below
+`if __name__ == "__main__":` because the slices are read by worker processes.
+"""),
+]
+
+
 NOTEBOOKS = {
     "01_explore_diffsky_catalog.ipynb": NB01,
     "02_pipeline_step_by_step.ipynb": NB02,
@@ -1105,6 +1752,9 @@ NOTEBOOKS = {
     "04_extending_models.ipynb": NB04,
     "05_full_run.ipynb": NB05,
     "06_dndz_census.ipynb": NB06,
+    "07_two_step_workflow.ipynb": NB07,
+    "08_dndz_secondary_limit.ipynb": NB08,
+    "09_catalog_from_base.ipynb": NB09,
 }
 
 

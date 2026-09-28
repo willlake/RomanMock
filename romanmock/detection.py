@@ -28,6 +28,7 @@ class DetectionResult:
     detected: np.ndarray      # (n, nf) bool
     bitmask: np.ndarray       # (n,) uint32
     n_det: np.ndarray         # (n,) uint8
+    primary: np.ndarray | None = None   # (n, nf) bool: lines above the primary flux limit
 
     @property
     def n_features(self) -> int:
@@ -85,7 +86,8 @@ def detect_lines(
         Redshift including peculiar velocity (diffsky ``redshift_obs``).
     line_set : LineSet or preset name
     detection_model : DetectionModel, optional
-        Defaults to :class:`ThresholdDetection` with the Roman grism constant limit.
+        Defaults to :class:`ThresholdDetection` with the Roman grism constant limits
+        (1.0e-16 for the first line of a galaxy, 4.0e-17 for its other lines).
     rng : numpy Generator, optional
         Needed by stochastic detection models.
     component_flux : dict, optional
@@ -104,6 +106,7 @@ def detect_lines(
     if not line_set.has_separated_components:
         det: Detection = model.detect(flux, wave_obs, rng)
         detected, flux_measured, snr = det.detected, det.flux_measured, det.snr
+        primary = det.primary if det.primary is not None else detected
     else:
         # Separated multi-component features (e.g. the plan's [O III] = 4959 + 5007 species)
         # are tested transition by transition: each component has its own observed
@@ -125,11 +128,14 @@ def detect_lines(
         det = model.detect(f_cols, w_cols, rng)
         n, nf = flux.shape
         detected = np.zeros((n, nf), dtype=bool)
+        primary = np.zeros((n, nf), dtype=bool)
+        comp_primary = det.primary if det.primary is not None else det.detected
         flux_measured = np.zeros((n, nf))
         snr = np.zeros((n, nf))
         for i in range(nf):
             sel = owner == i
             detected[:, i] = det.detected[:, sel].any(axis=1)
+            primary[:, i] = comp_primary[:, sel].any(axis=1)
             flux_measured[:, i] = det.flux_measured[:, sel].sum(axis=1)
             snr[:, i] = det.snr[:, sel].max(axis=1)
     bitmask = pack_bitmask(detected)
@@ -141,4 +147,5 @@ def detect_lines(
         detected=detected,
         bitmask=bitmask,
         n_det=popcount(bitmask),
+        primary=primary,
     )

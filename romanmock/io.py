@@ -143,11 +143,134 @@ def iter_slices(catalog):
         yield getattr(catalog.header.file, "step", 0), catalog
 
 
-def write_dataset(path, dataset, overwrite: bool = False):
+def write_dataset(path, dataset, overwrite: bool = False, compress_index: bool = True):
+    """Write ``dataset`` with OpenCosmo; by default store its spatial index compressed.
+
+    OpenCosmo (1.3.11) writes the HEALPix index of a lightcone uncompressed: two int64 per
+    pixel for the whole sky at every level up to nside 1024, i.e. a fixed 268 MB per file
+    that is mostly zeros. With ``compress_index`` the file is written to a temporary name
+    and copied to ``path`` with the index datasets gzip-compressed (about 1 MB); every
+    other dataset is copied unchanged. OpenCosmo reads both layouts.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    oc.write(path, dataset, overwrite=overwrite)
+    if not compress_index:
+        oc.write(path, dataset, overwrite=overwrite)
+        return path
+    if path.exists() and not overwrite:
+        raise FileExistsError(f"{path} exists; pass overwrite=True to replace it")
+    tmp = path.with_name(f".{path.stem}.uncompressed_tmp.hdf5")   # hidden, so that globbing *.hdf5 never sees it
+    try:
+        oc.write(tmp, dataset, overwrite=True)
+        compress_spatial_index(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
     return path
+
+
+INDEX_GROUP = "index"
+INDEX_COMPRESSION = {"compression": "gzip", "compression_opts": 4, "shuffle": True, "chunks": True}
+
+
+def _is_index_dataset(name: str) -> bool:
+    return INDEX_GROUP in name.split("/")[:-1]
+
+
+def compress_spatial_index(src, dst, min_size: int = 4096) -> Path:
+    """Copy the HDF5 file ``src`` to ``dst`` with the datasets of every ``index`` group
+    gzip-compressed (datasets smaller than ``min_size`` elements are copied as they are).
+    Groups, attributes and all other datasets are copied unchanged. The copy is written
+    to a hidden temporary file and moved to ``dst`` only once complete, so ``dst`` may be
+    ``src`` itself (conversion in place)."""
+    import os
+
+    src, dst = Path(src), Path(dst)
+    part = dst.with_name(f".{dst.name}.part")
+    try:
+        with h5py.File(src, "r") as fin, h5py.File(part, "w") as fout:
+            for k, v in fin.attrs.items():
+                fout.attrs[k] = v
+
+            def visit(name, obj):
+                if isinstance(obj, h5py.Group):
+                    group = fout.require_group(name)
+                    for k, v in obj.attrs.items():
+                        group.attrs[k] = v
+                    return
+                parent_name, base = os.path.split(name)
+                parent = fout.require_group(parent_name) if parent_name else fout
+                if _is_index_dataset(name) and obj.shape and obj.size >= min_size:
+                    new = parent.create_dataset(base, data=obj[...], **INDEX_COMPRESSION)
+                    for k, v in obj.attrs.items():
+                        new.attrs[k] = v
+                else:
+                    fin.copy(obj, parent, name=base)
+
+            fin.visititems(visit)
+        os.replace(part, dst)
+    finally:
+        part.unlink(missing_ok=True)
+    return dst
+
+
+def spatial_index_is_compressed(path, min_size: int = 4096) -> bool:
+    """True if no large index dataset of the file is stored uncompressed."""
+    plain = False
+
+    def visit(name, obj):
+        nonlocal plain
+        if isinstance(obj, h5py.Dataset) and _is_index_dataset(name) and obj.shape and obj.size >= min_size \
+                and obj.compression is None:
+            plain = True
+
+    with h5py.File(Path(path), "r") as f:
+        f.visititems(visit)
+    return not plain
+
+
+def compress_index_in_place(path) -> tuple[str, int, int, bool]:
+    """Convert one output file; returns ``(path, bytes before, bytes after, converted)``.
+    Files whose index is already compressed are left untouched."""
+    path = Path(path)
+    before = path.stat().st_size
+    if spatial_index_is_compressed(path):
+        return str(path), before, before, False
+    compress_spatial_index(path, path)
+    return str(path), before, path.stat().st_size, True
+
+
+def spatial_index_nbytes(path) -> int:
+    """Bytes used on disk by the spatial index datasets of an output file."""
+    total = 0
+
+    def visit(name, obj):
+        nonlocal total
+        if isinstance(obj, h5py.Dataset) and _is_index_dataset(name):
+            total += obj.id.get_storage_size()
+
+    with h5py.File(Path(path), "r") as f:
+        f.visititems(visit)
+    return total
+
+
+def sample_files(path) -> list[Path]:
+    """Files of an analysis sample: the slice files of a sample directory, ordered by step,
+    or the single file itself."""
+    path = Path(path)
+    if path.is_dir():
+        files = sorted((f for f in path.glob("*.hdf5") if not f.name.startswith(".")), key=step_from_filename)
+        if not files:
+            raise FileNotFoundError(f"no sample files in {path}")
+        return files
+    if not path.exists():
+        raise FileNotFoundError(f"{path} does not exist")
+    return [path]
+
+
+def open_sample(path):
+    """Open an analysis sample written by ``romanmock select`` (directory of slice files or
+    single file) as one OpenCosmo lightcone."""
+    return oc.open(*sample_files(path))
 
 
 def output_filename(input_path, output_dir, tag: str = "romanmock") -> Path:

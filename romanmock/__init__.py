@@ -29,9 +29,16 @@ from .confusion import ConfusionMatrix, WavelengthBinnedConfusion, FAIL
 from .redshift import assign_redshifts, IdOutcome, RedshiftAssignment
 from .config import RomanMockConfig
 from .pipeline import RomanMockPipeline
+from .catalog import BaseCatalog, Catalog, make_catalog, make_random
+from .footprint import PatchFootprint
 
 
 __all__ = [
+    "BaseCatalog",
+    "Catalog",
+    "make_catalog",
+    "make_random",
+    "PatchFootprint",
     "LineFeature",
     "LineSet",
     "get_line_set",

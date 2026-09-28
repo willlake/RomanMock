@@ -303,7 +303,14 @@ def mock_dndz(z_obs: np.ndarray, z_edges: np.ndarray, area_deg2: float, smooth_b
     to log dN/dz, so that the selection function does not divide out the realisation's own
     radial fluctuations."""
     counts, _ = np.histogram(z_obs[np.isfinite(z_obs)], bins=z_edges)
-    dndz = counts / (np.diff(z_edges) * area_deg2)
+    return dndz_from_counts(counts, z_edges, area_deg2, smooth_bins, poly_degree)
+
+
+def dndz_from_counts(counts: np.ndarray, z_edges: np.ndarray, area_deg2: float, smooth_bins: float = 0.0,
+                     poly_degree: int | None = None) -> np.ndarray:
+    """:func:`mock_dndz` for counts that were histogrammed already (e.g. accumulated slice by slice)."""
+    z_edges = np.asarray(z_edges, dtype=np.float64)
+    dndz = np.asarray(counts, dtype=np.float64) / (np.diff(z_edges) * area_deg2)
     if smooth_bins and smooth_bins > 0:
         from scipy.ndimage import gaussian_filter1d
 
@@ -341,7 +348,18 @@ def downsample_to_dndz(
     z_obs = np.asarray(z_obs, dtype=np.float64)
     mock = mock_dndz_values if mock_dndz_values is not None else mock_dndz(z_obs, z_edges, area_deg2, smooth_bins)
     zc = 0.5 * (z_edges[1:] + z_edges[:-1])
-    tgt = np.asarray(target(zc), dtype=np.float64)
+    p_keep = keep_probability(mock, np.asarray(target(zc), dtype=np.float64), zc, warn_empty=warn_empty, stacklevel=3)
+    keep = rng.random(z_obs.size) < probability_per_galaxy(z_obs, z_edges, p_keep)
+    return keep, p_keep
+
+
+def keep_probability(mock: np.ndarray, target: np.ndarray, z_center: np.ndarray, warn_empty: bool = True,
+                     stacklevel: int = 2) -> np.ndarray:
+    """``p_keep = target / mock`` per bin, clipped to [0, 1]; warns where the target exceeds
+    the mock (a shortage cannot be filled; bins with an empty mock count unless
+    ``warn_empty`` is False)."""
+    mock = np.asarray(mock, dtype=np.float64)
+    tgt = np.asarray(target, dtype=np.float64)
     with np.errstate(divide="ignore", invalid="ignore"):
         p_keep = np.where(mock > 0, tgt / mock, 0.0)
     short = tgt > mock * (1.0 + 1e-9)          # includes bins where the mock is empty
@@ -350,19 +368,25 @@ def downsample_to_dndz(
     if np.any(short):
         warnings.warn(
             f"target dN/dz exceeds the mock in {short.sum()} of {short.size} bins "
-            f"(z ~ {zc[short].min():.2f}-{zc[short].max():.2f}); thinning cannot fill a shortage, "
+            f"(z ~ {z_center[short].min():.2f}-{z_center[short].max():.2f}); thinning cannot fill a shortage, "
             "those bins keep every galaxy.",
             RuntimeWarning,
-            stacklevel=2,
+            stacklevel=stacklevel,
         )
-    p_keep = np.clip(p_keep, 0.0, 1.0)
-    b = np.searchsorted(z_edges, z_obs, side="right") - 1
-    b = np.where(z_obs == z_edges[-1], p_keep.size - 1, b)   # closed upper edge, like np.histogram
-    inside = (b >= 0) & (b < p_keep.size) & np.isfinite(z_obs)
-    p = np.zeros(z_obs.size)
-    p[inside] = p_keep[b[inside]]
-    keep = rng.random(z_obs.size) < p
-    return keep, p_keep
+    return np.clip(p_keep, 0.0, 1.0)
+
+
+def probability_per_galaxy(z: np.ndarray, z_edges: np.ndarray, p_keep: np.ndarray) -> np.ndarray:
+    """``p_keep`` of the bin of each redshift (closed upper edge, like ``np.histogram``);
+    zero outside the bins and for NaN."""
+    z = np.asarray(z, dtype=np.float64)
+    z_edges = np.asarray(z_edges, dtype=np.float64)
+    b = np.searchsorted(z_edges, z, side="right") - 1
+    b = np.where(z == z_edges[-1], p_keep.size - 1, b)
+    inside = (b >= 0) & (b < p_keep.size) & np.isfinite(z)
+    p = np.zeros(z.size)
+    p[inside] = np.asarray(p_keep)[b[inside]]
+    return p
 
 
 # ---------------------------------------------------------------------------------

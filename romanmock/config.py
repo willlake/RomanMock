@@ -16,10 +16,13 @@ from typing import Any
 import yaml
 
 from .lines import DEFAULT_LINE_SET
-from .roman import DEFAULT_LINE_FLUX_LIMIT, GRISM_WAVE_RANGE_ANGSTROM
+from .roman import DEFAULT_LINE_FLUX_LIMIT, DEFAULT_SECONDARY_LINE_FLUX_LIMIT, GRISM_WAVE_RANGE_ANGSTROM
 
 DEFAULT_PASSTHROUGH = ["ra", "dec", "redshift_true"]
 from .confusion import DEFAULT_CONFUSION_ROWS, default_confusion_rows  # noqa: F401  (re-exported)
+
+#: input-catalog columns copied to the base flux catalog (two-step workflow, step 1)
+DEFAULT_BASE_COLUMNS = ["gal_id", "ra", "dec", "redshift_true"]
 
 #: columns written to analysis-sample files by default (stage B); None = every parent column
 DEFAULT_SAMPLE_COLUMNS = ["ra", "dec", "redshift_true", "redshift_rsd", "redshift_assigned", "id_outcome"]
@@ -66,13 +69,36 @@ class OutputConfig:
     store_snr: bool = False
     store_measured_flux: bool = False    # only differs from flux for noisy detection models
     sample_columns: list[str] | None = field(default_factory=lambda: list(DEFAULT_SAMPLE_COLUMNS))
+    compress_index: bool = True          # store the HEALPix index compressed (268 MB -> ~1 MB per file); data untouched
+    sample_layout: str = "slices"        # samples/<name>/ with one file per slice (login-node friendly), or "single":
+                                         # one file samples/<name>.hdf5 (assembled by OpenCosmo, ~0.3 GB of memory per slice)
+
+
+@dataclass
+class BaseConfig:
+    """The base flux catalog of the two-step workflow (``romanmock base`` / ``romanmock assign``).
+
+    Step 1 keeps every galaxy with at least one line above the primary limit of
+    ``sensitivity`` inside its bandpass and stores ``columns`` (copied from the input
+    mock), ``redshift_rsd``, the flux of *every* line of the line set and, optionally, the
+    bitmask at the base limits. Step 2 reads it back and redoes detection and redshift
+    assignment with limits that are at least as bright as the base ones.
+    """
+
+    dir: str = ""
+    tag: str = "romanmock_base"
+    overwrite: bool = False
+    columns: list[str] = field(default_factory=lambda: list(DEFAULT_BASE_COLUMNS))
+    store_bitmask: bool = True         # line_bitmask at the base limits
+    flux_dtype: str = "float64"        # "float32" saves 4 bytes per line and galaxy; thresholds then act on rounded fluxes
+    compress_index: bool = True        # store the HEALPix index compressed (268 MB -> ~1 MB per file); data untouched
 
 
 @dataclass
 class DownsampleConfig:
     """Thin one analysis sample to a target dN/dz of *assigned* redshift.
 
-    ``target`` is a target spec: ``{"reference": "wang2022", "line": "Ha", "flux_limit": 1.5e-16,
+    ``target`` is a target spec: ``{"reference": "wang2022", "line": "Ha", "flux_limit": 1e-16,
     "dust_av": 1.65}`` (line defaults to the sample's first assigned line, flux_limit to the
     run's constant flux limit), ``{"file": "dndz.txt"}`` (two columns z, dN/dz per deg^2) or
     ``{"z": [...], "dndz": [...]}``.
@@ -127,10 +153,13 @@ class SampleConfig:
 class RomanMockConfig:
     catalog: CatalogConfig = field(default_factory=CatalogConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
+    base: BaseConfig = field(default_factory=BaseConfig)
+    source: str = "catalog"            # input of stage A: "catalog" (the diffsky mock) or "base" (the base flux catalog)
     line_set: Any = DEFAULT_LINE_SET   # preset name or list of feature dicts
     flux: FluxConfig = field(default_factory=FluxConfig)
     sensitivity: dict = field(default_factory=lambda: {
-        "type": "constant", "flux_limit": DEFAULT_LINE_FLUX_LIMIT, "wave_range": list(GRISM_WAVE_RANGE_ANGSTROM)})
+        "type": "constant", "flux_limit": DEFAULT_LINE_FLUX_LIMIT, "wave_range": list(GRISM_WAVE_RANGE_ANGSTROM),
+        "secondary_flux_limit": DEFAULT_SECONDARY_LINE_FLUX_LIMIT})
     detection: dict = field(default_factory=lambda: {"type": "threshold"})
     confusion: dict = field(default_factory=lambda: {"type": "default"})   # DEFAULT_CONFUSION_ROWS adapted to the line set
     redshift: RedshiftConfig = field(default_factory=RedshiftConfig)
@@ -147,6 +176,7 @@ class RomanMockConfig:
         return cls(
             catalog=_dc(CatalogConfig, d.pop("catalog", {})),
             output=_dc(OutputConfig, d.pop("output", {})),
+            base=_dc(BaseConfig, d.pop("base", {})),
             flux=_dc(FluxConfig, d.pop("flux", {})),
             redshift=_dc(RedshiftConfig, d.pop("redshift", {})),
             population_thinning=None if thinning is None else _dc(PopulationThinningConfig, thinning),
