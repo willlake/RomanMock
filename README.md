@@ -1,7 +1,6 @@
 # romanmock
 
-Build a Roman-like emission-line spectroscopic mock from a diffsky lightcone, following
-`Roman_Mock_Plan_and_Comments.pdf`. Catalog access goes through
+Build a Roman-like emission-line spectroscopic mock from a diffsky lightcone. Catalog access goes through
 [OpenCosmo](https://github.com/ArgonneCPAC/OpenCosmo) and the
 [diffsky](https://github.com/ArgonneCPAC/diffsky) loaders; the package adds only the
 survey-specific steps (fluxes, detection, bitmask, redshift identification, sample selection).
@@ -12,12 +11,12 @@ editing the package.
 ## Installation
 
 ```bash
-cd /global/u2/w/willlake/Packages/RomanMock
-pip install -e .            # opencosmo, hdf5plugin, astropy, pyyaml, ... ; diffsky/dsps optional
-pytest tests                # 65 tests, about 6 minutes; tests on the real mock are skipped if it is absent
+# cd /global/u2/w/willlake/Packages/RomanMock
+# pip install -e .            # opencosmo, hdf5plugin, astropy, pyyaml, ... ; diffsky/dsps optional
+# pytest tests                # 65 tests, about 6 minutes; tests on the real mock are skipped if it is absent
 ```
 
-On Perlmutter login nodes set `export JAX_PLATFORMS=cpu` (diffsky imports JAX; the CLI does
+On NERSC login nodes set `export JAX_PLATFORMS=cpu` (diffsky imports JAX; the CLI does
 this by default).
 
 ## Input
