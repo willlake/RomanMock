@@ -11,9 +11,8 @@ editing the package.
 ## Installation
 
 ```bash
-# cd /global/u2/w/willlake/Packages/RomanMock
+# cd dir-to-RomanMock
 # pip install -e .            # opencosmo, hdf5plugin, astropy, pyyaml, ... ; diffsky/dsps optional
-# pytest tests                # 65 tests, about 6 minutes; tests on the real mock are skipped if it is absent
 ```
 
 On NERSC login nodes set `export JAX_PLATFORMS=cpu` (diffsky imports JAX; the CLI does
