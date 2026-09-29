@@ -266,22 +266,31 @@ class Catalog:
 # the base catalog
 # =====================================================================================
 class BaseCatalog:
-    """The base flux catalog written by step 1 (``romanmock base`` / ``build_base``)."""
+    """The base flux catalog written by step 1 (``romanmock base`` / ``build_base``).
 
-    def __init__(self, base_dir, tag: str = "romanmock_base"):
+    ``area_deg2`` is the sky area of the lightcone, if you know it. When it is not given it is
+    estimated: from the sky patches of the mock, or else from the galaxies
+    (:attr:`area_source` tells which). It can also be set later, ``base.area_deg2 = 2500.0``.
+    """
+
+    def __init__(self, base_dir, tag: str = "romanmock_base", area_deg2: float | None = None):
         self.dir = Path(base_dir)
         self.tag = tag
         manifest = read_manifest(self.dir, tag)
         if manifest is None or manifest.get("kind") != "base":
             raise FileNotFoundError(f"no base catalog in {self.dir} (manifest {tag}_manifest.yaml): run `romanmock base` first")
         self.description = manifest["base"]
+        self.manifest_hash = manifest.get("config_hash")
         self.slices = {int(k): v for k, v in sorted(manifest["slices"].items(), key=lambda kv: int(kv[0]))
                        if v.get("n_galaxies", 0) > 0}
         self.line_set = get_line_set(self.description["line_set"])
         self.sensitivity = build_sensitivity(self.description["sensitivity"])
         self.flux_suffix = self.description["flux"]["suffix"]
         self._area = None
+        self.area_source = None            # "user", "footprint" or "healpix", once the area is known
         self._footprint = None
+        if area_deg2 is not None:
+            self.area_deg2 = area_deg2
 
     # ---- what is in it -------------------------------------------------------------
     @property
@@ -314,44 +323,84 @@ class BaseCatalog:
 
     @property
     def area_deg2(self) -> float:
-        """Sky area of the lightcone (computed once from the HEALPix index, then cached in the base directory)."""
+        """Sky area of the lightcone [deg^2]: the value given by the user, else an estimate. The
+        estimate is the area of the sky patches of the mock (:attr:`footprint`) or, without them,
+        the area covered by the galaxies in the HEALPix index (cached in the base directory)."""
         if self._area is None:
+            try:
+                self._area, self.area_source = self.footprint.area_deg2, "footprint"
+                return self._area
+            except (FileNotFoundError, KeyError, ValueError, OSError):
+                pass
+            warnings.warn("the footprint of the mock is not available: the sky area is estimated from the galaxies",
+                          RuntimeWarning, stacklevel=2)
             cache = self.dir / f"{self.tag}_area.json"
-            if cache.exists():
-                self._area = float(json.loads(cache.read_text())["area_deg2"])
+            stored = json.loads(cache.read_text()) if cache.exists() else {}
+            self.area_source = "healpix"
+            if stored.get("base") == self._identity():
+                self._area = float(stored["area_deg2"])
             else:
                 self._area = float(sky_area_deg2(oc.open(*self.files)))
                 try:
-                    cache.write_text(json.dumps({"area_deg2": self._area, "n_files": len(self.files)}))
+                    cache.write_text(json.dumps({"area_deg2": self._area, "base": self._identity()}))
                 except OSError:          # read-only base catalog: just recompute next time
                     pass
         return self._area
 
+    @area_deg2.setter
+    def area_deg2(self, value):
+        if value is None:                                  # back to the estimate
+            self._area, self.area_source = None, None
+            return
+        value = float(value)
+        if not 0 < value <= 4 * np.pi * np.degrees(1.0) ** 2:
+            raise ValueError(f"area_deg2 = {value}: the sky area is between 0 and 41253 deg2")
+        self._area, self.area_source = value, "user"
+
     @property
     def footprint(self):
-        """Sky footprint of the lightcone: the union of its sky patches (cached in the base directory)."""
+        """Sky footprint of the lightcone: the union of the sky patches of the input mock.
+
+        It is built from the mock the base catalog was made of (nothing is assumed about its
+        size), checked against the galaxies of the base catalog, and cached in the base
+        directory. The cache is dropped when the base catalog has been rebuilt.
+        """
         if self._footprint is None:
             from .footprint import PatchFootprint
 
             cache = self.dir / f"{self.tag}_footprint.json"
             if cache.exists():
-                self._footprint = PatchFootprint.load(cache)
-            else:
+                stored = json.loads(cache.read_text())
+                if stored.get("base") == self._identity():
+                    self._footprint = PatchFootprint.from_dict(stored)
+            if self._footprint is None:
                 import yaml
 
                 meta = yaml.safe_load((self.dir / f"{self.tag}_metadata.yaml").read_text())
                 inputs = {Path(p).name: Path(p) for p in meta.get("input_files", [])}
-                slices = sorted(self.slices.values(), key=lambda v: v.get("input_size", 0))
+                slices = sorted(self.slices.values(), key=lambda v: -v.get("n_input", 0))     # the most populated first
                 files = [inputs[v["input"]] for v in slices if v.get("input") in inputs and inputs[v["input"]].exists()]
                 if not files:
                     raise FileNotFoundError("the input mock of the base catalog is not there: the footprint cannot be "
                                             "built. Pass footprint=PatchFootprint(...)")
-                self._footprint = PatchFootprint.from_mock(files[0])
+                footprint = PatchFootprint.from_mock(files[:3])
+                big = max(self.slices.values(), key=lambda v: v["n_galaxies"])
+                pos = oc.open(str(self.dir / big["output"])).select("ra", "dec").get_data("numpy")
+                check = footprint.check(pos["ra"], pos["dec"])
+                if not check["inside"] > 0.99 or check["empty"] > 0.01:
+                    raise ValueError(f"the footprint built from the sky patches of the mock ({footprint}) does not match "
+                                     f"the galaxies of {big['output']}: {check}. Pass footprint=PatchFootprint(...)")
+                self._footprint = footprint
                 try:
-                    self._footprint.save(cache)
+                    cache.write_text(json.dumps({**footprint.to_dict(), "base": self._identity(), "check": check}))
                 except OSError:
                     pass
         return self._footprint
+
+    def _identity(self) -> dict:
+        """What a cached footprint or area belongs to: changes when the base catalog is rebuilt."""
+        return {"config_hash": self.manifest_hash, "n_slices": len(self.slices), "n_galaxies": self.n_galaxies,
+                "completed": max(str(v.get("completed", "")) for v in self.slices.values())}
 
     def make_random(self, catalog: "Catalog", **settings):
         """``catalog.make_random(footprint=self.footprint, **settings)``; see :meth:`Catalog.make_random`."""
@@ -384,6 +433,7 @@ class BaseCatalog:
         seed: int = 12345,
         n_workers: int | None = None,
         write_to=None,
+        area_deg2: float | None = None,
         verbose: bool = True,
     ) -> Catalog:
         """Build a catalog from the base catalog. Every argument is optional.
@@ -438,6 +488,9 @@ class BaseCatalog:
             Default: as many as fit in the memory this session may use, at most 8.
         write_to : path
             Also write the catalog there (see :meth:`Catalog.write`).
+        area_deg2 : float
+            Sky area of the lightcone [deg^2], used for dN/dz and for the downsampling.
+            Default: the area of the base catalog (given by the user, else estimated).
         verbose : bool
             Print the progress and the line report: the lines inside the bandpass for the
             redshift cut, and the potential and actual line interlopers. The report is also
@@ -446,7 +499,9 @@ class BaseCatalog:
         spec = self._spec(flux_limit, secondary_flux_limit, confusion, z_range, z_column, lines, membership, outcomes, n_det_min,
                           cuts, downsample, columns, wave_range, detection, sigma_z, seed)
         populations = spec["populations"]
-        area = self.area_deg2 if populations else None
+        if area_deg2 is not None:
+            self.area_deg2 = area_deg2
+        area = self.area_deg2
         if n_workers is None:
             n_workers = suggest_n_workers(max_workers=8, per_worker_gb=2.5)
         tasks = [(spec, str(self.dir / v["output"]), step) for step, v in self.slices.items()]
@@ -475,8 +530,12 @@ class BaseCatalog:
         settings = {k: spec[k] for k in ("flux_limit", "secondary_flux_limit", "wave_range", "z_range", "z_column", "lines", "membership",
                                          "outcomes", "n_det_min", "cuts", "sigma_z", "seed", "detection")}
         settings.update(confusion=spec["confusion_config"], downsample=spec["downsample_label"], base=str(self.dir), base_tag=self.tag)
-        cat = Catalog(data, settings, info, self.line_set.names, self.area_deg2 if (populations or self._has_area()) else None)
+        info["area_deg2"], info["area_source"] = area, self.area_source
+        cat = Catalog(data, settings, info, self.line_set.names, area)
         if verbose:
+            how = {"user": "given", "footprint": "estimated from the sky patches of the mock",
+                   "healpix": "estimated from the galaxies"}[self.area_source]
+            print(f"[romanmock] sky area {area:.2f} deg2 ({how})", flush=True)
             print(f"[romanmock] {info['n_detected']:,} of {info['n_base']:,} base galaxies detected; "
                   f"{info['n_galaxies']:,} in the catalog", flush=True)
             print(cat.line_report(), flush=True)
@@ -485,9 +544,6 @@ class BaseCatalog:
         if write_to is not None:
             cat.write(write_to)
         return cat
-
-    def _has_area(self) -> bool:
-        return self._area is not None or (self.dir / f"{self.tag}_area.json").exists()
 
     # ---- settings -> a picklable description for the workers -------------------------
     def _spec(self, flux_limit, secondary, confusion, z_range, z_column, lines, membership, outcomes, n_det_min, cuts, downsample,

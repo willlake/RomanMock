@@ -16,6 +16,7 @@ is measured from the galaxies when the footprint is built (:meth:`PatchFootprint
 from __future__ import annotations
 
 import json
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -60,31 +61,43 @@ class PatchFootprint:
 
     # ---- construction ------------------------------------------------------------------
     @classmethod
-    def from_mock(cls, catalog_file, decomposition=None, ra_offset: float | None = None) -> "PatchFootprint":
-        """Footprint of the mock that ``catalog_file`` (one slice) belongs to.
+    def from_mock(cls, catalog_files, decomposition=None, ra_offset: float | None = None) -> "PatchFootprint":
+        """Footprint of the mock that ``catalog_files`` (one slice or several) belong to.
 
-        The patches are the values of ``lc_patch`` in the file, their rectangles come from
-        ``decomposition`` (default: ``lc_cores-decomposition.txt`` in the same directory).
+        The patches are the values of ``lc_patch`` in the files, their rectangles come from
+        ``decomposition`` (default: ``lc_cores-decomposition.txt`` in the same directory). Nothing
+        about the footprint is assumed: a mock with other patches gives another footprint.
         ``ra_offset`` is measured unless given: the multiple of 90 degrees that puts the galaxies
-        inside their own patches.
+        inside their own patches. Several slices guard against a slice that misses a patch; a
+        warning is given when the slices do not contain the same patches.
         """
         import opencosmo as oc
 
-        catalog_file = Path(catalog_file)
-        table = read_patch_decomposition(decomposition or catalog_file.parent / DECOMPOSITION_FILE)
-        data = oc.open(str(catalog_file)).select("lc_patch", "ra", "dec").get_data("numpy")
-        patch = np.asarray(data["lc_patch"]).astype(np.int64)
-        ra, dec = np.asarray(data["ra"], dtype=np.float64), np.asarray(data["dec"], dtype=np.float64)
+        files = [Path(catalog_files)] if isinstance(catalog_files, (str, Path)) else [Path(f) for f in catalog_files]
+        table = read_patch_decomposition(decomposition or files[0].parent / DECOMPOSITION_FILE)
         rows = {int(r[0]): r for r in table}
-        missing = sorted(set(np.unique(patch).tolist()) - set(rows))
-        if missing:
-            raise ValueError(f"patches {missing} are not in the decomposition")
-        own = np.array([rows[int(p)] for p in patch[:: max(patch.size // 200_000, 1)]])
-        ra_s, dec_s = (x[:: max(patch.size // 200_000, 1)] for x in (ra, dec))
-        theta = np.radians(90.0 - dec_s)
+        per_file, own, ra, dec = [], [], [], []
+        for f in files:
+            data = oc.open(str(f)).select("lc_patch", "ra", "dec").get_data("numpy")
+            patch = np.asarray(data["lc_patch"]).astype(np.int64)
+            found = sorted(np.unique(patch).tolist())
+            missing = sorted(set(found) - set(rows))
+            if missing:
+                raise ValueError(f"patches {missing} of {f.name} are not in the decomposition")
+            per_file.append(found)
+            step = max(patch.size // 200_000, 1)
+            own.append(np.array([rows[int(p)] for p in patch[::step]]))
+            ra.append(np.asarray(data["ra"], dtype=np.float64)[::step])
+            dec.append(np.asarray(data["dec"], dtype=np.float64)[::step])
+        if any(p != per_file[0] for p in per_file):
+            warnings.warn("the slices do not contain the same sky patches (" + ", ".join(
+                f"{f.name}: {len(p)}" for f, p in zip(files, per_file)) + "): the footprint is their union; if the "
+                "footprint of the mock depends on redshift, build one footprint per redshift range", RuntimeWarning, stacklevel=2)
+        own, ra, dec = np.concatenate(own), np.concatenate(ra), np.concatenate(dec)
+        theta = np.radians(90.0 - dec)
 
         def inside(offset):
-            phi = np.radians((ra_s + offset) % 360.0)
+            phi = np.radians((ra + offset) % 360.0)
             return np.mean((theta >= own[:, 1]) & (theta <= own[:, 2]) & (phi >= own[:, 3]) & (phi <= own[:, 4]))
 
         offsets = [ra_offset] if ra_offset is not None else [180.0, 0.0, 90.0, 270.0]
@@ -92,8 +105,34 @@ class PatchFootprint:
         best = max(found, key=found.get)
         if found[best] < 0.98:
             raise ValueError(f"the galaxies are not inside their patches (fraction inside per ra offset: {found})")
-        use = np.array([rows[p] for p in sorted(np.unique(patch).tolist())])
+        use = np.array([rows[p] for p in sorted(set().union(*per_file))])
         return cls(use[:, 1], use[:, 2], use[:, 3], use[:, 4], ra_offset=best, patches=use[:, 0])
+
+    def check(self, ra, dec, nside: int | None = None) -> dict:
+        """Compare the footprint with the positions of galaxies.
+
+        ``inside``: fraction of the galaxies inside the footprint (a low value: the footprint
+        misses part of the mock). ``empty``: fraction of the HEALPix pixels lying fully inside the
+        footprint that contain no galaxy (a high value: the footprint covers sky the mock does
+        not). ``nside`` defaults to the resolution with about 50 galaxies per pixel.
+        """
+        import healpy as hp
+
+        ra, dec = np.asarray(ra, dtype=np.float64), np.asarray(dec, dtype=np.float64)
+        if nside is None:
+            per_deg2 = ra.size / self.area_deg2
+            nside = int(2 ** np.clip(np.floor(np.log2(np.sqrt(per_deg2 * FULL_SKY_DEG2 / 12 / 50.0))), 2, 8))
+        pixels = np.arange(hp.nside2npix(nside))
+        lon, lat = hp.pix2ang(nside, pixels, lonlat=True)
+        near = (lat > 90 - np.degrees(self.theta_hi.max()) - 1) & (lat < 90 - np.degrees(self.theta_lo.min()) + 1)
+        pixels = pixels[near & self.contains(lon, lat)]
+        corners = hp.boundaries(nside, pixels, step=2)                       # (n, 3, 8)
+        c_lon, c_lat = hp.vec2ang(np.moveaxis(corners, 1, 2).reshape(-1, 3), lonlat=True)
+        interior = pixels[self.contains(c_lon, c_lat).reshape(pixels.size, -1).all(axis=1)]
+        counts = np.bincount(hp.ang2pix(nside, ra, dec, lonlat=True), minlength=hp.nside2npix(nside))
+        return {"inside": float(np.mean(self.contains(ra, dec))) if ra.size else float("nan"),
+                "empty": float(np.mean(counts[interior] == 0)) if interior.size else float("nan"),
+                "nside": int(nside), "n_pixels": int(interior.size), "n_galaxies": int(ra.size)}
 
     def to_dict(self) -> dict:
         return {"ra_offset": self.ra_offset, "area_deg2": self.area_deg2,

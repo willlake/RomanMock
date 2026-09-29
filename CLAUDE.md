@@ -63,10 +63,10 @@ in step with the code.
 | `diagnostics.py`, `plotting.py` | checks (confusion, contamination, completeness, dN/dz); notebook plot style |
 | `config.py`, `cli.py`, `io.py` | YAML config dataclasses, CLI, OpenCosmo I/O, manifests, index compression, memory budget |
 
-CLI commands: `info`, `lines`, `example-config`, `run`, `base`, `catalog`, `assign`, `summary`, `select`, `compress-index`.
-Scripts: `execute_notebooks.sh` (sbatch, notebook prefixes as arguments), `run_base.sh` (sbatch, step 1),
-`run_slices.sh` (job array for `run`), `example_analysis.py`, `census_1e17.py` + `run_census_1e17.sh` (one-off
-count of galaxies above 1e-17 used for a cost estimate).
+CLI commands: `info`, `lines`, `example-config`, `run`, `base`, `census`, `catalog`, `random`, `assign`, `summary`,
+`select`, `compress-index`.
+Scripts: `production.sh` (sbatch: base catalog + census from `configs/production.yaml`), `run_slices.sh` (job array
+for `run`), `example_analysis.py`.
 
 ## Conventions
 
@@ -105,8 +105,8 @@ Two-step workflow:
   (`assign` + `select`, OpenCosmo files, manifests) is for when an OpenCosmo lightcone on disk is needed.
 - Randoms: `cat.make_random(which, n_times, write_to)`. Footprint = the 60 patches in `lc_patch`, rectangles from
   `lc_cores-decomposition.txt` in the mock directory; `dec = 90 - theta`, `ra = phi - 180` (offset measured in
-  `PatchFootprint.from_mock`, cached in `<base>/<tag>_footprint.json`). Exact area 2062.65 deg² (the HEALPix
-  estimate `base.area_deg2`, still used for dN/dz, gives 2063.0). 0.006 % of the galaxies lie outside (satellites).
+  `PatchFootprint.from_mock`, cached in `<base>/<tag>_footprint.json`). Exact area 2062.65 deg², which is `base.area_deg2` and
+  `cat.area_deg2` (the HEALPix estimate, 2063.0, is the fallback and what `select` uses). 0.006 % of the galaxies lie outside (satellites).
   Stream of random catalog k: `(seed, 30000, kind index, k)`. One file per multiple of the data size.
   Neither OpenCosmo nor diffsky makes randoms for a footprint; diffsky has
   `experimental.lc_utils.mc_lightcone_random_ra_dec` for a single rectangle.
@@ -116,6 +116,17 @@ Two-step workflow:
   (`SampleConfig.membership`). In the mock [O III] 5007 is never the brightest line at 1 < z < 1.9, so with
   "assigned" an [O III] sample there holds interlopers only. The line report counts detected / identified /
   brightest / mistaken / interlopers per line.
+- Sky area: the user's value when given (`BaseCatalog(..., area_deg2=)`, `make_catalog(area_deg2=)`, `romanmock
+  catalog --area`), else estimated (footprint, then HEALPix); `base.area_source` / `cat.info["area_source"]` say which.
+  The area affects dN/dz and the downsampling only, not the randoms (they use the footprint geometry).
+- The footprint is never assumed. `BaseCatalog.footprint` reads `lc_patch` from the three most populated input
+  slices and the rectangles from the decomposition file of that mock, checks the result against the galaxies of
+  the largest base slice (`PatchFootprint.check`: more than 99 % inside, under 1 % of interior HEALPix pixels
+  empty, else ValueError), and caches it with the identity of the base catalog (`_identity`), so a rebuilt base
+  catalog or another mock gets its own footprint. If the mock has no decomposition, `area_deg2` warns and falls
+  back to the HEALPix estimate. The numbers 60 patches / 2062.65 deg² appear only in tests and documentation.
+- When replacing a section of a document by slicing between two markers, check that the markers are adjacent
+  (on 2026-09-28 a slice removed the sections Conventions to OpenCosmo facts of this file; restored from git).
 - Line report: `make_catalog(verbose=True)` prints `cat.line_report()`; the numbers are in
   `cat.info["line_report"]` (`lines`, `interlopers`). Geometry in `catalog.line_report` (potential interlopers:
   line i inside the bandpass that passes the redshift cut when taken for j; lightcone bounds padded by
@@ -240,23 +251,18 @@ Randomness and provenance:
 Data columns cost 48 B per galaxy for the default parent columns and 116 B for the base catalog. At 1e-17 the
 mock has 203 M galaxies with a line in 0.5 < z < 3.0 (74 % of all), against 59 M at 1e-16 and 41 M at 1.5e-16.
 
-## Demo outputs (`$PSCRATCH/romanmock_demo`)
+## Production data (`/global/cfs/cdirs/m4943/Simulations/RomanMocks/<mock version>/`)
 
-- `two_step/base` (base catalog, rebuilt 2026-09-28 with `line_bitmask_base`; `romanmock_base_area.json` caches
-  the sky area), `two_step/nb_F*` (notebook 07), `two_step/halpha_z1p0_1p9.hdf5` (notebook 09),
-  `two_step/randoms/` (notebook 10: Hα catalog and its randoms, 2.2 GB).
-- `full_F1.0e-16_S4.0e-17`, `parent_F1.0e-16_S4.0e-17`: notebooks 05 and 03 with the current defaults.
-- `full/`, `parent/`: older 1.5e-16 single-threshold runs, uncompressed index.
-- `census_z0p5_3p0.npz` (notebook 06), `census_secondary_z0p5_3p0.npz` (notebook 08), `census_z0p5_3p0_1e17.npz`.
+- `base/` (built 2026-09-28 by `scripts/production.sh`, job 59059171), `census/dndz_census_z0p5_3p0.npz`,
+  `catalogs/halpha_z1p0_1p9.hdf5` (notebook 02), `randoms/halpha_z1p0_1p9_<which>_<index>.hdf5` (notebook 03).
+- `$PSCRATCH/romanmock_demo` holds the outputs of the earlier tutorial notebooks (scratch, purged in time).
 
 ## Working style
 
 - Plots (notebooks) use `romanmock.plotting` (fixed categorical order, single axis, thin marks).
-- Notebooks live in `notebooks/` (01–10) and are generated from `notebooks/build_notebooks.py`; edit the builder,
-  then `python notebooks/build_notebooks.py --execute --only <prefixes>` (login node: 01–04, 09, 10; the user edits
-  and reruns notebook copies in Jupyter, so check the `.ipynb` on disk for their settings before regenerating) or
-  `sbatch scripts/execute_notebooks.sh <prefixes>` (05–08). Running the builder without `--only` rewrites every
-  notebook, and without `--execute` it strips their outputs.
+- `notebooks/` holds three production examples (01 dN/dz and flux limits, 02 catalog, 03 randoms), edited as
+  notebooks; there is no generator. The ten earlier tutorials and their generator were moved by the user to
+  `~/Projects/Roman/RomanMock/Notebooks/` (2026-09-28). Keep notebooks minimal: only what is needed for the task.
 - `configs/roman_grism_baseline.yaml` is the commented template for every config block; keep it complete (it was
   found truncated after the sensitivity block on 2026-09-28 and restored).
 - The user commits; leave changes uncommitted in the working tree unless asked.

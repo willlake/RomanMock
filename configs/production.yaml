@@ -1,0 +1,23 @@
+# Production configuration: base catalog of the Roman grism mock (two-step workflow, step 1).
+#
+#   sbatch scripts/production.sh            # base catalog and dN/dz census, one CPU node, a few minutes
+#
+# Step 2 (catalogs and randoms) needs no configuration file: see notebooks/02_build_catalog.ipynb
+# and notebooks/03_build_randoms.ipynb, or `romanmock catalog` and `romanmock random`.
+
+catalog:
+  path: /global/cfs/cdirs/m4943/Simulations/sdss_feniks_hizels_260710_09_07_2026
+
+base:
+  dir: /global/cfs/cdirs/m4943/Simulations/RomanMocks/sdss_feniks_hizels_260710_09_07_2026/base
+  columns: [gal_id, ra, dec, redshift_true]     # copied from the input mock, next to redshift_rsd and the line fluxes
+
+line_set: roman_transitions
+
+# The base catalog keeps every galaxy with a line above flux_limit inside the bandpass. It is the
+# deepest primary limit step 2 can use; the secondary limit is chosen freely in step 2.
+sensitivity:
+  type: constant
+  flux_limit: 1.0e-16               # erg/s/cm^2
+  secondary_flux_limit: 4.0e-17
+  wave_range: [10000.0, 19300.0]    # Angstrom

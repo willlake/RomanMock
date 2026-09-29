@@ -46,11 +46,13 @@ vary. So the mock is read once, and every catalog is made from the result.
 `redshift_true`, `redshift_rsd` and the flux of every line of the line set.
 
 ```bash
-romanmock base cfg.yaml --workers 32          # or: sbatch scripts/run_base.sh cfg.yaml   (about 1 minute on a CPU node)
+sbatch scripts/production.sh                  # configs/production.yaml: base catalog and dN/dz census, about 5 minutes
+romanmock base cfg.yaml --workers 32          # the base catalog alone
 ```
 
-`cfg.yaml` needs `catalog.path`, `base.dir` and, to change the defaults, `sensitivity` and `base.columns`;
-`configs/roman_grism_baseline.yaml` is a commented template.
+`cfg.yaml` needs `catalog.path`, `base.dir` and, to change the defaults, `sensitivity` and `base.columns`.
+`configs/production.yaml` is the configuration of the production run, `configs/roman_grism_baseline.yaml` a
+commented template of every option.
 
 **Step 2, as often as you like: a catalog.** One call with the flux limits, the confusion matrix, the lines and
 the redshift range of your choice. It returns numpy arrays; nothing is written unless you ask, and nothing is
@@ -87,6 +89,7 @@ cat.write("halpha.hdf5")                          # optional: .hdf5, .fits or .n
 | `downsample` | `"wang2022"` thins the emitter populations to the Wang et al. (2022) forecast | no downsampling |
 | `columns` | columns returned, or `"all"` (line fluxes, bitmask, `gal_id`, ...) | ra, dec, three redshifts, id_outcome |
 | `wave_range`, `detection`, `sigma_z`, `seed`, `n_workers`, `write_to` | bandpass, detection model, redshift error, seed, workers, output file | |
+| `area_deg2` | sky area of the lightcone, for dN/dz and the downsampling; also `BaseCatalog(path, area_deg2=...)` | estimated |
 | `verbose` | print the progress and the line report (below) | `True` |
 
 **Line report.** With `verbose=True` the call prints which lines fall inside the bandpass for the redshift
@@ -131,7 +134,7 @@ romanmock catalog /path/to/base -o halpha.hdf5 --flux-limit 1.5e-16 --secondary-
           --confusion my_confusion.yaml --lines Ha --z-range 1.0 1.9 --downsample wang2022
 ```
 
-Notebook 09 walks through this. In a script, call `make_catalog` below `if __name__ == "__main__":` because
+Notebook 02 walks through this. In a script, call `make_catalog` below `if __name__ == "__main__":` because
 the slices are read by worker processes.
 
 **Random catalogs.** `cat.make_random` makes the randoms of a catalog: uniform on the sky inside the footprint
@@ -166,8 +169,8 @@ the angles theta and phi listed in `lc_cores-decomposition.txt`, and each galaxy
 **The file-based route.** `romanmock assign` (step 2 written as OpenCosmo files, one per slice) followed by
 `romanmock select` (analysis samples) does the same through a YAML configuration, with manifests and
 configuration hashes that refuse to mix different settings in one directory. It gives identical galaxies for
-identical settings and seed (tested) and is the route to take when the output must be an OpenCosmo lightcone;
-see notebook 07. `romanmock run cfg.yaml` does stage A in one pass from the input mock.
+identical settings and seed (tested) and is the route to take when the output must be an OpenCosmo lightcone.
+`romanmock run cfg.yaml` does stage A in one pass from the input mock.
 
 ## Pipeline
 
@@ -375,7 +378,7 @@ the [O III] targets for z < 2.85.
 `romanmock.census.line_census` counts emitters directly from the input mock with flux, bandpass and redshift
 cuts only, for several limits in one pass, split into single-line and multi-line galaxies. A limit is a number
 (one threshold for every line, the population of the Wang et al. tables) or a `(primary, secondary)` pair (the
-two-tier rule). Notebooks 06 and 08 use it. With one threshold at 1.0e-16 the mock has 1.5 times the forecast Hα
+two-tier rule). `romanmock census` writes it to a file and notebook 01 plots it. With one threshold at 1.0e-16 the mock has 1.5 times the forecast Hα
 counts over 0.5 < z < 2.0 and 3 times the [O III] counts over 1.0 < z < 3.0.
 
 ## Resources
@@ -393,29 +396,30 @@ Measured on the full lightcone (324 M input galaxies, base limit 1.0e-16, 64.6 M
 | `line_census`, 42 slices, 6 limits | CPU node, 32 workers | 0.8 min | about 5 GB |
 
 NERSC login nodes cap each user at 30 GB, so steps that read the input mock fit with at most 5 workers there; a
-short batch job is simpler (`scripts/run_base.sh`, `scripts/execute_notebooks.sh`). Sky areas come from the
-HEALPix index at its finest sufficiently populated resolution with edge pixels counted half (2062.5 deg² for
-this mock, nominal 2062.6); estimate them from a whole catalog, not from a single sparse slice.
+short batch job is simpler (`scripts/production.sh`). 
 
-## Notebooks
+**Sky area.** Give it if you know it: `BaseCatalog(path, area_deg2=2500.0)` or `make_catalog(area_deg2=2500.0)`.
+Otherwise it is estimated, from the sky patches of the mock (2062.65 deg² for this one) or, when the mock has
+no patch decomposition, from the galaxies in the HEALPix index. `cat.info["area_source"]` records which:
+`user`, `footprint` or `healpix`. The file-based route always uses the HEALPix estimate (`sky_area_deg2`).
 
-`notebooks/` holds nine executed tutorials (regenerate with `python notebooks/build_notebooks.py --execute
-[--only 07 09]`; edit the builder, not the `.ipynb` files):
+## Production data and notebooks
 
-1. `01_explore_diffsky_catalog.ipynb` – slices, columns, units, rest wavelengths, luminosities to fluxes with `add_line_fluxes`, which lines fall in the grism.
-2. `02_pipeline_step_by_step.ipynb` – fluxes, two-tier detection and bitmask, confusion matrix, redshift assignment on arrays; input versus empirical confusion.
-3. `03_run_and_build_samples.ipynb` – `RomanMockPipeline.run` on three slices, the parent catalog, contamination and completeness, downsampling a sample to a target dN/dz.
-4. `04_extending_models.ipynb` – tabulated sensitivity, noisy detection, an S/N-dependent confusion model registered for YAML, custom line sets.
-5. `05_full_run.ipynb` – all 67 slices in one pass from the input mock, then dN/dz per assigned line, the (z_rsd, z_assigned) plane, contamination, completeness, population thinning to the Wang et al. (2022) forecast and two HLSS-like samples.
-6. `06_dndz_census.ipynb` – dN/dz of galaxies with a line above 1.0e-16 or 1.5e-16 erg/s/cm² inside the grism range at 0.5 < z < 3.0, no confusion or downsampling, split into single-line and multi-line galaxies and compared with both dust models of the Wang et al. (2022) tables, with their uncertainties.
-7. `07_two_step_workflow.ipynb` – the two-step construction on the full lightcone: base flux catalog, step 2 at three settings of the limits, analysis samples, what step 2 refuses, a join through `gal_id`, disk usage.
-8. `08_dndz_secondary_limit.ipynb` – the single-line / multi-line dN/dz of notebook 06 for secondary flux limits of 8e-17 and 4e-17 next to a single threshold, for primary limits of 1.0e-16 and 1.5e-16.
-9. `09_catalog_from_base.ipynb` – the everyday recipe: `BaseCatalog.make_catalog` with chosen flux limits, confusion matrix, lines and redshift range, returned in memory; changing settings, downsampling to Wang et al. (2022), writing to disk.
-10. `10_random_catalogs.ipynb` – `cat.make_random`: the footprint, randoms for the contaminated catalog, the galaxies and the interlopers, sky and redshift checks, N files on disk.
+The products for the mock `sdss_feniks_hizels_260710_09_07_2026` are in
+`/global/cfs/cdirs/m4943/Simulations/RomanMocks/sdss_feniks_hizels_260710_09_07_2026/`:
 
-Notebooks 01 to 04 and 09 run on a login node. Notebooks 05 to 08 read the whole input mock the first time and
-are meant for a compute node: `sbatch scripts/execute_notebooks.sh 05 06 07 08`. Their results are cached, so
-later runs are quick.
+| directory | content | made by |
+|---|---|---|
+| `base/` | base catalog: 64.6 M galaxies with a line above 1.0e-16 erg/s/cm², 66 slices, 7.6 GB | `sbatch scripts/production.sh` |
+| `census/` | `dndz_census_z0p5_3p0.npz`: dN/dz per line for primary limits 1.0e-16, 1.5e-16 and secondary limits none, 8e-17, 4e-17 | `sbatch scripts/production.sh` |
+| `catalogs/` | `halpha_z1p0_1p9.hdf5`: Hα sample at 1.0 < z < 1.9 | notebook 02 |
+| `randoms/` | `halpha_z1p0_1p9_<which>_<index>.hdf5`: 10 random catalogs each for all, galaxies and interlopers | notebook 03 |
+
+`notebooks/` holds three executed examples, all of which run on a login node:
+
+1. `01_dndz_flux_limits.ipynb` – dN/dz per line and the single-line fraction for the primary and secondary flux limits.
+2. `02_build_catalog.ipynb` – a catalog from the base catalog: flux limits, confusion matrix, line and redshift selection, the line report, writing and reading.
+3. `03_build_randoms.ipynb` – the random catalogs of that catalog for the contaminated sample, the galaxies and the interlopers.
 
 ## Extending (hooks for the plan's comments)
 

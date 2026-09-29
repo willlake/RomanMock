@@ -38,6 +38,13 @@ def test_footprint_area_and_sampling(tmp_path):
     assert grid.shape == (2, 3) and grid.tolist() == [[True, True, False], [False, True, False]]
     assert fp.rectangles().shape == (6, 4)
     assert bool(fp.contains(200.0, 55.0))
+    # check against galaxies: a footprint that is too small or too large is noticed
+    good = fp.check(ra, dec)
+    assert good["inside"] == 1.0 and good["empty"] == 0.0 and good["n_pixels"] > 50
+    small = PatchFootprint(fp.theta_lo[:4], fp.theta_hi[:4], fp.phi_lo[:4], fp.phi_hi[:4])
+    assert small.check(ra, dec)["inside"] < 0.9
+    part = dec > 60
+    assert fp.check(ra[part], dec[part])["empty"] > 0.1
     fp2 = PatchFootprint.load(fp.save(tmp_path / "fp.json"))
     assert fp2.area_deg2 == fp.area_deg2 and fp2.n_patches == 6
 
@@ -99,8 +106,17 @@ def test_footprint_and_randoms_of_the_mock(tmp_path):
     base = BaseCatalog(tmp_path / "base")
     fp = base.footprint
     assert fp.n_patches == 60 and fp.ra_offset == 180.0 and fp.area_deg2 == pytest.approx(2062.65, abs=0.05)
-    assert fp.area_deg2 == pytest.approx(base.area_deg2, rel=2e-2)             # the HEALPix estimate, two sparse slices
+    assert base.area_deg2 == fp.area_deg2
     assert (tmp_path / "base" / "romanmock_base_footprint.json").exists()
+    import json
+
+    cache = tmp_path / "base" / "romanmock_base_footprint.json"
+    stored = json.loads(cache.read_text())
+    assert stored["check"]["inside"] > 0.99 and stored["check"]["empty"] <= 0.01 and stored["base"] == base._identity()
+    # a cache that belongs to another base catalog (rebuilt, other mock) is not used
+    cache.write_text(json.dumps({**_footprint().to_dict(), "base": {**stored["base"], "n_galaxies": 1}}))
+    assert BaseCatalog(tmp_path / "base").footprint.n_patches == 60
+    assert json.loads(cache.read_text())["base"] == base._identity()
     cat = base.make_catalog(confusion={"SIII_9532": {"Ha": 0.3}}, n_workers=1, verbose=False)
     assert np.mean(fp.contains(cat["ra"], cat["dec"])) > 0.995                   # satellites spill over the edge
     ran = cat.make_random(n_times=2, verbose=False)

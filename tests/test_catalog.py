@@ -47,8 +47,8 @@ def test_base_catalog_description(base):
     assert b.flux_limit == 1e-16 and b.wave_range == (10000.0, 19300.0) and b.n_galaxies > 0
     assert {"gal_id", "ra", "redshift_rsd", "redshift_assigned", "line_bitmask", "Ha_flux"} <= set(b.columns)
     assert "64" not in repr(b) or True
-    assert 2000 < b.area_deg2 < 2130
-    assert (tmp / "base" / "romanmock_base_area.json").exists()              # cached
+    assert b.area_deg2 == pytest.approx(2062.65, abs=0.05)                   # the footprint
+    assert (tmp / "base" / "romanmock_base_footprint.json").exists()         # cached
 
 
 def test_catalog_equals_pipeline_catalog(base):
@@ -78,7 +78,12 @@ def test_catalog_equals_pipeline_catalog(base):
 
 def test_cuts_and_downsampling_equal_select(base):
     tmp, b = base
+    import opencosmo as oc
+    from romanmock.selection import sky_area_deg2
+
     target = {"z": [0.0, 4.0], "dndz": [1500.0, 1500.0]}
+    b = BaseCatalog(b.dir)
+    b._area = float(sky_area_deg2(oc.open(*b.files)))          # the estimate `romanmock select` uses, for equal rows
     with pytest.warns(RuntimeWarning):
         cat = b.make_catalog(confusion=ROWS, seed=5, lines=["SIII_9532"], membership="assigned", z_range=(0.28, 0.35),
                              columns=ALL, downsample={"SIII_9532": target}, n_workers=2, verbose=False, **LIMITS)
@@ -244,3 +249,30 @@ def test_line_report(base, capsys):
                           downsample={"SIII_9532": {"z": z.tolist(), "dndz": [50.0] * 4}}, **LIMITS)
     assert len(thin) < len(cat)
     assert sum(r["n"] for r in thin.info["line_report"]["interlopers"]) == np.sum(thin["id_outcome"] == 3)
+
+
+def test_sky_area_given_or_estimated(base, capsys):
+    _, b = base
+    b = BaseCatalog(b.dir)
+    assert b.area_source is None
+    est = b.make_catalog(n_workers=1, **LIMITS)
+    assert est.area_deg2 == pytest.approx(2062.65, abs=0.05) and est.info["area_source"] == "footprint"
+    assert "estimated from the sky patches" in capsys.readouterr().out
+    edges = np.array([0.25, 0.4])
+    given = b.make_catalog(n_workers=1, area_deg2=1000.0, **LIMITS)
+    assert given.area_deg2 == 1000.0 and given.info["area_source"] == "user" and b.area_deg2 == 1000.0
+    assert "1000.00 deg2 (given)" in capsys.readouterr().out
+    np.testing.assert_allclose(given.dndz(edges) * 1000.0, est.dndz(edges) * est.area_deg2)
+    assert BaseCatalog(b.dir, area_deg2=2500.0).area_deg2 == 2500.0
+    b.area_deg2 = None                                                  # back to the estimate
+    assert b.area_deg2 == pytest.approx(2062.65, abs=0.05) and b.area_source == "footprint"
+    # the area sets the density the downsampling aims at
+    target = {"SIII_9532": {"z": [0.0, 4.0], "dndz": [500.0, 500.0]}}
+    kw = dict(confusion=ROWS, seed=5, n_workers=1, verbose=False, downsample=target, **LIMITS)
+    with pytest.warns(RuntimeWarning):
+        small, large = b.make_catalog(area_deg2=1000.0, **kw), b.make_catalog(area_deg2=2000.0, **kw)
+    n = lambda c: c.info["downsample"]["SIII_9532"]["n_after"]
+    assert n(large) > 1.5 * n(small)
+    for bad in (0.0, -5.0, 5e4):
+        with pytest.raises(ValueError):
+            BaseCatalog(b.dir, area_deg2=bad)

@@ -147,7 +147,7 @@ def cmd_catalog(args):
 
     from .catalog import BaseCatalog
 
-    base = BaseCatalog(args.base_dir)
+    base = BaseCatalog(args.base_dir, area_deg2=args.area)
     confusion = None
     if args.confusion:
         with open(args.confusion) as f:
@@ -166,6 +166,23 @@ def cmd_catalog(args):
         seed=args.seed, n_workers=None if args.workers == "auto" else int(args.workers), verbose=not args.quiet)
     print(cat.summary())
     print(f"[romanmock] written: {cat.write(args.output)}")
+
+
+def cmd_census(args):
+    """dN/dz census of the input mock: emitters above flux limits, single-line and multi-line."""
+    _jax_platform(args)
+    import numpy as np
+
+    from .census import line_census
+
+    secondary = [None if s <= 0 else s for s in (args.secondary_flux_limits or [0.0])]
+    limits = [(p, s) for p in args.flux_limits for s in secondary]
+    lo, hi = args.z_range
+    edges = np.round(lo + args.dz * np.arange(int(round((hi - lo) / args.dz)) + 1), 6)
+    census = line_census(args.catalog, limits, edges, line_set=args.line_set, n_workers=_n_workers(args, 5.0),
+                         verbose=not args.quiet)
+    path = census.save(args.output)
+    print(f"[romanmock] census of {len(census.steps)} slices, limits (primary, secondary) {census.limits} -> {path}")
 
 
 def cmd_random(args):
@@ -292,11 +309,27 @@ def main(argv=None):
     s.add_argument("--downsample", help="reference dN/dz to thin the emitter populations to, e.g. wang2022 (default: none)")
     s.add_argument("--dust-av", type=float, default=1.65, help="dust model of the reference (1.65 or 1.92)")
     s.add_argument("--columns", nargs="+", help="columns to keep, or 'all'")
+    s.add_argument("--area", type=float, help="sky area of the lightcone [deg^2] (default: estimated)")
     s.add_argument("--seed", type=int, default=12345)
     s.add_argument("--workers", default="auto")
     s.add_argument("--jax-platform", default="cpu", help="JAX_PLATFORMS value (default cpu)")
     s.add_argument("--quiet", action="store_true")
     s.set_defaults(func=cmd_catalog)
+
+    s = sub.add_parser("census", help="dN/dz of the emitters of the input mock above flux limits, split into "
+                                      "single-line and multi-line; no confusion, no downsampling")
+    s.add_argument("catalog", help="directory of the diffsky mock")
+    s.add_argument("-o", "--output", required=True, help="output file (.npz), read with LineCensus.load")
+    s.add_argument("--flux-limits", nargs="+", type=float, default=[1.0e-16], help="primary limits [erg/s/cm^2]")
+    s.add_argument("--secondary-flux-limits", nargs="+", type=float,
+                   help="secondary limits, each combined with every primary limit; 0 = single threshold")
+    s.add_argument("--z-range", nargs=2, type=float, default=[0.5, 3.0], metavar=("ZMIN", "ZMAX"))
+    s.add_argument("--dz", type=float, default=0.1, help="width of the redshift bins")
+    s.add_argument("--line-set", default="roman_transitions")
+    s.add_argument("--workers", default="auto", help="number of parallel slice processes, or 'auto' (~5 GB each)")
+    s.add_argument("--jax-platform", default="cpu", help="JAX_PLATFORMS value (default cpu)")
+    s.add_argument("--quiet", action="store_true")
+    s.set_defaults(func=cmd_census)
 
     s = sub.add_parser("random", help="random catalogs for a catalog: uniform inside the footprint, redshifts drawn "
                                       "from the data; N files of the size of the data")
