@@ -46,6 +46,7 @@ DEFAULT_COLUMNS = ["ra", "dec", "redshift_true", "redshift_rsd", "redshift_assig
 #: columns computed in step 2 (the others are read from the base catalog)
 DERIVED_COLUMNS = ["redshift_assigned", "id_outcome", "line_bitmask", "n_det", "line_true", "line_assigned"]
 DEFAULT_OUTCOMES = ("MULTI_LINE", "SINGLE_CORRECT", "SINGLE_MISID")     # every galaxy with a redshift
+CHUNK_ROWS = 1_000_000  #: rows of a slice processed at a time by a worker (bounds its memory)
 RSD_MARGIN = 0.012      #: largest |z_rsd - z_true| / (1 + z) allowed for in the line report
 REDSHIFT_COLUMNS = ("redshift_assigned", "redshift_rsd", "redshift_true")
 
@@ -321,6 +322,40 @@ class BaseCatalog:
     def files(self) -> list[Path]:
         return [self.dir / v["output"] for v in self.slices.values()]
 
+    def read_slices(self, columns: Sequence[str], z_range: tuple[float | None, float | None] | None = None,
+                    z_column: str = "redshift_rsd", verbose: bool = False):
+        """Yield the ``columns`` of the base catalog slice by slice, as dicts of numpy arrays.
+
+        For computations that stream through the base catalog, such as histograms of the stored
+        columns: one slice at a time is in memory (a few hundred MB), whatever the size of the
+        base catalog, and no worker processes are used. ``z_range`` keeps the rows with
+        ``z_column`` inside it and skips the slices entirely outside it. The stored columns are
+        :attr:`columns` without the ones step 2 derives (``base.description["columns"]``,
+        ``redshift_rsd``, the line fluxes and the base bitmask).
+        """
+        columns = list(columns)
+        need_z = z_range is not None
+        read = list(dict.fromkeys([*columns, *([z_column] if need_z else [])]))
+        lo, hi = (None, None) if z_range is None else z_range
+        for step, v in self.slices.items():
+            if need_z:
+                margin = RSD_MARGIN * (1 + v["z_max"])
+                if (lo is not None and v["z_max"] + margin < lo) or (hi is not None and v["z_min"] - margin > hi):
+                    continue
+            if verbose:
+                print(f"[romanmock] slice {step}: {v['n_galaxies']:,} rows", flush=True)
+            data = oc.open(str(self.dir / v["output"])).select(*read).get_data("numpy", wrap_single=True)
+            if need_z:
+                z = np.asarray(data[z_column], dtype=np.float64)
+                keep = np.isfinite(z)
+                if lo is not None:
+                    keep &= z >= lo
+                if hi is not None:
+                    keep &= z <= hi
+                yield {c: np.asarray(data[c])[keep] for c in columns}
+            else:
+                yield {c: np.asarray(data[c]) for c in columns}
+
     @property
     def area_deg2(self) -> float:
         """Sky area of the lightcone [deg^2]: the value given by the user, else an estimate. The
@@ -485,7 +520,7 @@ class BaseCatalog:
             Gaussian error ``sigma_z (1 + z)`` on multi-line redshifts.
         seed : int
         n_workers : int
-            Default: as many as fit in the memory this session may use, at most 8.
+            Default: as many as fit in the memory this session may use, at most 32.
         write_to : path
             Also write the catalog there (see :meth:`Catalog.write`).
         area_deg2 : float
@@ -503,7 +538,7 @@ class BaseCatalog:
             self.area_deg2 = area_deg2
         area = self.area_deg2
         if n_workers is None:
-            n_workers = suggest_n_workers(max_workers=8, per_worker_gb=2.5)
+            n_workers = suggest_n_workers(max_workers=32, per_worker_gb=2.5)     # memory-limited: ~12 on a login node
         tasks = [(spec, str(self.dir / v["output"]), step) for step, v in self.slices.items()]
         if verbose:
             print(f"[romanmock] {len(tasks)} slices of {self.dir.name}, {n_workers} worker(s)", flush=True)
@@ -681,7 +716,14 @@ def make_random(catalog, **settings):
 # workers
 # =====================================================================================
 def _catalog_slice(spec: dict, path: str, step: int) -> dict:
-    """Detection, redshift assignment and cuts for one slice of the base catalog."""
+    """Detection, redshift assignment and cuts for one slice of the base catalog.
+
+    The slice is read and processed in chunks of :data:`CHUNK_ROWS` rows, so that the memory of a
+    worker does not grow with the slice. The random draws are consumed in row order, so the
+    result equals that of one pass over the slice.
+    """
+    import h5py
+
     line_set = get_line_set(spec["line_set"])
     flux_columns = spec["flux_columns"]
     comp_cols = {c: f"{c}{spec['flux_suffix']}" for feat in line_set if not feat.is_blend for c in feat.components} \
@@ -689,67 +731,95 @@ def _catalog_slice(spec: dict, path: str, step: int) -> dict:
     derived = set(DERIVED_COLUMNS)
     wanted = [c for c in dict.fromkeys([*spec["columns"], *spec["cuts"], spec["z_column"]]) if c not in derived]
     read = list(dict.fromkeys([*flux_columns, *comp_cols.values(), "redshift_rsd", *wanted]))
-    data = oc.open(path).select(*read).get_data("numpy", wrap_single=True)
-    n = len(data["redshift_rsd"])
-
-    flux = np.stack([np.asarray(data[c], dtype=np.float64) for c in flux_columns], axis=1)
-    comp = {lum: np.asarray(data[name], dtype=np.float64) for lum, name in comp_cols.items()} or None
-    z_rsd = np.asarray(data["redshift_rsd"], dtype=np.float64)
     rng = np.random.default_rng([spec["seed"], int(step)])              # the pipeline's stream for this slice
+    rng_thin = np.random.default_rng([spec["seed"], THINNING_STREAM, int(step)])   # the stream `romanmock select` uses
     model = build_detection(spec["detection"], build_sensitivity(spec["sensitivity"]))
-    det = detect_lines(flux, z_rsd, line_set, model, rng, component_flux=comp)
-    za = assign_redshifts(det, z_rsd, line_set, spec["confusion"], rng, PerfectMultiLine(spec["sigma_z"]))
-    cols = dict(data)
-    cols.update(redshift_assigned=za.z_assigned, id_outcome=za.outcome, line_bitmask=det.bitmask, n_det=det.n_det,
-                line_true=za.line_true, line_assigned=za.line_assigned)
-
-    detected = det.bitmask > 0
-    out = {"step": int(step), "n_base": int(n), "n_detected": int(detected.sum())}
+    multi_line = PerfectMultiLine(spec["sigma_z"])
     pops = spec["populations"]
-    if pops:
-        out["hist"], out["n_pop"] = {}, {}
-        for name, pop in pops.items():
-            zs = z_rsd[detected & (za.line_true == pop["bit"])]
-            out["n_pop"][name] = int(zs.size)
-            out["hist"][name] = np.histogram(zs[np.isfinite(zs)], bins=pop["edges"])[0]
+    n_lines = len(line_set)
 
-    keep = detected.copy()
-    if spec["outcome_codes"] is not None:
-        keep &= np.isin(za.outcome, spec["outcome_codes"])
-    if spec["z_range"] is not None:
-        z = np.asarray(cols[spec["z_column"]], dtype=np.float64)
-        lo, hi = spec["z_range"]
-        keep &= np.isfinite(z)
-        if lo is not None:
-            keep &= z >= lo
-        if hi is not None:
-            keep &= z <= hi
-    if spec["line_bits"] is not None:
-        keep &= tracer_membership(cols, line_set, spec["lines"], spec["membership"])
-    if spec["n_det_min"] is not None:
-        keep &= det.n_det >= spec["n_det_min"]
-    for col, (lo, hi) in spec["cuts"].items():
-        v = np.asarray(cols[col])
-        if lo is not None:
-            keep &= v >= lo
-        if hi is not None:
-            keep &= v <= hi
+    parts = []
+    with h5py.File(path, "r") as h:
+        group = base_data_group(h)
+        n = group["redshift_rsd"].shape[0]
+        for start in range(0, n, CHUNK_ROWS):
+            stop = min(start + CHUNK_ROWS, n)
+            data = {c: group[c][start:stop] for c in read}
+            z_rsd = np.asarray(data["redshift_rsd"], dtype=np.float64)
+            flux = np.stack([np.asarray(data[c], dtype=np.float64) for c in flux_columns], axis=1)
+            comp = {lum: np.asarray(data[name], dtype=np.float64) for lum, name in comp_cols.items()} or None
+            det = detect_lines(flux, z_rsd, line_set, model, rng, component_flux=comp)
+            za = assign_redshifts(det, z_rsd, line_set, spec["confusion"], rng, multi_line)
+            cols = dict(data)
+            cols.update(redshift_assigned=za.z_assigned, id_outcome=za.outcome, line_bitmask=det.bitmask, n_det=det.n_det,
+                        line_true=za.line_true, line_assigned=za.line_assigned)
+            detected = det.bitmask > 0
+            part = {"n": stop - start, "n_detected": int(detected.sum())}
+            if pops:
+                part["hist"], part["n_pop"] = {}, {}
+                for name, pop in pops.items():
+                    zs = z_rsd[detected & (za.line_true == pop["bit"])]
+                    part["n_pop"][name] = int(zs.size)
+                    part["hist"][name] = np.histogram(zs[np.isfinite(zs)], bins=pop["edges"])[0]
+                u = np.zeros(stop - start)                       # one uniform deviate per detected galaxy, in order
+                u[detected] = rng_thin.random(int(detected.sum()))
 
-    out["columns"] = {c: np.ascontiguousarray(np.asarray(cols[c])[keep]) for c in spec["columns"]}
-    ident = {"line_true": za.line_true[keep], "line_assigned": za.line_assigned[keep], "outcome": za.outcome[keep],
-             "bitmask": np.asarray(det.bitmask)[keep]}
+            keep = detected.copy()
+            if spec["outcome_codes"] is not None:
+                keep &= np.isin(za.outcome, spec["outcome_codes"])
+            if spec["z_range"] is not None:
+                z = np.asarray(cols[spec["z_column"]], dtype=np.float64)
+                lo, hi = spec["z_range"]
+                keep &= np.isfinite(z)
+                if lo is not None:
+                    keep &= z >= lo
+                if hi is not None:
+                    keep &= z <= hi
+            if spec["line_bits"] is not None:
+                keep &= tracer_membership(cols, line_set, spec["lines"], spec["membership"])
+            if spec["n_det_min"] is not None:
+                keep &= det.n_det >= spec["n_det_min"]
+            for col, (lo, hi) in spec["cuts"].items():
+                v = np.asarray(cols[col])
+                if lo is not None:
+                    keep &= v >= lo
+                if hi is not None:
+                    keep &= v <= hi
+
+            part["columns"] = {c: np.ascontiguousarray(np.asarray(cols[c])[keep]) for c in spec["columns"]}
+            part["ident"] = {"line_true": za.line_true[keep], "line_assigned": za.line_assigned[keep],
+                             "outcome": za.outcome[keep], "bitmask": np.asarray(det.bitmask)[keep]}
+            if pops:
+                part["u"], part["population"], part["z_pop"] = u[keep], za.line_true[keep].astype(np.int16), z_rsd[keep]
+            parts.append(part)
+
+    cat = lambda key: np.concatenate([p[key] for p in parts]) if parts else np.zeros(0)
+    out = {"step": int(step), "n_base": int(sum(p["n"] for p in parts)), "n_detected": int(sum(p["n_detected"] for p in parts)),
+           "columns": {c: (np.concatenate([p["columns"][c] for p in parts]) if parts else np.zeros(0)) for c in spec["columns"]}}
+    ident = {k: (np.concatenate([p["ident"][k] for p in parts]) if parts else np.zeros(0, dtype=np.int64)) for k in
+             ("line_true", "line_assigned", "outcome", "bitmask")}
     if pops:
         out["ident"] = ident                       # counted after the thinning
+        out["hist"] = {name: np.sum([p["hist"][name] for p in parts], axis=0) for name in pops}
+        out["n_pop"] = {name: int(sum(p["n_pop"][name] for p in parts)) for name in pops}
+        out["u"], out["population"], out["z_pop"] = cat("u"), cat("population"), cat("z_pop")
     else:
-        out["line_counts"] = line_counts(n_lines=len(line_set), **ident)
-    if pops:
-        # one uniform deviate per detected galaxy, in catalog order: the stream `romanmock select` uses
-        u = np.zeros(n)
-        u[detected] = np.random.default_rng([spec["seed"], THINNING_STREAM, int(step)]).random(int(detected.sum()))
-        out["u"] = u[keep]
-        out["population"] = np.asarray(za.line_true)[keep].astype(np.int16)
-        out["z_pop"] = z_rsd[keep]
+        out["line_counts"] = line_counts(n_lines=n_lines, **ident)
     return out
+
+
+def base_data_group(h):
+    """The HDF5 group with the columns of a base-catalog file (``<step>_data/data`` as OpenCosmo writes it)."""
+    import h5py
+
+    for key in ["data", *h.keys()]:
+        node = h.get(key)
+        if isinstance(node, h5py.Group):
+            if "redshift_rsd" in node:
+                return node
+            if isinstance(node.get("data"), h5py.Group) and "redshift_rsd" in node["data"]:
+                return node["data"]
+    raise KeyError(f"{h.filename}: no data group with the column redshift_rsd")
 
 
 def _run(tasks, n_workers: int) -> list[dict]:

@@ -59,12 +59,13 @@ in step with the code.
 | `randoms.py` | `make_random`: randoms of a `Catalog` for `which` = all / galaxies / interlopers; redshifts drawn from the data |
 | `catalog.py` | `BaseCatalog.make_catalog` -> `Catalog`: step 2 in memory from the base catalog (the everyday route), `Catalog.write/read` |
 | `reference_dndz.py` | Wang et al. (2022) Tables 1–2 with uncertainties |
+| `fluxdist.py` | `flux_distribution` / `FluxDistribution`: log-flux histograms of every galaxy per line and redshift bin, no cut; quantiles, fraction above a threshold |
 | `census.py` | `line_census` / `LineCensus`: dN/dz of emitters above flux limits, single/multi-line, no confusion |
 | `diagnostics.py`, `plotting.py` | checks (confusion, contamination, completeness, dN/dz); notebook plot style |
 | `config.py`, `cli.py`, `io.py` | YAML config dataclasses, CLI, OpenCosmo I/O, manifests, index compression, memory budget |
 
-CLI commands: `info`, `lines`, `example-config`, `run`, `base`, `census`, `catalog`, `random`, `assign`, `summary`,
-`select`, `compress-index`.
+CLI commands: `info`, `lines`, `example-config`, `run`, `base`, `census`, `flux-distribution`, `catalog`, `random`, `assign`,
+`summary`, `select`, `compress-index`.
 Scripts: `production.sh` (sbatch: base catalog + census from `configs/production.yaml`), `run_slices.sh` (job array
 for `run`), `example_analysis.py`.
 
@@ -127,10 +128,19 @@ Two-step workflow:
   back to the HEALPix estimate. The numbers 60 patches / 2062.65 deg² appear only in tests and documentation.
 - When replacing a section of a document by slicing between two markers, check that the markers are adjacent
   (on 2026-09-28 a slice removed the sections Conventions to OpenCosmo facts of this file; restored from git).
+- Mock line model facts (from notebook 04): Hβ/[O III]5007 = 0.45 (0.42–0.47) and [O III]4959/5007 = 0.329 nearly fixed;
+  [S III]9532/Hα median 0.47 (0.35–0.8); [O III]5007/Hα median 0.44; Hβ/Hα 0.19. Median Hα flux 3–5e-17 at every z,
+  so the flux histogram per dex is flat between 1e-17 and 1e-16 (no faint-end rise: mock population).
 - Line report: `make_catalog(verbose=True)` prints `cat.line_report()`; the numbers are in
   `cat.info["line_report"]` (`lines`, `interlopers`). Geometry in `catalog.line_report` (potential interlopers:
   line i inside the bandpass that passes the redshift cut when taken for j; lightcone bounds padded by
   `RSD_MARGIN`), counts in `catalog.line_counts` (per slice in the workers, after the thinning when downsampling).
+- `BaseCatalog.read_slices(columns, z_range)` streams the stored columns slice by slice (no workers, < 1 GB): the
+  way to histogram or scan the base catalog. Notebook 01's flux histograms use it: 135 s and 0.8 GB peak for the
+  1e-17 base on a CPU node, so the notebook runs on a login node whatever the base limit.
+- `_catalog_slice` processes a slice in chunks of `CHUNK_ROWS` (1 M rows): the memory of a worker no longer grows
+  with the slice (8.4 M rows per slice at 1e-17 broke the pool on a login node). Chunking is exact because the
+  random draws are consumed in row order (`test_chunked_slices_equal_one_pass`).
 - `make_catalog` reuses `detect_lines` / `assign_redshifts` with the pipeline's random streams (`(seed, step)` for
   the confusion draws, `(seed, 20000, step)` for the thinning, one uniform per detected galaxy in slice order), so
   it equals `assign` + `select` row for row (`test_catalog.py`). Thinning is done in one pass: workers return
@@ -253,14 +263,17 @@ mock has 203 M galaxies with a line in 0.5 < z < 3.0 (74 % of all), against 59 M
 
 ## Production data (`/global/cfs/cdirs/m4943/Simulations/RomanMocks/<mock version>/`)
 
-- `base/` (built 2026-09-28 by `scripts/production.sh`, job 59059171), `census/dndz_census_z0p5_3p0.npz`,
-  `catalogs/halpha_z1p0_1p9.hdf5` (notebook 02), `randoms/halpha_z1p0_1p9_<which>_<index>.hdf5` (notebook 03).
+- `base/` (limit 1.0e-17, 222.0 M galaxies, 25.9 GB; rebuilt 2026-09-30 by `scripts/production.sh`, job 59129636, 2 min
+  on a CPU node; the 1.0e-16 base of 2026-09-28 had 64.6 M galaxies, 7.6 GB), `census/dndz_census_z0p5_3p0.npz`,
+  `census/flux_distribution.npz` (job 59160266, 1 min), `catalogs/Every_z1p5_1p9.hdf5` (notebook 02),
+  `randoms/Every_z1p5_1p9_<which>_<index>.hdf5` (notebook 03).
 - `$PSCRATCH/romanmock_demo` holds the outputs of the earlier tutorial notebooks (scratch, purged in time).
 
 ## Working style
 
 - Plots (notebooks) use `romanmock.plotting` (fixed categorical order, single axis, thin marks).
-- `notebooks/` holds three production examples (01 dN/dz and flux limits, 02 catalog, 03 randoms), edited as
+- `notebooks/` holds four production examples (01 dN/dz and flux limits, 02 catalog, 03 randoms, 04 line fluxes of the
+  whole mock: quantiles, fractions above thresholds, companion lines; explains 01), edited as
   notebooks; there is no generator. The ten earlier tutorials and their generator were moved by the user to
   `~/Projects/Roman/RomanMock/Notebooks/` (2026-09-28). Keep notebooks minimal: only what is needed for the task.
 - `configs/roman_grism_baseline.yaml` is the commented template for every config block; keep it complete (it was

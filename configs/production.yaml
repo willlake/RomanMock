@@ -11,13 +11,15 @@ catalog:
 base:
   dir: /global/cfs/cdirs/m4943/Simulations/RomanMocks/sdss_feniks_hizels_260710_09_07_2026/base
   columns: [gal_id, ra, dec, redshift_true]     # copied from the input mock, next to redshift_rsd and the line fluxes
+  overwrite: true                               # a rerun replaces the base catalog
 
 line_set: roman_transitions
 
 # The base catalog keeps every galaxy with a line above flux_limit inside the bandpass. It is the
-# deepest primary limit step 2 can use; the secondary limit is chosen freely in step 2.
+# deepest primary limit step 2 can use; the limits of a catalog are chosen in step 2 (1.0e-16 and
+# 4.0e-17 by default). 1.0e-17 keeps 74 % of the galaxies of the mock: about 30 GB.
 sensitivity:
   type: constant
-  flux_limit: 1.0e-16               # erg/s/cm^2
-  secondary_flux_limit: 4.0e-17
+  flux_limit: 1.0e-17               # erg/s/cm^2
+  secondary_flux_limit: 1.0e-17     # must not exceed flux_limit; only the stored line_bitmask_base depends on it
   wave_range: [10000.0, 19300.0]    # Angstrom

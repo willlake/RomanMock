@@ -185,6 +185,21 @@ def cmd_census(args):
     print(f"[romanmock] census of {len(census.steps)} slices, limits (primary, secondary) {census.limits} -> {path}")
 
 
+def cmd_flux_distribution(args):
+    """Histograms of the line fluxes of the whole mock per redshift bin (no flux cut)."""
+    _jax_platform(args)
+    import numpy as np
+
+    from .fluxdist import flux_distribution
+
+    lo, hi = args.z_range
+    edges = np.round(lo + args.dz * np.arange(int(round((hi - lo) / args.dz)) + 1), 6)
+    result = flux_distribution(args.catalog, edges, line_set=args.line_set, n_workers=_n_workers(args, 5.0),
+                               verbose=not args.quiet)
+    path = result.save(args.output)
+    print(f"[romanmock] flux distribution of {len(result.steps)} slices, {int(result.n_gal.sum()):,} galaxies -> {path}")
+
+
 def cmd_random(args):
     """Random catalogs for a catalog written by `romanmock catalog` / `Catalog.write`."""
     from .catalog import Catalog
@@ -330,6 +345,18 @@ def main(argv=None):
     s.add_argument("--jax-platform", default="cpu", help="JAX_PLATFORMS value (default cpu)")
     s.add_argument("--quiet", action="store_true")
     s.set_defaults(func=cmd_census)
+
+    s = sub.add_parser("flux-distribution", help="histograms of the line fluxes of every galaxy of the input mock per "
+                                                 "redshift bin, with no flux cut (quantiles, fractions above a limit)")
+    s.add_argument("catalog", help="directory of the diffsky mock")
+    s.add_argument("-o", "--output", required=True, help="output file (.npz), read with FluxDistribution.load")
+    s.add_argument("--z-range", nargs=2, type=float, default=[0.0, 4.0], metavar=("ZMIN", "ZMAX"))
+    s.add_argument("--dz", type=float, default=0.1, help="width of the redshift bins")
+    s.add_argument("--line-set", default="roman_transitions")
+    s.add_argument("--workers", default="auto", help="number of parallel slice processes, or 'auto' (~5 GB each)")
+    s.add_argument("--jax-platform", default="cpu", help="JAX_PLATFORMS value (default cpu)")
+    s.add_argument("--quiet", action="store_true")
+    s.set_defaults(func=cmd_flux_distribution)
 
     s = sub.add_parser("random", help="random catalogs for a catalog: uniform inside the footprint, redshifts drawn "
                                       "from the data; N files of the size of the data")

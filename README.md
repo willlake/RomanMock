@@ -295,6 +295,7 @@ romanmock compress-index $PSCRATCH/my_mock --workers 4
 | full lightcone | galaxies | uncompressed index | default |
 |---|---|---|---|
 | base catalog, limit 1.0e-16, all line fluxes | 64.6 M | 25.2 GB | 7.6 GB |
+| base catalog, limit 1.0e-17 (production) | 222.0 M | — | 25.9 GB |
 | parent catalog at 1.0e-16 / 4.0e-17 | 64.6 M | 20.8 GB | 3.2 GB |
 | parent catalog at 1.5e-16 / 4.0e-17 | 44.9 M | 19.9 GB | 2.3 GB |
 | Hα sample, z 1.0 to 1.9, six columns, 22 slice files | 17.0 M | 6.6 GB | 0.73 GB |
@@ -376,7 +377,9 @@ the [O III] targets for z < 2.85.
 `romanmock.census.line_census` counts emitters directly from the input mock with flux, bandpass and redshift
 cuts only, for several limits in one pass, split into single-line and multi-line galaxies. A limit is a number
 (one threshold for every line, the population of the Wang et al. tables) or a `(primary, secondary)` pair (the
-two-tier rule). `romanmock census` writes it to a file and notebook 01 plots it. With one threshold at 1.0e-16 the mock has 1.5 times the forecast Hα
+two-tier rule). `romanmock census` writes it to a file and notebook 01 plots it. `romanmock flux-distribution`
+(`romanmock.fluxdist.FluxDistribution`) histograms the flux of every line of every galaxy per redshift bin with no
+cut, for `quantile(line, q)`, `fraction_above(line, flux)` and `number_above` as functions of redshift (notebook 04). With one threshold at 1.0e-16 the mock has 1.5 times the forecast Hα
 counts over 0.5 < z < 2.0 and 3 times the [O III] counts over 1.0 < z < 3.0.
 
 ## Resources
@@ -396,6 +399,10 @@ Measured on the full lightcone (324 M input galaxies, base limit 1.0e-16, 64.6 M
 NERSC login nodes cap each user at 30 GB, so steps that read the input mock fit with at most 5 workers there; a
 short batch job is simpler (`scripts/production.sh`). 
 
+**Streaming the base catalog.** `base.read_slices(["redshift_rsd", "Ha_flux"], z_range=(0.5, None))` yields the
+stored columns one slice at a time (a few hundred MB), for histograms and scans of the base catalog without
+`make_catalog`; notebook 01 uses it for the flux distributions.
+
 **Sky area.** Give it if you know it: `BaseCatalog(path, area_deg2=2500.0)` or `make_catalog(area_deg2=2500.0)`.
 Otherwise it is estimated, from the sky patches of the mock (2062.65 deg² for this one) or, when the mock has
 no patch decomposition, from the galaxies in the HEALPix index. `cat.info["area_source"]` records which:
@@ -408,8 +415,8 @@ The products for the mock `sdss_feniks_hizels_260710_09_07_2026` are in
 
 | directory | content | made by |
 |---|---|---|
-| `base/` | base catalog: 64.6 M galaxies with a line above 1.0e-16 erg/s/cm², 66 slices, 7.6 GB | `sbatch scripts/production.sh` |
-| `census/` | `dndz_census_z0p5_3p0.npz`: dN/dz per line for primary limits 1.0e-16, 1.5e-16 and secondary limits none, 8e-17, 4e-17 | `sbatch scripts/production.sh` |
+| `base/` | base catalog: 222.0 M galaxies with a line above 1.0e-17 erg/s/cm² (74 % of the mock), 66 slices, 25.9 GB | `sbatch scripts/production.sh` |
+| `census/` | `dndz_census_z0p5_3p0.npz`: dN/dz per line (redshift bins of 0.01) for primary limits 1.0e-16, 1.5e-16 and secondary limits none, 8e-17, 4e-17; `flux_distribution.npz`: histograms of log flux (0.02 dex) per line and redshift bin (0.01) of all 324 M galaxies | `sbatch scripts/production.sh` |
 | `catalogs/` | `halpha_z1p0_1p9.hdf5`: Hα sample at 1.0 < z < 1.9 | notebook 02 |
 | `randoms/` | `halpha_z1p0_1p9_<which>_<index>.hdf5`: 10 random catalogs each for all, galaxies and interlopers | notebook 03 |
 
@@ -418,6 +425,7 @@ The products for the mock `sdss_feniks_hizels_260710_09_07_2026` are in
 1. `01_dndz_flux_limits.ipynb` – dN/dz per line and the single-line fraction for the primary and secondary flux limits.
 2. `02_build_catalog.ipynb` – a catalog from the base catalog: flux limits, confusion matrix, line and redshift selection, the line report, writing and reading.
 3. `03_build_randoms.ipynb` – the random catalogs of that catalog for the contaminated sample, the galaxies and the interlopers.
+4. `04_line_flux_distribution.ipynb` – the line fluxes of every galaxy of the mock (no flux cut): quantiles and fractions above the thresholds versus redshift, the companion lines of a selected galaxy; what explains the counts of notebook 01.
 
 ## Extending (hooks for the plan's comments)
 

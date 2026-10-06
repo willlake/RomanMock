@@ -276,3 +276,34 @@ def test_sky_area_given_or_estimated(base, capsys):
     for bad in (0.0, -5.0, 5e4):
         with pytest.raises(ValueError):
             BaseCatalog(b.dir, area_deg2=bad)
+
+
+def test_chunked_slices_equal_one_pass(base, monkeypatch):
+    """Workers process a slice in chunks; the result must not depend on the chunk size (random streams included)."""
+    from romanmock import catalog as module
+
+    _, b = base
+    kw = dict(confusion={"SIII_9532": {"Ha": 0.3, "fail": 0.2}}, seed=11, outcomes=None, columns=ALL, n_workers=1, verbose=False,
+              downsample={"SIII_9532": {"z": [0.0, 4.0], "dndz": [500.0, 500.0]}}, **LIMITS)
+    with pytest.warns(RuntimeWarning):
+        whole = b.make_catalog(**kw)
+    monkeypatch.setattr(module, "CHUNK_ROWS", 997)
+    with pytest.warns(RuntimeWarning):
+        chunked = b.make_catalog(**kw)
+    assert len(whole) == len(chunked) > 1000
+    for c in ALL:
+        np.testing.assert_array_equal(whole[c], chunked[c], err_msg=c)
+    assert whole.info["line_report"] == chunked.info["line_report"]
+
+
+def test_read_slices_streams_the_base_catalog(base):
+    _, b = base
+    parts = list(b.read_slices(["gal_id", "Ha_flux"], z_range=(0.3, 0.34)))
+    assert 0 < len(parts) <= len(b.slices) and set(parts[0]) == {"gal_id", "Ha_flux"}
+    streamed = np.concatenate([p["gal_id"] for p in parts])
+    cat = b.make_catalog(flux_limit=b.flux_limit, secondary_flux_limit=None, outcomes=None, z_column="redshift_rsd",
+                         z_range=(0.3, 0.34), columns=["gal_id", "Ha_flux"], n_workers=1, verbose=False)
+    np.testing.assert_array_equal(streamed, cat["gal_id"])                 # every base galaxy, in base order
+    np.testing.assert_array_equal(np.concatenate([p["Ha_flux"] for p in parts]), cat["Ha_flux"])
+    everything = sum(p["gal_id"].size for p in b.read_slices(["gal_id"]))
+    assert everything == b.n_galaxies
