@@ -272,8 +272,11 @@ mock has 203 M galaxies with a line in 0.5 < z < 3.0 (74 % of all), against 59 M
 ## Working style
 
 - Plots (notebooks) use `romanmock.plotting` (fixed categorical order, single axis, thin marks).
-- `notebooks/` holds four production examples (01 dN/dz and flux limits, 02 catalog, 03 randoms, 04 line fluxes of the
-  whole mock: quantiles, fractions above thresholds, companion lines; explains 01), edited as
+- `notebooks/` holds six production examples (01 dN/dz and flux limits, 02 catalog, 03 randoms, 04 line fluxes of the
+  whole mock: quantiles, fractions above thresholds, companion lines; explains 01; 05 single-line galaxies of the base
+  catalog against observed wavelength: 0–90/90–99.9 % flux quantiles and the stacked line mix above a threshold per 775 Å
+  range, lines under 1 % in every range dropped; in the mock they are 92 % Hα because of the fixed line ratios; 06 stacked single-line/multi-line composition of the
+  detected galaxies by line combination against redshift), edited as
   notebooks; there is no generator. The ten earlier tutorials and their generator were moved by the user to
   `~/Projects/Roman/RomanMock/Notebooks/` (2026-09-28). Keep notebooks minimal: only what is needed for the task.
 - `configs/roman_grism_baseline.yaml` is the commented template for every config block; keep it complete (it was

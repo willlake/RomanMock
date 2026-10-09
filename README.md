@@ -416,16 +416,18 @@ The products for the mock `sdss_feniks_hizels_260710_09_07_2026` are in
 | directory | content | made by |
 |---|---|---|
 | `base/` | base catalog: 222.0 M galaxies with a line above 1.0e-17 erg/s/cm² (74 % of the mock), 66 slices, 25.9 GB | `sbatch scripts/production.sh` |
-| `census/` | `dndz_census_z0p5_3p0.npz`: dN/dz per line (redshift bins of 0.01) for primary limits 1.0e-16, 1.5e-16 and secondary limits none, 8e-17, 4e-17; `flux_distribution.npz`: histograms of log flux (0.02 dex) per line and redshift bin (0.01) of all 324 M galaxies | `sbatch scripts/production.sh` |
+| `census/` | `dndz_census_z0p5_3p0.npz`: dN/dz per line (redshift bins of 0.01) for primary limits 1.0e-16, 1.5e-16 and secondary limits none, 8e-17, 6e-17, 4e-17; `flux_distribution.npz`: histograms of log flux (0.02 dex) per line and redshift bin (0.01) of all 324 M galaxies | `sbatch scripts/production.sh` |
 | `catalogs/` | `halpha_z1p0_1p9.hdf5`: Hα sample at 1.0 < z < 1.9 | notebook 02 |
 | `randoms/` | `halpha_z1p0_1p9_<which>_<index>.hdf5`: 10 random catalogs each for all, galaxies and interlopers | notebook 03 |
 
-`notebooks/` holds three executed examples, all of which run on a login node:
+`notebooks/` holds six executed examples, all of which run on a login node:
 
 1. `01_dndz_flux_limits.ipynb` – dN/dz per line and the single-line fraction for the primary and secondary flux limits.
 2. `02_build_catalog.ipynb` – a catalog from the base catalog: flux limits, confusion matrix, line and redshift selection, the line report, writing and reading.
 3. `03_build_randoms.ipynb` – the random catalogs of that catalog for the contaminated sample, the galaxies and the interlopers.
 4. `04_line_flux_distribution.ipynb` – the line fluxes of every galaxy of the mock (no flux cut): quantiles and fractions above the thresholds versus redshift, the companion lines of a selected galaxy; what explains the counts of notebook 01.
+5. `05_line_flux_vs_wavelength.ipynb` – the single-line galaxies (one in-band line above 1.5e-16, no other above 6e-17), read from the base catalog, against observed wavelength: 0–90 % and 90–99.9 % quantiles of the flux of the single line, and the stacked share of each line among the single-line galaxies above a flux threshold in twelve 775 Å ranges of the bandpass; lines that are the single line of fewer than 1 % of the galaxies in every range are left out of the plots.
+6. `06_line_combinations.ipynb` – stacked composition of the detected galaxies (primary 1.5e-16, secondary 6e-17) against redshift, 0.5 to 3.0: single-line galaxies per line at the bottom, multi-line galaxies per combination of detected lines above.
 
 ## Extending (hooks for the plan's comments)
 
