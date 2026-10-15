@@ -64,7 +64,7 @@ cat = base.make_catalog(
     flux_limit=1.5e-16,                      # primary limit: at least one line of the galaxy above it
     secondary_flux_limit=8e-17,              # limit for the other lines of such a galaxy (None: no second tier)
     confusion={"Ha": {"OIII_5007": 0.2},     # single-line galaxies: {true line: {assigned line: probability}}
-               "OIII_5007": {"Ha": 0.2}},    # None: the package default
+               "OIII_5007": {"Ha": 0.2}},    # None: the package default; "empirical": the line mix of the mock (below)
     lines=["Ha"],                            # galaxies in which Ha is identified
     z_range=(1.0, 1.9),                      # range of redshift_assigned
     seed=2026,
@@ -78,7 +78,7 @@ cat.write("halpha.hdf5")                          # optional: .hdf5, .fits or .n
 |---|---|---|
 | `flux_limit` | primary limit; cannot be deeper than the base catalog | the base catalog's limit |
 | `secondary_flux_limit` | limit for the other lines of a detected galaxy; `None` = no second tier | 4.0e-17 |
-| `confusion` | rows of the confusion matrix, a full config, or a model object | package default |
+| `confusion` | rows of the confusion matrix, a full config, or a model object; `"empirical"` or a `LineFractionTable` for the line mix of the mock (below) | package default |
 | `lines` | keep galaxies in which one of these lines is identified | every line |
 | `membership` | multi-line galaxies: `"detected"` = each detected line is identified (a galaxy with Hα and [O III] is in both samples); `"assigned"` = only the brightest line, disjoint samples. `romanmock select` defaults to `assigned` | `"detected"` |
 | `z_range`, `z_column` | redshift range, on `redshift_assigned`, `redshift_rsd` or `redshift_true` | no cut, assigned |
@@ -123,7 +123,42 @@ detected = identified + mistaken. The sample of a line is its identified galaxie
 
 The assigned redshift of a galaxy with more than one detected line is `redshift_rsd` (the true redshift
 including the peculiar velocity), never `redshift_true`. For a single-line galaxy it follows from the line
-identity drawn from the confusion matrix.
+identity drawn from the confusion matrix, or from the line mix of the mock.
+
+**Identifying single lines from the line mix of the mock.** A confusion matrix states, per true line, how
+often it is taken for another; the numbers are assumed. The alternative is to let the mock say what a
+single line at a given observed wavelength and flux is likely to be. `confusion="empirical"` builds a
+`LineFractionTable` from the base catalog at the flux limits of the catalog: the single-line galaxies are
+binned in the observed wavelength of their line (bins of `wave_bin`, default 250 Å, about twelve resolution
+elements of the grism, which resolves 21–24 Å at R ≈ 475–900) and, inside each wavelength bin, ranked by
+flux and cut into bins of equal count: as many as hold at least `galaxies_per_bin` galaxies each (default
+500, so every cell has 500 to 999 galaxies and a populated wavelength bin gets finer flux bins than a sparse
+one), or exactly `n_flux_bins`, or the bins between the quantiles `flux_quantiles` (e.g. `[0, 0.5, 0.9,
+0.99, 1]`, to resolve the bright tail where the rare lines sit). Each cell records the
+share of each line among its galaxies; lines that are the single line of fewer than `min_count` galaxies in
+all (default 100) are left out and the shares renormalised. A single-line galaxy is then given a line with
+the shares of its own cell (`mode="draw"`) or the most common line of its cell (`mode="max"`), whatever its
+true line, so the interlopers are the galaxies whose line is a minority at their wavelength and flux. The
+table costs one more pass over the base catalog; build it once and reuse it:
+
+```python
+table = base.line_fractions(flux_limit=1.5e-16, secondary_flux_limit=6e-17,    # same limits as the catalog
+                            wave_bin=250.0, galaxies_per_bin=500, min_count=100,
+                            write_to="line_fractions.npz")                     # optional
+print(table.summary())                      # galaxies and shares per wavelength bin, the smallest cell
+table.expected_confusion()                  # the confusion matrix it implies, averaged over the single-line galaxies of each line
+cat = base.make_catalog(flux_limit=1.5e-16, secondary_flux_limit=6e-17, confusion=table, lines=["Ha"], z_range=(1.0, 1.9))
+cat = base.make_catalog(..., confusion="empirical")                                  # builds the table first
+cat = base.make_catalog(..., confusion={"type": "empirical", "galaxies_per_bin": 1000, "mode": "max"})
+cat = base.make_catalog(..., confusion={"type": "empirical", "file": "line_fractions.npz"})
+```
+
+`romanmock line-fractions BASE -o line_fractions.npz --flux-limit 1.5e-16 --secondary-flux-limit 6e-17` writes
+the table from the command line, `romanmock catalog ... --confusion line_fractions.npz` (or `--confusion
+empirical`) uses it, and `confusion: {type: empirical, file: line_fractions.npz}` selects it in a pipeline
+configuration. `make_catalog` warns when the table was built at other flux limits than the catalog uses. The
+line report then quotes, as `P`, the expected probability over the single-line galaxies of the true line.
+`cat.settings["confusion"]` keeps how the table was built and a hash of its content, not the numbers.
 
 The same from the command line, writing a file:
 
@@ -177,7 +212,7 @@ identical settings and seed (tested) and is the route to take when the output mu
 | fluxes | `romanmock.fluxes`, `romanmock.cosmology` | `F = L / (4 pi D_L^2)` with the catalog cosmology from OpenCosmo (`astropy` backend) or `dsps.cosmology.luminosity_distance_to_z` (`dsps` backend; agree to 5e-6) |
 | 1. detectability | `romanmock.sensitivity`, `romanmock.detection` | `lambda_obs = lambda_0 (1+z_rsd)`; `ConstantFluxLimit` (primary limit 1.0e-16 erg/s/cm², secondary limit 4.0e-17) or `TabulatedFluxLimit` (wavelength dependent, `secondary_ratio`); `ThresholdDetection` or `GaussianNoiseDetection` |
 | 2. bitmask | `romanmock.lines`, `romanmock.detection` | bit *i* = feature *i* of a `LineSet`; `n_det = popcount`; ordering written to the run metadata |
-| 3. redshift | `romanmock.confusion`, `romanmock.redshift` | multi-line: `z_assigned = z_rsd` (optional `sigma_z`); single-line: draw identity *j* from `C_ij` (+ fail column), `z_assigned = lambda_i,0 (1+z_rsd)/lambda_j,0 - 1` |
+| 3. redshift | `romanmock.confusion`, `romanmock.redshift` | multi-line: `z_assigned = z_rsd` (optional `sigma_z`); single-line: draw identity *j* from `C_ij` (+ fail column) or from the line mix of the mock at the line's observed wavelength and flux rank (`LineFractionTable`), `z_assigned = lambda_i,0 (1+z_rsd)/lambda_j,0 - 1` |
 | two-step | `RomanMockPipeline.build_base`, `romanmock.catalog.BaseCatalog` | base flux catalog written once; catalogs made from it in memory (`make_catalog`) or as files (`source: base`) |
 | 4. samples | `romanmock.samples`, `romanmock.selection` | footprint, `redshift_assigned` range, tracer (`membership: assigned` = brightest line, disjoint samples; `detected` = any detected line for multi-line galaxies), outcome quality, population thinning, downsampling with `p_keep = target/mock`; built slice by slice |
 | checks | `romanmock.diagnostics`, `romanmock.census` | empirical confusion, contamination fraction `f_{i->j}(B)`, detection and identification efficiency, completeness; `dN/dz` of emitters above a flux limit, single- versus multi-line |
@@ -309,6 +344,7 @@ romanmock example-config --catalog DIR --output OUT > my.yaml
 
 romanmock base my.yaml --workers 32               # two-step, step 1: base flux catalog
 romanmock catalog BASE_DIR -o out.hdf5 --flux-limit 1.5e-16 --lines Ha --z-range 1.0 1.9   # step 2: one catalog file
+romanmock line-fractions BASE_DIR -o fractions.npz --flux-limit 1.5e-16   # the line mix of the single-line galaxies, for --confusion fractions.npz
 romanmock assign my.yaml --flux-limit 1.5e-16 --output-dir OUT --workers auto   # step 2 as OpenCosmo files
 romanmock run my.yaml --workers 32                # stage A in one pass from the input mock
 romanmock run my.yaml --steps 219 224             # a subset of slices (job arrays: scripts/run_slices.sh)
@@ -439,7 +475,8 @@ The products for the mock `sdss_feniks_hizels_260710_09_07_2026` are in
 * **Confusion depending on `lambda_obs`, S/N, photometry** (comment 3): implement
   `ConfusionModel.assign(true_index, context, rng)`; `context` carries `wave_obs`, `snr`,
   `flux`, `z_rsd` and any `redshift.context_columns` from the catalog (in the two-step workflow they must be
-  in `base.columns`). `WavelengthBinnedConfusion` is the first example. Matrices can be loaded from YAML files.
+  in `base.columns`). `WavelengthBinnedConfusion` is the first example; `LineFractionTable` (`type: empirical`)
+  the second: it uses `wave_obs` and `flux` and not the true line. Matrices can be loaded from YAML files.
 * **Multi-line redshift errors / wrong multi-line identifications**: implement
   `MultiLineModel.assign(det, z_rsd, sel, rng)` (default `PerfectMultiLine(sigma_z)`).
 * **Feature definition** (comment 2): change the `line_set` list; blends are sums of columns.
@@ -450,4 +487,6 @@ The products for the mock `sdss_feniks_hizels_260710_09_07_2026` are in
 The default confusion matrix (`romanmock.confusion.DEFAULT_CONFUSION_ROWS`: true Hα called [O III] 5007 with
 probability 0.5 %, true [O III] 5007 or [S III] 9532 called Hα with 5 %, true Hβ called [O III] 5007 with 5 %,
 no failures) is an explicitly assumed scenario, not a Roman calibration. With the default secondary limit it
-matters for about 6 % of the detected galaxies, the single-line ones.
+matters for about 6 % of the detected galaxies, the single-line ones. The empirical alternative
+(`confusion: {type: empirical, ...}`) replaces the assumed numbers by the line mix of the mock itself, which is
+only as good as the mock's line ratios.

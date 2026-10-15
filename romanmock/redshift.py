@@ -75,6 +75,15 @@ def brightest_detected(det: DetectionResult) -> np.ndarray:
     return np.where(det.n_det > 0, idx, NO_LINE).astype(np.int64)
 
 
+def single_lines(det: DetectionResult) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """The single line of every single-line galaxy (``n_det == 1``): its observed wavelength,
+    its measured flux and its feature index, in row order. The arrays a
+    :class:`~romanmock.confusion.LineFractionTable` is built from."""
+    rows = np.flatnonzero(det.n_det == 1)
+    i = brightest_detected(det)[rows]
+    return det.wave_obs[rows, i], det.flux_measured[rows, i], i
+
+
 def assign_redshifts(
     det: DetectionResult,
     z_rsd: np.ndarray,

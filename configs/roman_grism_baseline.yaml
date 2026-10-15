@@ -81,6 +81,10 @@ confusion:                        # assumed scenario, not a calibrated Roman pre
   # type: wavelength_binned
   # edges: [10000, 15000, 19300]
   # matrices: [{rows: {...}}, {file: confusion_red.yaml}]
+  # type: empirical              # the line mix of the mock's single-line galaxies per observed wavelength and flux rank
+  # file: line_fractions.npz     # built at the flux limits of this run: `romanmock line-fractions BASE -o line_fractions.npz ...`
+  # mode: draw                   # draw: each line with the share of the cell; max: the most common line of the cell
+  # p_fail: 0.0
 
 redshift:
   rsd_column: redshift_obs        # input column with peculiar velocity; written out as redshift_rsd

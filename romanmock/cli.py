@@ -149,7 +149,11 @@ def cmd_catalog(args):
 
     base = BaseCatalog(args.base_dir, area_deg2=args.area)
     confusion = None
-    if args.confusion:
+    if args.confusion == "empirical":                  # the line mix of the mock, built on the fly
+        confusion = {"type": "empirical"}
+    elif args.confusion and args.confusion.endswith(".npz"):   # a saved line-fraction table
+        confusion = {"type": "empirical", "file": args.confusion}
+    elif args.confusion:
         with open(args.confusion) as f:
             confusion = yaml.safe_load(f)
         confusion = confusion.get("confusion", confusion) if isinstance(confusion, dict) else confusion
@@ -166,6 +170,20 @@ def cmd_catalog(args):
         seed=args.seed, n_workers=None if args.workers == "auto" else int(args.workers), verbose=not args.quiet)
     print(cat.summary())
     print(f"[romanmock] written: {cat.write(args.output)}")
+
+
+def cmd_line_fractions(args):
+    """The line mix of the single-line galaxies of the base catalog per observed wavelength and flux rank."""
+    _jax_platform(args)
+    from .catalog import BaseCatalog
+
+    base = BaseCatalog(args.base_dir)
+    secondary = "default" if args.secondary_flux_limit is None else (None if args.secondary_flux_limit <= 0 else args.secondary_flux_limit)
+    base.line_fractions(flux_limit=args.flux_limit, secondary_flux_limit=secondary, wave_bin=args.wave_bin,
+                        galaxies_per_bin=args.galaxies_per_bin, n_flux_bins=args.n_flux_bins, flux_quantiles=args.flux_quantiles,
+                        min_count=args.min_count, mode=args.mode, p_fail=args.p_fail, seed=args.seed,
+                        n_workers=None if args.workers == "auto" else int(args.workers), write_to=args.output, verbose=not args.quiet)
+    print(f"[romanmock] line fractions written to {args.output}")
 
 
 def cmd_census(args):
@@ -314,7 +332,8 @@ def main(argv=None):
     s.add_argument("-o", "--output", required=True, help="output file (.hdf5, .fits or .npz); replaced if it exists")
     s.add_argument("--flux-limit", type=float, help="primary flux limit [erg/s/cm^2] (default: the base catalog's)")
     s.add_argument("--secondary-flux-limit", type=float, help="limit for the other lines (default 4e-17; 0 = no second tier)")
-    s.add_argument("--confusion", help="YAML file with the rows {true line: {assigned line: probability}}")
+    s.add_argument("--confusion", help="YAML file with the rows {true line: {assigned line: probability}}; or a line-fraction "
+                                       "table (.npz, from `romanmock line-fractions`); or `empirical` to build that table first")
     s.add_argument("--lines", nargs="+", help="keep galaxies in which one of these lines is identified, e.g. Ha")
     s.add_argument("--membership", default="detected", choices=["detected", "assigned"],
                    help="multi-line galaxies: every detected line counts (detected), or only the brightest (assigned)")
@@ -330,6 +349,27 @@ def main(argv=None):
     s.add_argument("--jax-platform", default="cpu", help="JAX_PLATFORMS value (default cpu)")
     s.add_argument("--quiet", action="store_true")
     s.set_defaults(func=cmd_catalog)
+
+    s = sub.add_parser("line-fractions", help="the line mix of the single-line galaxies of the base catalog per bin of "
+                                              "observed wavelength and flux rank: the table of the empirical line identification "
+                                              "(`romanmock catalog --confusion table.npz`, YAML `confusion: {type: empirical, file: ...}`)")
+    s.add_argument("base_dir", help="directory of the base catalog (written by `romanmock base`)")
+    s.add_argument("-o", "--output", required=True, help="output file (.npz), read with LineFractionTable.load")
+    s.add_argument("--flux-limit", type=float, help="primary flux limit of the catalog the table is for (default: the base catalog's)")
+    s.add_argument("--secondary-flux-limit", type=float, help="limit for the other lines (default 4e-17; 0 = no second tier)")
+    s.add_argument("--wave-bin", type=float, default=250.0, help="width of the observed-wavelength bins [A] (default 250)")
+    s.add_argument("--galaxies-per-bin", type=int, default=500, help="each wavelength bin is cut into as many equal-count flux-rank "
+                                                                      "bins as hold at least this many galaxies (default 500)")
+    s.add_argument("--n-flux-bins", type=int, help="instead: this many equal-count flux-rank bins in every wavelength bin")
+    s.add_argument("--flux-quantiles", nargs="+", type=float, help="instead: the quantiles of the flux bins, from 0 to 1")
+    s.add_argument("--min-count", type=int, default=100, help="lines that are the single line of fewer galaxies are left out")
+    s.add_argument("--mode", default="draw", choices=["draw", "max"], help="draw a line with the shares of the cell, or take the most common")
+    s.add_argument("--p-fail", type=float, default=0.0, help="uniform probability of no redshift")
+    s.add_argument("--seed", type=int, default=12345)
+    s.add_argument("--workers", default="auto")
+    s.add_argument("--jax-platform", default="cpu", help="JAX_PLATFORMS value (default cpu)")
+    s.add_argument("--quiet", action="store_true")
+    s.set_defaults(func=cmd_line_fractions)
 
     s = sub.add_parser("census", help="dN/dz of the emitters of the input mock above flux limits, split into "
                                       "single-line and multi-line; no confusion, no downsampling")

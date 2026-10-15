@@ -5,7 +5,8 @@ The pipeline follows the construction plan in ``Roman_Mock_Plan_and_Comments.pdf
 1. convert dust-attenuated line luminosities (erg/s) to observed fluxes (erg/s/cm^2)
    and decide which lines are detectable  -> :mod:`romanmock.fluxes`, :mod:`romanmock.detection`
 2. record detectable lines in a documented bitmask   -> :mod:`romanmock.lines`, :mod:`romanmock.detection`
-3. assign a measured redshift (multi-line: exact; single-line: confusion matrix)
+3. assign a measured redshift (multi-line: exact; single-line: confusion matrix or the
+   line mix of the mock per observed wavelength and flux rank)
    -> :mod:`romanmock.confusion`, :mod:`romanmock.redshift`
 4. construct analysis samples (footprint, redshift, quality, downsampling to a target dN/dz)
    -> :mod:`romanmock.selection`
@@ -25,7 +26,7 @@ from .sensitivity import (
     GaussianNoiseDetection,
 )
 from .detection import detect_lines, DetectionResult, pack_bitmask, unpack_bitmask, popcount
-from .confusion import ConfusionMatrix, WavelengthBinnedConfusion, FAIL
+from .confusion import ConfusionMatrix, WavelengthBinnedConfusion, LineFractionTable, FAIL
 from .redshift import assign_redshifts, IdOutcome, RedshiftAssignment
 from .config import RomanMockConfig
 from .pipeline import RomanMockPipeline
@@ -59,6 +60,7 @@ __all__ = [
     "popcount",
     "ConfusionMatrix",
     "WavelengthBinnedConfusion",
+    "LineFractionTable",
     "FAIL",
     "assign_redshifts",
     "IdOutcome",

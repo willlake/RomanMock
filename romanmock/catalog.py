@@ -13,6 +13,10 @@ that can be repeated freely::
     cat["ra"], cat["redshift_assigned"], len(cat)     # numpy arrays
     cat.write("halpha.hdf5")                          # only if you want it on disk
 
+Single lines can instead be identified from the line mix of the mock itself
+(``confusion="empirical"``: the share of each line among the single-line galaxies at the
+same observed wavelength and flux rank, :meth:`BaseCatalog.line_fractions`).
+
 Nothing is written unless asked for, and no setting is remembered between calls. The base
 catalog is read slice by slice (in parallel); detection, bitmask and redshift assignment use
 the same functions and the same per-slice random streams as the pipeline, so a catalog made
@@ -31,11 +35,11 @@ import numpy as np
 import opencosmo as oc
 
 from ._version import __version__
-from .confusion import ConfusionMatrix, build_confusion, default_confusion
+from .confusion import ConfusionMatrix, LineFractionTable, build_confusion, default_confusion
 from .detection import detect_lines
 from .io import memory_budget_gb, read_manifest, suggest_n_workers
 from .lines import get_line_set
-from .redshift import IdOutcome, PerfectMultiLine, assign_redshifts
+from .redshift import IdOutcome, PerfectMultiLine, assign_redshifts, single_lines
 from .roman import DEFAULT_LINE_FLUX_LIMIT, DEFAULT_SECONDARY_LINE_FLUX_LIMIT
 from .samples import THINNING_STREAM
 from .selection import TargetDNDZ, tracer_membership, dndz_from_counts, keep_probability, probability_per_galaxy, sky_area_deg2
@@ -48,6 +52,9 @@ DERIVED_COLUMNS = ["redshift_assigned", "id_outcome", "line_bitmask", "n_det", "
 DEFAULT_OUTCOMES = ("MULTI_LINE", "SINGLE_CORRECT", "SINGLE_MISID")     # every galaxy with a redshift
 CHUNK_ROWS = 1_000_000  #: rows of a slice processed at a time by a worker (bounds its memory)
 RSD_MARGIN = 0.012      #: largest |z_rsd - z_true| / (1 + z) allowed for in the line report
+FRACTION_STREAM = 40000  #: random stream of the line-fraction scan: (seed, FRACTION_STREAM, step); used by noisy detection models only
+#: options of ``confusion={"type": "empirical", ...}`` that build the table on the fly (``BaseCatalog.line_fractions``)
+FRACTION_OPTIONS = ("wave_bin", "wave_edges", "galaxies_per_bin", "n_flux_bins", "flux_quantiles", "min_count", "mode", "p_fail", "write_to")
 REDSHIFT_COLUMNS = ("redshift_assigned", "redshift_rsd", "redshift_true")
 
 DESCRIPTIONS = {
@@ -481,10 +488,16 @@ class BaseCatalog:
         secondary_flux_limit : float or None
             Limit for the other lines of such a galaxy. ``None`` = no second tier.
             Default: 4.0e-17 (never above the primary limit).
-        confusion : dict, ConfusionMatrix or None
-            ``{true line: {assigned line: probability, "fail": probability}}`` for the
-            single-line galaxies; lines not listed are identified correctly. ``None`` = the
-            package default. A full config (``{"type": ...}``) or a model object also works.
+        confusion : dict, str, ConfusionMatrix, LineFractionTable or None
+            How single-line galaxies are identified. A confusion matrix: ``{true line:
+            {assigned line: probability, "fail": probability}}``, lines not listed identified
+            correctly; ``None`` = the package default. Or the line mix of the mock:
+            ``"empirical"`` builds a :class:`~romanmock.confusion.LineFractionTable` from the
+            base catalog at these flux limits first (one more pass over it; the options of
+            :meth:`line_fractions` go in a dict, ``{"type": "empirical", "wave_bin": 250.0,
+            "galaxies_per_bin": 500, "min_count": 100, "mode": "draw"}``), a table made by
+            :meth:`line_fractions` is used as it is, ``{"type": "empirical", "file": ...}``
+            loads a saved one. A full config (``{"type": ...}``) or a model object also works.
         z_range : (min, max)
             Keep galaxies with ``z_column`` inside the range (either end may be None).
         z_column : {"redshift_assigned", "redshift_rsd", "redshift_true"}
@@ -531,14 +544,15 @@ class BaseCatalog:
             redshift cut, and the potential and actual line interlopers. The report is also
             kept: ``cat.line_report()`` (text) and ``cat.info["line_report"]`` (numbers).
         """
+        if n_workers is None:
+            n_workers = suggest_n_workers(max_workers=32, per_worker_gb=2.5)     # memory-limited: ~12 on a login node
+        confusion = self._resolve_confusion(confusion, flux_limit, secondary_flux_limit, wave_range, detection, seed, n_workers, verbose)
         spec = self._spec(flux_limit, secondary_flux_limit, confusion, z_range, z_column, lines, membership, outcomes, n_det_min,
                           cuts, downsample, columns, wave_range, detection, sigma_z, seed)
         populations = spec["populations"]
         if area_deg2 is not None:
             self.area_deg2 = area_deg2
         area = self.area_deg2
-        if n_workers is None:
-            n_workers = suggest_n_workers(max_workers=32, per_worker_gb=2.5)     # memory-limited: ~12 on a login node
         tasks = [(spec, str(self.dir / v["output"]), step) for step, v in self.slices.items()]
         if verbose:
             print(f"[romanmock] {len(tasks)} slices of {self.dir.name}, {n_workers} worker(s)", flush=True)
@@ -561,7 +575,8 @@ class BaseCatalog:
         z_cover = (max(z_cover[0] - RSD_MARGIN * (1 + z_cover[0]), 0.0), z_cover[1] + RSD_MARGIN * (1 + z_cover[1]))
         info["line_report"] = line_report(self.line_set.names, self.line_set.rest_waves, spec["wave_range"], spec["z_range"],
                                           spec["z_column"], z_cover, spec["line_bits"], confusion_probabilities(spec["confusion"]),
-                                          counts, spec["outcome_codes"], spec["membership"])
+                                          counts, spec["outcome_codes"], spec["membership"],
+                                          probability_kind="expected" if isinstance(spec["confusion"], LineFractionTable) else "matrix")
         settings = {k: spec[k] for k in ("flux_limit", "secondary_flux_limit", "wave_range", "z_range", "z_column", "lines", "membership",
                                          "outcomes", "n_det_min", "cuts", "sigma_z", "seed", "detection")}
         settings.update(confusion=spec["confusion_config"], downsample=spec["downsample_label"], base=str(self.dir), base_tag=self.tag)
@@ -581,9 +596,8 @@ class BaseCatalog:
         return cat
 
     # ---- settings -> a picklable description for the workers -------------------------
-    def _spec(self, flux_limit, secondary, confusion, z_range, z_column, lines, membership, outcomes, n_det_min, cuts, downsample,
-              columns, wave_range, detection, sigma_z, seed) -> dict:
-        names = self.line_set.names
+    def _sensitivity(self, flux_limit, secondary, wave_range) -> ConstantFluxLimit:
+        """The flux limits and bandpass of a catalog, validated against the base catalog."""
         flux_limit = self.flux_limit if flux_limit is None else float(flux_limit)
         if flux_limit < self.flux_limit * (1 - 1e-9):
             raise ValueError(f"flux_limit {flux_limit:.3g} is deeper than the base catalog ({self.flux_limit:.3g}); "
@@ -595,7 +609,28 @@ class BaseCatalog:
             if secondary != "default":
                 raise ValueError("secondary_flux_limit must be a number, None or 'default'")
             secondary = min(DEFAULT_SECONDARY_LINE_FLUX_LIMIT, flux_limit)
-        sens = ConstantFluxLimit(flux_limit, wave_range, secondary_flux_limit=secondary)    # validates the pair
+        return ConstantFluxLimit(flux_limit, wave_range, secondary_flux_limit=secondary)    # validates the pair
+
+    def _resolve_confusion(self, confusion, flux_limit, secondary, wave_range, detection, seed, n_workers, verbose):
+        """Build the line-fraction table when ``confusion`` asks for the empirical model without one."""
+        if isinstance(confusion, str):
+            confusion = {"type": confusion}
+        if isinstance(confusion, Mapping) and confusion.get("type") == "empirical" and "file" not in confusion \
+                and "table" not in confusion:
+            options = {k: v for k, v in confusion.items() if k != "type"}
+            unknown = sorted(set(options) - set(FRACTION_OPTIONS))
+            if unknown:
+                raise KeyError(f"unknown options {unknown} for the empirical confusion model; known: {list(FRACTION_OPTIONS)}, "
+                               "or file / table")
+            return self.line_fractions(flux_limit=flux_limit, secondary_flux_limit=secondary, wave_range=wave_range,
+                                       detection=detection, seed=seed, n_workers=n_workers, verbose=verbose, **options)
+        return confusion
+
+    def _spec(self, flux_limit, secondary, confusion, z_range, z_column, lines, membership, outcomes, n_det_min, cuts, downsample,
+              columns, wave_range, detection, sigma_z, seed) -> dict:
+        names = self.line_set.names
+        sens = self._sensitivity(flux_limit, secondary, wave_range)
+        flux_limit, wave_range = sens.flux_limit_value, tuple(sens.wave_range)
 
         if confusion is None:
             model = default_confusion(self.line_set)
@@ -606,6 +641,10 @@ class BaseCatalog:
             model = ConfusionMatrix.from_dict(self.line_set, {k: dict(v) for k, v in confusion.items()}, default_p_fail=0.0)
         else:
             model = build_confusion(confusion, self.line_set)
+        if list(model.names) != names:
+            raise ValueError(f"the confusion model is for the lines {list(model.names)}, not {names}")
+        if isinstance(model, LineFractionTable):
+            _check_table(model, flux_limit, sens.secondary_flux_limit_value if sens.two_tier else None, wave_range)
         confusion_config = model.to_config() if hasattr(model, "to_config") else repr(model)
 
         if z_column not in REDSHIFT_COLUMNS:
@@ -699,10 +738,109 @@ class BaseCatalog:
             out[line] = {"bit": names.index(line), "edges": edges, "target": np.asarray(target(zc), dtype=np.float64)}
         return out, label
 
+    # ---- the line mix of the single-line galaxies ------------------------------------
+    def line_fractions(
+        self,
+        flux_limit: float | None = None,
+        secondary_flux_limit: float | None | str = "default",
+        wave_range: tuple[float, float] | None = None,
+        detection: Mapping | None = None,
+        wave_bin: float = 250.0,
+        wave_edges=None,
+        galaxies_per_bin: int = 500,
+        n_flux_bins: int | None = None,
+        flux_quantiles=None,
+        min_count: int = 100,
+        mode: str = "draw",
+        p_fail: float = 0.0,
+        seed: int = 12345,
+        n_workers: int | None = None,
+        write_to=None,
+        verbose: bool = True,
+    ) -> LineFractionTable:
+        """The line mix of the single-line galaxies of the base catalog per bin of observed
+        wavelength and flux rank: the :class:`~romanmock.confusion.LineFractionTable` of the
+        empirical identification, ``make_catalog(confusion=table)``.
+
+        The base catalog is scanned once at these flux limits (the same detection as
+        :meth:`make_catalog`), and the single line of every single-line galaxy is kept: its
+        observed wavelength, its flux and which line it is. The bandpass is cut into bins of
+        ``wave_bin`` Angstrom (or at ``wave_edges``); inside each bin the galaxies are ranked by
+        flux and cut into bins of equal count, as many as hold at least ``galaxies_per_bin``
+        galaxies each (every cell then has between ``galaxies_per_bin`` and twice that, and a
+        populated wavelength bin gets finer flux bins than a sparse one), or into exactly
+        ``n_flux_bins`` bins, or at the quantiles ``flux_quantiles`` (``[0, 0.5, 0.9, 0.99, 1]``
+        resolves the bright tail, where the rare lines are). Lines that are the single line of
+        fewer than ``min_count`` galaxies in all
+        are left out of the identification. Build the table at the ``flux_limit``,
+        ``secondary_flux_limit`` and ``wave_range`` of the catalog it is for; ``make_catalog``
+        warns when they differ.
+
+        ``mode`` is ``"draw"`` (a galaxy gets each line with the probability of its cell) or
+        ``"max"`` (the most common line of its cell); ``p_fail`` a uniform probability of no
+        redshift. ``write_to`` saves the table (``.npz``) for ``confusion={"type": "empirical",
+        "file": ...}`` and the YAML configs of the pipeline. ``seed`` matters only for noisy
+        detection models. ``verbose`` prints :meth:`LineFractionTable.summary`: the galaxies
+        and the shares per wavelength bin, and the smallest cell, to judge the binning.
+        """
+        sens = self._sensitivity(flux_limit, secondary_flux_limit, wave_range)
+        flux_limit, wave_range = sens.flux_limit_value, tuple(sens.wave_range)
+        secondary = sens.secondary_flux_limit_value if sens.two_tier else None
+        if wave_edges is None:
+            n_bins = max(1, int(round((wave_range[1] - wave_range[0]) / float(wave_bin))))
+            wave_edges = np.linspace(wave_range[0], wave_range[1], n_bins + 1)
+        wave_edges = np.asarray(wave_edges, dtype=np.float64)
+        comp_cols = {c: f"{c}{self.flux_suffix}" for feat in self.line_set if not feat.is_blend for c in feat.components} \
+            if self.line_set.has_separated_components else {}
+        spec = {"line_set": self.line_set.to_config(), "flux_columns": self.flux_columns, "component_columns": comp_cols,
+                "sensitivity": sens.to_config(), "detection": dict(detection or {"type": "threshold"}), "seed": int(seed)}
+        if n_workers is None:
+            n_workers = suggest_n_workers(max_workers=32, per_worker_gb=2.5)
+        tasks = [(spec, str(self.dir / v["output"]), step) for step, v in self.slices.items()]
+        if verbose:
+            print(f"[romanmock] line fractions: scanning {len(tasks)} slices of {self.dir.name} for single-line galaxies "
+                  f"(F > {flux_limit:.2g}" + (f", other lines < {secondary:.2g}" if secondary else "") + f"), {n_workers} worker(s)",
+                  flush=True)
+        results = _run(tasks, n_workers, _single_lines_slice)
+        wave, flux, line = (np.concatenate([r[k] for r in results]) for k in ("wave", "flux", "line"))
+        settings = {"base": str(self.dir), "base_tag": self.tag, "flux_limit": flux_limit, "secondary_flux_limit": secondary,
+                    "wave_range": list(wave_range), "detection": spec["detection"], "wave_bin": float(np.median(np.diff(wave_edges))),
+                    "n_base": int(sum(r["n"] for r in results)),
+                    "built": _dt.datetime.now().isoformat(timespec="seconds")}
+        table = LineFractionTable.from_single_lines(self.line_set, wave, flux, line, wave_edges, galaxies_per_bin, n_flux_bins,
+                                                    flux_quantiles, min_count, mode, p_fail, settings)
+        if verbose:
+            print(table.summary(), flush=True)
+        if write_to is not None:
+            path = table.save(write_to)
+            if verbose:
+                print(f"[romanmock] line fractions written to {path}", flush=True)
+        return table
+
 
 def make_catalog(base_dir, **settings) -> Catalog:
     """``BaseCatalog(base_dir).make_catalog(**settings)``."""
     return BaseCatalog(base_dir).make_catalog(**settings)
+
+
+def _check_table(table: LineFractionTable, flux_limit: float, secondary: float | None, wave_range) -> None:
+    """Warn when a line-fraction table was built at other limits than the catalog uses: its flux-rank
+    bins then describe another population."""
+    s = table.settings
+    if "flux_limit" not in s:
+        return
+    mismatch = []
+    if not np.isclose(s["flux_limit"], flux_limit, rtol=1e-6, atol=0.0):       # fluxes ~1e-16: the default atol would hide it
+        mismatch.append(f"flux_limit {s['flux_limit']:.3g} (table) vs {flux_limit:.3g} (catalog)")
+    if (s.get("secondary_flux_limit") is None) != (secondary is None) or \
+            (secondary is not None and not np.isclose(s["secondary_flux_limit"], secondary, rtol=1e-6, atol=0.0)):
+        mismatch.append(f"secondary_flux_limit {s.get('secondary_flux_limit')} (table) vs {secondary} (catalog)")
+    if "wave_range" in s and not np.allclose(s["wave_range"], wave_range, rtol=1e-6, atol=0.0):
+        mismatch.append(f"wave_range {s['wave_range']} (table) vs {list(wave_range)} (catalog)")
+    if mismatch:
+        warnings.warn("the line-fraction table was built for other single-line galaxies than this catalog has: "
+                      + "; ".join(mismatch) + ". Build it with BaseCatalog.line_fractions at the limits of the catalog.",
+                      RuntimeWarning, stacklevel=4)
 
 
 def make_random(catalog, **settings):
@@ -822,14 +960,41 @@ def base_data_group(h):
     raise KeyError(f"{h.filename}: no data group with the column redshift_rsd")
 
 
-def _run(tasks, n_workers: int) -> list[dict]:
+def _single_lines_slice(spec: dict, path: str, step: int) -> dict:
+    """Worker of :meth:`BaseCatalog.line_fractions`: the single line (wavelength, flux, index) of every
+    single-line galaxy of one slice, detected as :func:`_catalog_slice` does it."""
+    import h5py
+
+    line_set = get_line_set(spec["line_set"])
+    flux_columns, comp_cols = spec["flux_columns"], spec["component_columns"]
+    read = list(dict.fromkeys([*flux_columns, *comp_cols.values(), "redshift_rsd"]))
+    rng = np.random.default_rng([spec["seed"], FRACTION_STREAM, int(step)])
+    model = build_detection(spec["detection"], build_sensitivity(spec["sensitivity"]))
+    waves, fluxes, lines, n = [], [], [], 0
+    with h5py.File(path, "r") as h:
+        group = base_data_group(h)
+        n = group["redshift_rsd"].shape[0]
+        for start in range(0, n, CHUNK_ROWS):
+            stop = min(start + CHUNK_ROWS, n)
+            data = {c: group[c][start:stop] for c in read}
+            z_rsd = np.asarray(data["redshift_rsd"], dtype=np.float64)
+            flux = np.stack([np.asarray(data[c], dtype=np.float64) for c in flux_columns], axis=1)
+            comp = {lum: np.asarray(data[name], dtype=np.float64) for lum, name in comp_cols.items()} or None
+            det = detect_lines(flux, z_rsd, line_set, model, rng, component_flux=comp)
+            w, f, i = single_lines(det)
+            waves.append(w); fluxes.append(f); lines.append(i.astype(np.int8))
+    cat = lambda parts, dtype: np.concatenate(parts) if parts else np.zeros(0, dtype=dtype)
+    return {"step": int(step), "n": int(n), "wave": cat(waves, np.float64), "flux": cat(fluxes, np.float64), "line": cat(lines, np.int8)}
+
+
+def _run(tasks, n_workers: int, worker=_catalog_slice) -> list[dict]:
     if n_workers <= 1 or len(tasks) <= 1:
-        return [_catalog_slice(*t) for t in tasks]
+        return [worker(*t) for t in tasks]
     import concurrent.futures as cf
     import multiprocessing as mp
 
     with cf.ProcessPoolExecutor(max_workers=n_workers, mp_context=mp.get_context("spawn")) as pool:
-        futures = [pool.submit(_catalog_slice, *t) for t in tasks]
+        futures = [pool.submit(worker, *t) for t in tasks]
         return [f.result() for f in futures]           # in slice order
 
 
@@ -891,9 +1056,12 @@ def line_counts(line_true, line_assigned, outcome, bitmask, n_lines: int) -> dic
 
 def confusion_probabilities(model) -> np.ndarray | None:
     """``P[i, j]`` = probability that a single line ``i`` is taken for ``j`` (the largest one over the
-    wavelength bins of a binned model); ``None`` for a model that is not a matrix."""
+    wavelength bins of a binned model; for a :class:`LineFractionTable` the expectation over the
+    single-line galaxies of line ``i``); ``None`` for a model that is none of these."""
     if isinstance(model, ConfusionMatrix):
         return model.matrix[:, :-1].copy()
+    if hasattr(model, "expected_confusion"):
+        return model.expected_confusion().matrix[:, :-1].copy()
     matrices = getattr(model, "matrices", None)
     if matrices and all(isinstance(m, ConfusionMatrix) for m in matrices):
         return np.max([m.matrix[:, :-1] for m in matrices], axis=0)
@@ -901,7 +1069,7 @@ def confusion_probabilities(model) -> np.ndarray | None:
 
 
 def line_report(names, rest_waves, wave_range, z_range, z_column, z_cover, assigned_bits=None, probabilities=None,
-                counts=None, outcome_codes=None, membership: str = "detected") -> dict:
+                counts=None, outcome_codes=None, membership: str = "detected", probability_kind: str = "matrix") -> dict:
     """Lines inside the bandpass for a redshift cut, and the interlopers the cut lets in.
 
     A line ``i`` observed at ``wave`` and taken for line ``j`` gets the redshift ``wave / rest_j - 1``.
@@ -956,7 +1124,7 @@ def line_report(names, rest_waves, wave_range, z_range, z_column, z_cover, assig
     kept = outcome_codes is None or int(IdOutcome.SINGLE_MISID) in outcome_codes
     return {"wave_range": list(map(float, wave_range)), "z_range": None if z_range is None else list(z_range),
             "z_column": z_column, "z_cover": list(map(float, z_cover)), "lines": lines, "interlopers": interlopers,
-            "misidentified_kept": bool(kept), "membership": membership}
+            "misidentified_kept": bool(kept), "membership": membership, "probability_kind": probability_kind}
 
 
 def format_line_report(report: dict | None) -> str:
@@ -1005,6 +1173,9 @@ def format_line_report(report: dict | None) -> str:
             share = f"{100 * r['n'] / r['n_line']:.2f}%" if r["n_line"] else "-"
             text += f"{r['n']:>13,}{share:>15s}"
         out.append(text)
+    if likely and report.get("probability_kind") == "expected":
+        out.append("  (P: expected over the single-line galaxies of the true line, from the line mix of the mock at their "
+                   "observed wavelength and flux rank)")
     if counted:
         total = sum(r["n"] for r in rows)
         own = "identified" if report.get("membership", "detected") == "detected" else "brightest"
@@ -1019,7 +1190,7 @@ def format_line_report(report: dict | None) -> str:
         if r not in likely and r["line_assigned"] in targets:       # lines nothing is taken for are left out
             idle.setdefault(r["line_assigned"], []).append(f"{r['line_true']} (z {span(r['z_true'], '.2f')})")
     if idle:
-        out.append("  possible by wavelength, but with probability 0 in the confusion matrix:")
+        out.append("  possible by wavelength, but with probability 0 in the confusion model:")
         out += [f"    taken for {name}: " + ", ".join(v) for name, v in idle.items()]
     if not rows:
         out.append("  none possible: no other line falls at these wavelengths")

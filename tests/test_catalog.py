@@ -307,3 +307,45 @@ def test_read_slices_streams_the_base_catalog(base):
     np.testing.assert_array_equal(np.concatenate([p["Ha_flux"] for p in parts]), cat["Ha_flux"])
     everything = sum(p["gal_id"].size for p in b.read_slices(["gal_id"]))
     assert everything == b.n_galaxies
+
+
+def test_empirical_confusion_catalog(base):
+    """`confusion="empirical"`: the table built from the base catalog, used in memory, on the fly and from a file."""
+    from romanmock.diagnostics import empirical_confusion
+
+    tmp, b = base
+    options = dict(wave_bin=1000.0, n_flux_bins=4, min_count=1)
+    table = b.line_fractions(n_workers=1, verbose=False, **options, **LIMITS)
+    assert table.names == b.line_set.names and table.n_single > 0 and table.n_wave_bins == 9
+    assert table.settings["flux_limit"] == LIMITS["flux_limit"]
+    assert table.settings["secondary_flux_limit"] == LIMITS["secondary_flux_limit"]
+    cat = b.make_catalog(confusion=table, seed=5, outcomes=None, columns=ALL, n_workers=1, verbose=False, **LIMITS)
+    assert (cat["n_det"] == 1).sum() == table.n_single                     # the same single-line galaxies
+    assert cat.settings["confusion"]["type"] == "empirical" and cat.settings["confusion"]["hash"] == table.content_hash()
+    assert cat.info["line_report"]["probability_kind"] == "expected"
+    fly = b.make_catalog(confusion={"type": "empirical", **options}, seed=5, outcomes=None, columns=ALL, n_workers=2, verbose=False,
+                         **LIMITS)
+    for c in ALL:
+        np.testing.assert_array_equal(cat[c], fly[c], err_msg=c)
+    single = cat["n_det"] == 1
+    emp = empirical_confusion(cat.data, b.line_set)
+    rows = np.bincount(cat["line_true"][single], minlength=len(b.line_set)) > 200
+    np.testing.assert_allclose(emp[rows], table.expected_confusion().matrix[rows], atol=0.05)
+    # the file route: the pipeline reads the saved table and writes the same catalog
+    path = table.save(tmp / "fractions.npz")
+    cfg = RomanMockConfig.from_dict({
+        "source": "base", "base": {"dir": str(tmp / "base")},
+        "output": {"dir": str(tmp / "empirical"), "passthrough_columns": ["gal_id", "ra", "dec", "redshift_true"], "overwrite": True},
+        "sensitivity": {"type": "constant", "wave_range": [10000.0, 19300.0], **LIMITS},
+        "confusion": {"type": "empirical", "file": str(path)}, "seed": 5})
+    pipe = RomanMockPipeline(cfg)
+    assert pipe.scientific_config()["confusion"]["hash"] == table.content_hash()
+    pipe.run(verbose=False)
+    parent = pipe.open_parent().select(*ALL).get_data("numpy")
+    for c in ALL:
+        np.testing.assert_array_equal(cat[c], parent[c], err_msg=c)
+    # a table built at other limits is used, with a warning
+    with pytest.warns(RuntimeWarning, match="other single-line galaxies"):
+        b.make_catalog(confusion=table, flux_limit=2e-16, seed=5, n_workers=1, verbose=False)
+    with pytest.raises(KeyError):
+        b.make_catalog(confusion={"type": "empirical", "wave_bins": 3}, seed=5, n_workers=1, verbose=False, **LIMITS)

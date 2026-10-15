@@ -50,22 +50,22 @@ in step with the code.
 | `cosmology.py`, `fluxes.py` | erg/s → erg/s/cm² via the OpenCosmo header cosmology (astropy or dsps backend) |
 | `sensitivity.py` | `SensitivityModel` + `DetectionModel` protocols and registries; two-tier rule (`apply_two_tier`) |
 | `detection.py` | `detect_lines`, `pack_bitmask`, `popcount`, `DetectionResult` |
-| `confusion.py` | `ConfusionMatrix` (fail column), `WavelengthBinnedConfusion`, `DEFAULT_CONFUSION_ROWS`, `build_confusion` |
+| `confusion.py` | `ConfusionMatrix` (fail column), `WavelengthBinnedConfusion`, `LineFractionTable` (`type: empirical`: the line mix of the single-line galaxies per observed wavelength and flux rank), `DEFAULT_CONFUSION_ROWS`, `build_confusion` |
 | `redshift.py` | `assign_redshifts`, `IdOutcome` codes, `MultiLineModel` hook |
 | `selection.py` | footprints, `SampleDefinition`, `sample_mask`, `TargetDNDZ`, thinning helpers, `sky_area_deg2` |
 | `samples.py` | slice-wise stage B: `process_slice`, `run_pass`, `thinning_keep`, `sample_keep` |
 | `pipeline.py` | `RomanMockPipeline`: `process_arrays`/`process_fluxes` (pure numpy) → `run` (stage A, from the mock or from the base catalog), `build_base`, `build_samples` |
 | `footprint.py` | `PatchFootprint`: union of the theta-phi sky patches of the lightcone (`from_mock`, `sample`, `contains`, `area_deg2`) |
 | `randoms.py` | `make_random`: randoms of a `Catalog` for `which` = all / galaxies / interlopers; redshifts drawn from the data |
-| `catalog.py` | `BaseCatalog.make_catalog` -> `Catalog`: step 2 in memory from the base catalog (the everyday route), `Catalog.write/read` |
+| `catalog.py` | `BaseCatalog.make_catalog` -> `Catalog`: step 2 in memory from the base catalog (the everyday route), `Catalog.write/read`; `BaseCatalog.line_fractions` scans it for the `LineFractionTable` |
 | `reference_dndz.py` | Wang et al. (2022) Tables 1–2 with uncertainties |
 | `fluxdist.py` | `flux_distribution` / `FluxDistribution`: log-flux histograms of every galaxy per line and redshift bin, no cut; quantiles, fraction above a threshold |
 | `census.py` | `line_census` / `LineCensus`: dN/dz of emitters above flux limits, single/multi-line, no confusion |
 | `diagnostics.py`, `plotting.py` | checks (confusion, contamination, completeness, dN/dz); notebook plot style |
 | `config.py`, `cli.py`, `io.py` | YAML config dataclasses, CLI, OpenCosmo I/O, manifests, index compression, memory budget |
 
-CLI commands: `info`, `lines`, `example-config`, `run`, `base`, `census`, `flux-distribution`, `catalog`, `random`, `assign`,
-`summary`, `select`, `compress-index`.
+CLI commands: `info`, `lines`, `example-config`, `run`, `base`, `census`, `flux-distribution`, `catalog`, `line-fractions`,
+`random`, `assign`, `summary`, `select`, `compress-index`.
 Scripts: `production.sh` (sbatch: base catalog + census from `configs/production.yaml`), `run_slices.sh` (job array
 for `run`), `example_analysis.py`.
 
@@ -84,6 +84,25 @@ General:
   (`confusion: {type: default}`) is `romanmock.confusion.DEFAULT_CONFUSION_ROWS` (Ha->OIII_5007 0.5 %,
   OIII_5007->Ha 5 %, SIII_9532->Ha 5 %, Hb->OIII_5007 5 %, no failures, `default_p_fail` 0), translated to
   the line set's names.
+- Empirical identification (`type: empirical`, added 2026-10-09 at the user's request, the confusion matrix kept as
+  an option): `LineFractionTable` in `confusion.py`. The single-line galaxies of the mock are binned in the observed
+  wavelength of their line (`wave_bin` 250 Å by default: the grism resolves 21–24 Å, R 475–900 per 2 pixels, so the
+  bin is set by statistics, not resolution) and, per wavelength bin, in flux rank: as many equal-count bins as hold
+  `galaxies_per_bin` (500, the user's choice on 2026-10-09; 20 fixed bins diluted the rare lines) galaxies, so the table is ragged
+  (`flux_edges` padded with inf before the last edge, `counts` zero there, `valid_cells` / `n_flux_bins_per_wave`), or
+  a fixed `n_flux_bins`, or `flux_quantiles`; `fraction[w, f, j]` = share of line j in the cell; lines with fewer than `min_count` (100)
+  single-line galaxies in all are dropped and the shares renormalised. `assign` ignores the true line: `mode`
+  `draw` (each line with the share of the cell, one uniform per galaxy like `ConfusionMatrix`) or `max`; uniform
+  `p_fail`. Empty cells take the mix of their wavelength bin, empty wavelength bins the mix of the whole table;
+  wavelengths/fluxes outside the edges go to the nearest bin. `expected_confusion()` gives the implied
+  `ConfusionMatrix` (used as `P` in the line report, `probability_kind: expected`). The table is built by
+  `BaseCatalog.line_fractions` (worker `_single_lines_slice`, stream `(seed, 40000, step)`, matters for noisy detection
+  only) at the limits of the catalog it is for; `make_catalog(confusion="empirical" | {"type": "empirical", options})`
+  builds it on the fly (one more pass), a `LineFractionTable` or `{"type": "empirical", "file": ...}` reuses one;
+  `_check_table` warns when its limits differ from the catalog's. `to_config()` is compact (hash of the content,
+  not the numbers): it goes into `cat.settings` and so into HDF5 attributes (64 KB limit) and into
+  `scientific_config()`; `save`/`load` (`.npz`) and `to_dict` hold the numbers. The pipeline route needs `file:`
+  (`romanmock line-fractions` writes it); it does not build the table itself.
 
 Detection (two-tier since 0.3.0):
 
