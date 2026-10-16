@@ -1,4 +1,6 @@
 """The S/N route on the real mock: a base catalog with the size column, make_catalog and assign agree."""
+import warnings
+
 import numpy as np
 import pytest
 
@@ -99,3 +101,22 @@ def test_assign_equals_make_catalog(built):
     bad = RomanMockConfig.from_dict({**cfg.to_dict(), "sensitivity": {"type": "roman_grism", "size": "r50_bulge_2d"}})
     with pytest.raises(KeyError, match="r50_bulge_2d"):
         RomanMockPipeline(bad)
+
+
+def test_noisy_detection_warns_and_fallback_is_counted(built):
+    """A noisy detection model close to the base limit warns in make_catalog as in the pipeline; the
+    galaxies that took a fallback size are counted (none in the mock)."""
+    tmp, steps, pipe, base_files = built
+    b = BaseCatalog(tmp / "base")
+    kw = dict(outcomes=None, n_workers=1, verbose=False)
+    with pytest.warns(UserWarning, match="noisy detection"):
+        noisy = b.make_catalog(snr=5.0, size=0.0, detection={"type": "gaussian_noise"}, **kw)
+    assert len(noisy) > 0
+    with warnings.catch_warnings(record=True) as seen:                   # 0.3" is 2.6 x shallower: the base is deep enough
+        warnings.simplefilter("always")
+        b.make_catalog(snr=5.0, size=0.3, detection={"type": "gaussian_noise"}, **kw)
+    assert not [w for w in seen if "noisy detection" in str(w.message)]
+    cat = b.make_catalog(snr=5.0, size={"column": "r50_disk_2d", "fallback": 0.3}, **kw)
+    assert cat.info["n_fallback_size"] == 0 and cat.settings["sensitivity"]["size"]["fallback"] == 0.3
+    assert len(cat) == len(b.make_catalog(snr=5.0, size="r50_disk_2d", **kw))
+

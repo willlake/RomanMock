@@ -205,12 +205,15 @@ class RomanGrismSensitivity:
 
     with the point-source row interpolated linearly in log F; the size factor has one scale
     ``r_c(lambda)`` per tabulated wavelength, fixed so that ``r = 0.3"`` reproduces the
-    extended-source row exactly (``r_c`` is 0.12-0.14", close to the PSF; ``p`` =
-    ``size_exponent``, 1/2 by default: the noise grows with the square root of the number of
-    pixels the line is spread over, which is linear in the size for a line that is only
-    smeared in the cross-dispersion direction). Sizes beyond 0.3" are an extrapolation of the
-    two tabulated rows. Wavelengths between the bandpass edges and the first / last tabulated
-    point take the nearest tabulated value.
+    extended-source row exactly. ``r_c`` (0.12-0.14") is an empirical transition scale set by
+    the ratio of the two rows, not a measured PSF width. ``p`` = ``size_exponent``, 1/2 by
+    default: the background noise grows with the square root of the number of pixels under
+    the line, which grows as ``r^2`` when the line image spreads in both detector directions,
+    so the limit tends to ``F ∝ r`` for large sizes, the large-size scaling the WFI page
+    quotes. Between 0 and 0.3" only the two ends are tabulated, and beyond 0.3" the model
+    follows that asymptote; other exponents are for sensitivity tests, not equally supported.
+    Wavelengths between the bandpass edges and the first / last tabulated point take the
+    nearest tabulated value (no throughput roll-off).
 
     The thresholds are S/N values: a line is above the primary limit when
     ``S/N = 5 F / F_5sigma >= snr`` (5 by default), and the other lines of such a galaxy are
@@ -461,25 +464,59 @@ def describe_sensitivity(sensitivity) -> str:
     return repr(sensitivity)
 
 
-CONTAINMENT_SIZES_ARCSEC = (0.0, 0.1, 0.3, 0.6, 1.0, 2.0)
+#: a noisy detection model wants the base catalog at least this much deeper than the requested limit
+NOISY_BASE_MARGIN = 1.5
+
+#: raw sizes [arcsec] of the containment check: the sizes of the base catalog's galaxies before
+#: ``scale`` and ``floor``, from a point source to the largest disks of the mock (~80 kpc)
+CONTAINMENT_SIZES_ARCSEC = (0.0, 0.05, 0.1, 0.2, 0.3, 0.45, 0.6, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0, 30.0)
 
 
 def limits_contained(requested, base, n_wave: int = 4001, sizes=CONTAINMENT_SIZES_ARCSEC) -> tuple[str | None, float]:
     """Is every galaxy ``requested`` can select in a base catalog built with ``base``?
 
     The primary limits are compared on a grid of wavelengths inside the requested bandpass
-    and, when either model uses sizes, on a grid of sizes. Returns ``(message, min_ratio)``:
+    and, when either model takes the sizes of the galaxies from the catalog, on a grid of raw
+    sizes of the same galaxy: each model's own :class:`~romanmock.sizes.SizeSpec` (``scale``,
+    ``floor``) is applied to the grid, so that two specs that assign different angular sizes
+    to the same galaxy are compared for that galaxy. Two models reading the size from
+    different quantities (column, unit, redshift column) cannot be compared and are refused,
+    as is a requested ``size_exponent`` below the base one, whose limits cross for sizes
+    beyond any finite grid (the limit grows as ``r^(2p)``). Returns ``(message, min_ratio)``:
     ``message`` is ``None`` when the requested limits are nowhere deeper than the base ones
     and the bandpass is inside the base one, else it says where; ``min_ratio`` is the
     smallest requested / base limit.
     """
     lo, hi = requested.wave_range
     wave = np.linspace(lo, hi, n_wave)[1:-1]
-    with_size = needs_size(requested) or needs_size(base)
+    req_spec = requested.size_spec if needs_size(requested) else None
+    base_spec = base.size_spec if needs_size(base) else None
+    if req_spec is not None and base_spec is not None:
+        if not req_spec.same_source(base_spec):
+            return (f"the requested sizes come from {req_spec.describe()} and the sizes of the base catalog from "
+                    f"{base_spec.describe()}: the limits cannot be compared galaxy by galaxy; rebuild the base catalog "
+                    "with the same size column, a fixed size or a constant flux limit", 0.0)
+        p_req, p_base = getattr(requested, "size_exponent", None), getattr(base, "size_exponent", None)
+        if p_req is not None and p_base is not None and p_req < p_base - 1e-12:
+            return (f"requested size_exponent {p_req:g} is below the base catalog's {p_base:g}: the requested limit is "
+                    "deeper than the base one for large galaxies", 0.0)
+    with_size = req_spec is not None or base_spec is not None
+    raw_sizes = np.asarray(sizes, dtype=np.float64)
+    if with_size:
+        # the raw sizes a galaxy of the base catalog can have: the grid, also through each scale
+        for spec in (req_spec, base_spec):
+            if spec is not None:
+                raw_sizes = np.concatenate([raw_sizes, np.asarray(sizes) / spec.scale])
+        raw_sizes = np.unique(raw_sizes)
     min_ratio = np.inf
-    for size in (sizes if with_size else (None,)):
-        req = primary_flux_limit(requested, wave, size)
-        ref = primary_flux_limit(base, wave, size)
+    for raw in (raw_sizes if with_size else (None,)):
+        if raw is None:
+            size_req = size_base = None
+        else:
+            size_req = float(req_spec.transform(raw)) if req_spec is not None else None
+            size_base = float(base_spec.transform(raw)) if base_spec is not None else None
+        req = primary_flux_limit(requested, wave, size_req)
+        ref = primary_flux_limit(base, wave, size_base)
         inside = np.isfinite(req)
         if np.any(inside & ~np.isfinite(ref)):
             return (f"requested bandpass {requested.wave_range} extends beyond the bandpass of the base catalog "
@@ -490,7 +527,13 @@ def limits_contained(requested, base, n_wave: int = 4001, sizes=CONTAINMENT_SIZE
         k = int(np.argmin(ratio))
         min_ratio = min(min_ratio, float(ratio[k]))
         if ratio[k] < 1.0 - 1e-9:
-            where = f"at {wave[inside][k]:.0f} A" + (f" for a size of {size:g} arcsec" if size is not None else "")
+            where = f"at {wave[inside][k]:.0f} A"
+            if size_req is not None:
+                where += f" for a size of {size_req:g} arcsec"
+                if size_base is not None and size_base != size_req:
+                    where += f" ({size_base:g} arcsec in the base catalog)"
+            elif size_base is not None:
+                where += f" for a galaxy of {size_base:g} arcsec in the base catalog"
             return (f"requested flux limit {req[inside][k]:.3g} is deeper than the base catalog limit "
                     f"{ref[inside][k]:.3g} ({where})", float(ratio[k]))
     return None, float(min_ratio)

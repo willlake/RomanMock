@@ -57,6 +57,7 @@ from .sensitivity import (
     build_sensitivity,
     describe_sensitivity,
     limits_contained,
+    NOISY_BASE_MARGIN,
     needs_size,
     nominal_flux_limit,
     nominal_secondary_limit,
@@ -620,6 +621,7 @@ class BaseCatalog:
         data = {c: np.concatenate([r["columns"][c] for r in results]) for c in spec["columns"]}
         info = {"n_base": int(sum(r["n_base"] for r in results)),
                 "n_detected": int(sum(r["n_detected"] for r in results)),
+                "n_fallback_size": int(sum(r["n_fallback_size"] for r in results)),
                 "n_selected": int(len(next(iter(data.values())))) if data else 0}
         if populations:
             keep, info["downsample"] = _thin(results, populations, spec, area)
@@ -647,6 +649,9 @@ class BaseCatalog:
             print(f"[romanmock] sky area {area:.2f} deg2 ({how})", flush=True)
             print(f"[romanmock] {info['n_detected']:,} of {info['n_base']:,} base galaxies detected; "
                   f"{info['n_galaxies']:,} in the catalog", flush=True)
+            if info["n_fallback_size"]:
+                print(f"[romanmock] {info['n_fallback_size']:,} base galaxies ({100 * info['n_fallback_size'] / max(info['n_base'], 1):.2f} %) "
+                      f"have no valid size and took the fallback of {spec['size'].fallback:g} arcsec", flush=True)
             print(cat.line_report(), flush=True)
         if cat.nbytes > 0.5e9 * memory_budget_gb():
             warnings.warn(f"the catalog takes {cat.nbytes / 1e9:.1f} GB of memory", stacklevel=2)
@@ -656,9 +661,10 @@ class BaseCatalog:
 
     # ---- settings -> a picklable description for the workers -------------------------
     def _sensitivity(self, flux_limit=None, secondary_flux_limit="default", wave_range=None, sensitivity=None, snr=None,
-                     secondary_snr="default", size=None, exposure_time=None, background=None):
+                     secondary_snr="default", size=None, exposure_time=None, background=None, detection=None):
         """The sensitivity model of a catalog: flux limits (``ConstantFluxLimit``), S/N thresholds
-        (``RomanGrismSensitivity``) or a given model; validated against the base catalog."""
+        (``RomanGrismSensitivity``) or a given model; validated against the base catalog. ``detection``
+        (the detection config) only decides whether to warn about a noisy model close to the base limit."""
         wave_range = self.wave_range if wave_range is None else (float(wave_range[0]), float(wave_range[1]))
         flux_given = flux_limit is not None or not (isinstance(secondary_flux_limit, str) and secondary_flux_limit == "default")
         snr_given = {k: v for k, v in dict(snr=snr, size=size, exposure_time=exposure_time, background=background).items()
@@ -684,9 +690,14 @@ class BaseCatalog:
                     raise ValueError("secondary_flux_limit must be a number, None or 'default'")
                 secondary = min(DEFAULT_SECONDARY_LINE_FLUX_LIMIT, flux_limit)
             sens = ConstantFluxLimit(flux_limit, wave_range, secondary_flux_limit=secondary)    # validates the pair
-        problem, _ = limits_contained(sens, self.sensitivity)
+        problem, min_ratio = limits_contained(sens, self.sensitivity)
         if problem is not None:
             raise ValueError(f"{problem}; rebuild the base catalog" + (" deeper" if "deeper" in problem else ""))
+        if (detection or {}).get("type", "threshold") != "threshold" and min_ratio < NOISY_BASE_MARGIN:
+            warnings.warn("a noisy detection model scatters galaxies across the flux limit, but the base catalog has "
+                          "none below its own limit (the selection is deterministic on the true fluxes); use a base "
+                          f"catalog clearly deeper than the requested limit (it is {min_ratio:.2f} x deeper at best)",
+                          stacklevel=4)
         missing = [c for c in getattr(sens, "required_columns", []) if c not in self.description["columns"]]
         if missing:
             raise KeyError(f"the sizes need the columns {missing}, which the base catalog does not store (it has "
@@ -710,7 +721,7 @@ class BaseCatalog:
     def _spec(self, sens_kw, confusion, z_range, z_column, lines, membership, outcomes, n_det_min, cuts, downsample,
               columns, detection, sigma_z, seed) -> dict:
         names = self.line_set.names
-        sens = self._sensitivity(**sens_kw)
+        sens = self._sensitivity(**sens_kw, detection=detection)
         flux_limit, wave_range = nominal_flux_limit(sens), tuple(sens.wave_range)
         secondary = nominal_secondary_limit(sens)
 
@@ -880,7 +891,7 @@ class BaseCatalog:
         and the shares per wavelength bin, and the smallest cell, to judge the binning.
         """
         sens = self._sensitivity(flux_limit, secondary_flux_limit, wave_range, sensitivity, snr, secondary_snr, size,
-                                 exposure_time, background)
+                                 exposure_time, background, detection=detection)
         flux_limit, wave_range = nominal_flux_limit(sens), tuple(sens.wave_range)
         secondary = nominal_secondary_limit(sens)
         if wave_edges is None:
@@ -995,7 +1006,7 @@ def _catalog_slice(spec: dict, path: str, step: int) -> dict:
             cols.update(redshift_assigned=za.z_assigned, id_outcome=za.outcome, line_bitmask=det.bitmask, n_det=det.n_det,
                         line_true=za.line_true, line_assigned=za.line_assigned)
             detected = det.bitmask > 0
-            part = {"n": stop - start, "n_detected": int(detected.sum())}
+            part = {"n": stop - start, "n_detected": int(detected.sum()), "n_fallback_size": _n_fallback_size(spec, data)}
             if pops:
                 part["hist"], part["n_pop"] = {}, {}
                 for name, pop in pops.items():
@@ -1036,6 +1047,7 @@ def _catalog_slice(spec: dict, path: str, step: int) -> dict:
 
     cat = lambda key: np.concatenate([p[key] for p in parts]) if parts else np.zeros(0)
     out = {"step": int(step), "n_base": int(sum(p["n"] for p in parts)), "n_detected": int(sum(p["n_detected"] for p in parts)),
+           "n_fallback_size": int(sum(p["n_fallback_size"] for p in parts)),
            "columns": {c: (np.concatenate([p["columns"][c] for p in parts]) if parts else np.zeros(0)) for c in spec["columns"]}}
     ident = {k: (np.concatenate([p["ident"][k] for p in parts]) if parts else np.zeros(0, dtype=np.int64)) for k in
              ("line_true", "line_assigned", "outcome", "bitmask")}
@@ -1054,6 +1066,14 @@ def _sizes(spec: dict, data: Mapping[str, np.ndarray]):
     if spec.get("size") is None:
         return None
     return spec["size"].angular_size(data, spec["cosmology"])
+
+
+def _n_fallback_size(spec: dict, data: Mapping[str, np.ndarray]) -> int:
+    """Galaxies of a chunk whose size is invalid and took the fallback size (0 without a size column or fallback)."""
+    size = spec.get("size")
+    if size is None or size.is_fixed or size.fallback is None:
+        return 0
+    return size.n_invalid(data, spec["cosmology"])
 
 
 def base_data_group(h):

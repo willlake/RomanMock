@@ -141,18 +141,25 @@ Detection (two-tier since 0.3.0):
   lines are detected at S/N >= 2; one detected line = single-line galaxy, primary + secondary lines = multi-line.
   Noise: the 5-sigma line limits of the NASA WFI technical page (grism, v1.4; `roman.py`) for a point source and
   r50 = 0.3" at ten wavelengths, 1 h, 2 x min zodi; `F_5sigma(lambda, r) = F_pt(lambda) (1 + (r/r_c)^2)^p (t/1h)^-1/2 (b/2)^1/2`,
-  `r_c(lambda)` fixed by the two rows (0.12-0.14"), `p = size_exponent` 0.5; S/N = 5 F / F_5sigma. Sizes above 0.3"
-  are an extrapolation. `snr=6.5, size=0.3` gives 1.05e-16 at 1.5 um, the old baseline.
+  `r_c(lambda)` fixed by the two rows (0.12-0.14", an empirical transition scale, not the PSF), `p = size_exponent`
+  0.5 (2-D broadening: noise ∝ r, the large-size scaling the WFI page quotes; other exponents are sensitivity tests);
+  S/N = 5 F / F_5sigma. `snr=6.5, size=0.3` gives 1.05e-16 at 1.5 um, the old baseline.
 - Sizes (`sizes.SizeSpec`): a number (arcsec, 0 = point source) or a column (`r50_disk_2d`, proper kpc, converted with
-  `arcsec_per_kpc_proper(redshift_true)`; `scale`, `floor`, NaN -> floor). `detect_lines(size=)` broadcasts an `(n,)`
+  `arcsec_per_kpc_proper(redshift_true)`; `scale`, `floor`; a non-finite or negative size is an error unless
+  `fallback` [arcsec] is set, `n_invalid` counts them, `make_catalog` reports `info["n_fallback_size"]`, the pipeline
+  warns). `detect_lines(size=)` broadcasts an `(n,)`
   array against `(n, n_features)`; `primary_flux_limit` / `secondary_flux_limit` forward sizes only to a model that
   takes them from a column (`needs_size`), so a fixed-size model keeps its size (matters for `limits_contained`).
   `RomanMockPipeline.base_columns` = `base.columns` + the size columns: a base built with a size column stores it;
   `make_catalog(size="r50_disk_2d")` needs `r50_disk_2d` in `base.columns` (production.yaml lists it since
-  2026-10-15; the production base must be rebuilt once). Workers get the `SizeSpec` and the cosmology
-  (`BaseCatalog.cosmology`, from the first base file) in their spec.
+  2026-10-15; the production base carries it since the rebuild of 2026-10-15). Workers get the `SizeSpec` and the
+  cosmology (`BaseCatalog.cosmology`, from the first base file) in their spec.
 - Containment of a selection in the base catalog is `sensitivity.limits_contained(requested, base)`: primary limits
-  on a wavelength grid and, when a model takes sizes from the catalog, a size grid (0-2"). `cat.settings` carries
+  on a wavelength grid and, when a model takes sizes from the catalog, on a grid of raw sizes (0-30") of the same
+  galaxy, each model's `SizeSpec.transform` (scale, floor) applied, so that two specs are compared galaxy by galaxy;
+  specs reading different quantities (`SizeSpec.same_source`) and a requested `size_exponent` below the base one
+  (limits cross beyond any grid) are refused (review of 2026-10-16). A noisy detection model warns in both entry
+  points when the base is less than `NOISY_BASE_MARGIN` (1.5) times deeper. `cat.settings` carries
   `sensitivity` (the config) plus nominal `flux_limit` / `secondary_flux_limit` (1.5 um, size 0.3" for a column);
   the Wang et al. lookup then needs an explicit `flux_limit` in `downsample`. `_check_table` compares the
   sensitivity configs. Note of the implementation: `Projects/Roman/RomanMock/RomanMock_SNR_Sensitivity_Note.md`.

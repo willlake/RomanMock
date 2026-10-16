@@ -57,7 +57,7 @@ from .selection import (
     keep_probability,
     sky_area_deg2,
 )
-from .sensitivity import ConstantFluxLimit, ThresholdDetection, build_detection, build_sensitivity, limits_contained
+from .sensitivity import NOISY_BASE_MARGIN, ConstantFluxLimit, ThresholdDetection, build_detection, build_sensitivity, limits_contained
 
 #: bitmask at the limits of the base catalog. It must not be called ``line_bitmask``: OpenCosmo writes the stored
 #: column instead of a new one of the same name, so step 2 would silently keep the base bitmask.
@@ -134,6 +134,12 @@ class RomanMockPipeline:
         """Angular size [arcsec] of the galaxies for the sensitivity model (``None`` when it has none)."""
         if self.size_spec is None:
             return None
+        if self.size_spec.fallback is not None:
+            n_bad = self.size_spec.n_invalid(data, cosmology)
+            if n_bad:
+                warnings.warn(f"{n_bad:,} of {len(next(iter(data.values()))):,} galaxies have no valid size "
+                              f"({self.size_spec.column}) and take the fallback of {self.size_spec.fallback:g} arcsec",
+                              stacklevel=2)
         return self.size_spec.angular_size(data, cosmology)
 
     @property
@@ -679,9 +685,10 @@ class RomanMockPipeline:
         problem, min_ratio = limits_contained(self.sensitivity, base_sens)
         if problem is not None:
             raise ValueError(f"{problem}; rebuild the base catalog" + (" deeper" if "deeper" in problem else ""))
-        if not isinstance(self.detection, ThresholdDetection) and min_ratio < 1.5:
+        if not isinstance(self.detection, ThresholdDetection) and min_ratio < NOISY_BASE_MARGIN:
             warnings.warn("a noisy detection model scatters galaxies across the flux limit, but the base catalog has "
-                          "none below its own limit; use a base catalog clearly deeper than the requested limit",
+                          "none below its own limit (the selection is deterministic on the true fluxes); use a base "
+                          f"catalog clearly deeper than the requested limit (it is {min_ratio:.2f} x deeper at best)",
                           stacklevel=3)
         missing = [c for c in [*cfg.output.passthrough_columns, *cfg.redshift.context_columns, *self.size_columns]
                    if c not in [*base["columns"], "redshift_rsd"]]

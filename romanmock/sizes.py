@@ -9,14 +9,16 @@ size of a galaxy comes from:
   proper kpc), converted to arcsec with the angular-diameter distance at ``redshift_column``
   (``redshift_true``) and the cosmology of the catalog; a column already in arcsec takes
   ``unit: arcsec``. ``scale`` multiplies the size (the line-emitting region need not have the
-  size of the stellar disk) and ``floor`` is the smallest size used; sizes that are not finite
-  take the floor.
+  size of the stellar disk) and ``floor`` is the smallest size used. A size that is not finite
+  or negative is invalid: it is an error unless ``fallback`` gives the size [arcsec] such
+  galaxies take; :meth:`SizeSpec.n_invalid` counts them, so that a catalog can report how many
+  galaxies used the fallback (the floor is never a missing-data policy).
 
 In YAML / ``make_catalog(size=...)``::
 
     size: 0.3
     size: r50_disk_2d
-    size: {column: r50_disk_2d, unit: kpc, redshift_column: redshift_true, scale: 1.0, floor: 0.0}
+    size: {column: r50_disk_2d, unit: kpc, redshift_column: redshift_true, scale: 1.0, floor: 0.0, fallback: 0.3}
 """
 
 from __future__ import annotations
@@ -36,7 +38,8 @@ class SizeSpec:
     unit: str = "kpc"                   # unit of the column: proper kpc (converted with D_A) or arcsec
     redshift_column: str = "redshift_true"   # redshift of the kpc -> arcsec conversion
     scale: float = 1.0                  # multiplies the size of the column
-    floor: float = 0.0                  # smallest size [arcsec]; also used where the column is not finite
+    floor: float = 0.0                  # smallest size [arcsec]
+    fallback: float | None = None       # size [arcsec] of galaxies whose column is not finite or negative; None: an error
 
     def __post_init__(self):
         if (self.fixed is None) == (self.column is None):
@@ -47,11 +50,13 @@ class SizeSpec:
             raise ValueError(f"unit must be one of {SIZE_UNITS}")
         if self.scale <= 0 or self.floor < 0:
             raise ValueError("scale must be positive and floor >= 0")
+        if self.fallback is not None and not (np.isfinite(self.fallback) and self.fallback >= 0):
+            raise ValueError(f"fallback must be a finite size >= 0 arcsec or None, not {self.fallback}")
 
     @classmethod
     def parse(cls, spec) -> "SizeSpec":
         """A number (arcsec), a column name, or a dict with ``column`` (+ ``unit``, ``redshift_column``,
-        ``scale``, ``floor``) or ``fixed``."""
+        ``scale``, ``floor``, ``fallback``) or ``fixed``."""
         if isinstance(spec, SizeSpec):
             return spec
         if spec is None:
@@ -60,7 +65,7 @@ class SizeSpec:
             return cls(column=spec)
         if isinstance(spec, Mapping):
             d = dict(spec)
-            unknown = sorted(set(d) - {"fixed", "column", "unit", "redshift_column", "scale", "floor"})
+            unknown = sorted(set(d) - {"fixed", "column", "unit", "redshift_column", "scale", "floor", "fallback"})
             if unknown:
                 raise KeyError(f"unknown size options {unknown}")
             if "fixed" in d:
@@ -79,20 +84,59 @@ class SizeSpec:
             return []
         return [self.column] + ([self.redshift_column] if self.unit == "kpc" else [])
 
-    def angular_size(self, data: Mapping[str, np.ndarray] | None = None, cosmology=None):
-        """Angular half-light size [arcsec]: a float for a fixed size, else an ``(n,)`` array."""
+    def same_source(self, other: "SizeSpec") -> bool:
+        """Do the two specs read the size of a galaxy from the same quantity (column, unit and, for kpc,
+        the redshift column), whatever their ``scale``, ``floor`` and ``fallback``?"""
+        if self.is_fixed or other.is_fixed:
+            return False
+        same = self.column == other.column and self.unit == other.unit
+        return same and (self.unit != "kpc" or self.redshift_column == other.redshift_column)
+
+    def transform(self, raw):
+        """The angular size [arcsec] for a raw size ``raw`` in arcsec (the column converted to arcsec, before
+        ``scale`` and ``floor``): ``max(scale * raw, floor)``; a fixed size for a fixed spec."""
         if self.is_fixed:
-            return float(self.fixed)
+            return np.full_like(np.asarray(raw, dtype=np.float64), self.fixed)
+        return np.maximum(np.asarray(raw, dtype=np.float64) * self.scale, self.floor)
+
+    def _raw(self, data: Mapping[str, np.ndarray] | None, cosmology) -> np.ndarray:
+        """The column converted to arcsec (NaN where it is not finite or negative), before scale and floor."""
         if data is None:
             raise ValueError(f"the size comes from the column {self.column!r}: pass the data")
-        size = np.asarray(data[self.column], dtype=np.float64) * self.scale
+        size = np.asarray(data[self.column], dtype=np.float64)
         if self.unit == "kpc":
             if cosmology is None:
                 raise ValueError("a size in kpc needs the cosmology for the angular-diameter distance")
             z = np.asarray(data[self.redshift_column], dtype=np.float64)
             size = size * arcsec_per_kpc_proper(z, cosmology)
-        size = np.where(np.isfinite(size), size, self.floor)
-        return np.maximum(size, self.floor)
+        return np.where(np.isfinite(size) & (size >= 0), size, np.nan)
+
+    def n_invalid(self, data: Mapping[str, np.ndarray] | None = None, cosmology=None) -> int:
+        """Number of galaxies whose size is not finite or negative (0 for a fixed size)."""
+        if self.is_fixed:
+            return 0
+        return int(np.isnan(self._raw(data, cosmology)).sum())
+
+    def angular_size(self, data: Mapping[str, np.ndarray] | None = None, cosmology=None):
+        """Angular half-light size [arcsec]: a float for a fixed size, else an ``(n,)`` array.
+
+        A size that is not finite or negative raises ``ValueError`` unless ``fallback`` is set, in which
+        case the galaxy takes the fallback size (not the floor).
+        """
+        if self.is_fixed:
+            return float(self.fixed)
+        raw = self._raw(data, cosmology)
+        invalid = np.isnan(raw)
+        if invalid.any():
+            n_bad = int(invalid.sum())
+            if self.fallback is None:
+                raise ValueError(f"{n_bad:,} of {raw.size:,} galaxies have a size from {self.column!r} that is not finite "
+                                 f"or negative; give size={{'column': {self.column!r}, ..., 'fallback': <arcsec>}} to assign "
+                                 "them a size, or clean the column")
+        size = np.maximum(raw * self.scale, self.floor)
+        if invalid.any():
+            size = np.where(invalid, self.fallback, size)
+        return size
 
     def to_config(self):
         if self.is_fixed:
@@ -104,6 +148,8 @@ class SizeSpec:
             d["scale"] = float(self.scale)
         if self.floor != 0.0:
             d["floor"] = float(self.floor)
+        if self.fallback is not None:
+            d["fallback"] = float(self.fallback)
         return d
 
     def describe(self) -> str:
@@ -114,6 +160,8 @@ class SizeSpec:
             s = f"{self.scale:g} x " + s
         if self.floor > 0:
             s += f", at least {self.floor:g} arcsec"
+        if self.fallback is not None:
+            s += f", {self.fallback:g} arcsec where invalid"
         return s
 
     def __repr__(self):

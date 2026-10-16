@@ -10,7 +10,7 @@ from romanmock.roman import (
     WFI_GRISM_5SIGMA_R50_0P3,
     WFI_GRISM_SENSITIVITY_WAVE_ANGSTROM,
 )
-from romanmock.sensitivity import build_sensitivity, limits_contained, nominal_flux_limit, nominal_secondary_limit
+from romanmock.sensitivity import CONTAINMENT_SIZES_ARCSEC, build_sensitivity, limits_contained, nominal_flux_limit, nominal_secondary_limit
 from romanmock.sizes import arcsec_per_kpc_proper
 
 WAVE = np.array(WFI_GRISM_SENSITIVITY_WAVE_ANGSTROM)
@@ -78,13 +78,23 @@ def test_size_spec(cosmo):
     with pytest.raises(KeyError):
         SizeSpec.parse({"column": "r50", "units": "kpc"})
     z = np.array([0.5, 1.5, 2.5])
-    data = {"r50_disk_2d": np.array([2.0, np.nan, 4.0]), "redshift_true": z}
+    data = {"r50_disk_2d": np.array([2.0, 3.0, 4.0]), "redshift_true": z}
     size = spec.angular_size(data, cosmo)
-    expected = np.array([2.0, 0.0, 4.0]) * arcsec_per_kpc_proper(z, cosmo)
+    expected = np.array([2.0, 3.0, 4.0]) * arcsec_per_kpc_proper(z, cosmo)
     np.testing.assert_allclose(size, expected)
     assert 0.2 < size[0] < 0.4                                           # 2 kpc at z = 0.5 is about 0.3"
     floor = SizeSpec.parse({"column": "r50_disk_2d", "scale": 2.0, "floor": 0.1}).angular_size(data, cosmo)
     np.testing.assert_allclose(floor, np.maximum(2 * expected, 0.1))
+    # an invalid size (not finite, negative) is an error, or takes the fallback, never the floor
+    bad = {"r50_disk_2d": np.array([2.0, np.nan, -1.0, np.inf]), "redshift_true": np.full(4, 0.5)}
+    with pytest.raises(ValueError, match="3 of 4 galaxies"):
+        spec.angular_size(bad, cosmo)
+    assert spec.n_invalid(bad, cosmo) == 3 and spec.n_invalid(data, cosmo) == 0
+    fb = SizeSpec.parse({"column": "r50_disk_2d", "floor": 0.1, "fallback": 0.3})
+    np.testing.assert_allclose(fb.angular_size(bad, cosmo), [size[0], 0.3, 0.3, 0.3])
+    assert fb.fallback == 0.3 and SizeSpec.parse(fb.to_config()) == fb and "0.3 arcsec where invalid" in fb.describe()
+    with pytest.raises(ValueError):
+        SizeSpec.parse({"column": "r50_disk_2d", "fallback": -0.3})
     # a fixed size ignores the data; a column spec needs them
     assert SizeSpec.parse(0.0).angular_size() == 0.0
     with pytest.raises(ValueError):
@@ -109,7 +119,8 @@ def test_two_tier_snr_rule_with_sizes(cosmo):
     flux[2, ha], flux[2, oiii] = 0.9 * f5[2, ha], 0.9 * f5[2, oiii]       # S/N 4.5 + 4.5: nothing
     flux[3, ha], flux[3, oiii] = 1.2 * f5[3, ha], 0.3 * f5[3, oiii]       # S/N 6 + 1.5: single line
     flux[4] = flux[1]                                                     # same fluxes, a 1" galaxy: fainter than its noise
-    flux[5] = np.where(np.isfinite(f5[1]), flux[1] * f5[5] / f5[1], 0.0)   # scaled to its own noise: multi-line again
+    with np.errstate(invalid="ignore"):
+        flux[5] = np.where(np.isfinite(f5[1]), flux[1] * f5[5] / f5[1], 0.0)   # scaled to its own noise: multi-line again
     det = detect_lines(flux, z, ROMAN_TRANSITIONS, ThresholdDetection(s), size=size)
     np.testing.assert_array_equal(det.n_det, [1, 2, 0, 1, 0, 2])
     np.testing.assert_allclose(det.snr[1, [ha, oiii]], [6.0, 2.5])
@@ -165,6 +176,43 @@ def test_config_roundtrip_and_containment():
     # a fixed-size base keeps its size: the point-source base contains the 0.3" request, not the reverse
     assert limits_contained(ConstantFluxLimit(1e-16), RomanGrismSensitivity(size=0.0))[0] is None
     assert limits_contained(ConstantFluxLimit(1e-16), RomanGrismSensitivity(size=0.3))[0] is not None
+
+
+def test_containment_compares_the_same_galaxy():
+    """Two size specs that assign different sizes to the same galaxy are compared for that galaxy
+    (review of 2026-10-16): a smaller scale or floor than the base is deeper and refused."""
+    R = RomanGrismSensitivity
+    col = lambda **kw: R(size={"column": "r", "unit": "arcsec", **kw})
+    msg, ratio = limits_contained(col(scale=0.5), col(scale=1.0))
+    assert msg is not None and "deeper" in msg and "in the base catalog" in msg and ratio < 1
+    assert limits_contained(col(scale=1.0), col(scale=0.5))[0] is None
+    assert limits_contained(col(scale=2.0), col())[0] is None
+    assert "deeper" in limits_contained(col(floor=0.0), col(floor=0.2))[0]
+    assert limits_contained(col(floor=0.2), col(floor=0.0))[0] is None
+    assert limits_contained(col(), col())[0] is None
+    # the galaxy of the reviewer's example: 0.6" in the base, 0.3" requested
+    wave, data = np.array([15000.0]), {"r": np.array([0.6])}
+    base, req = col(scale=1.0), col(scale=0.5)
+    assert base.flux_limit(wave, base.angular_size(data))[0] > req.flux_limit(wave, req.angular_size(data))[0]
+    # sizes read from different quantities cannot be compared
+    msg, _ = limits_contained(R(size="r50_bulge_2d"), R(size="r50_disk_2d"))
+    assert "cannot be compared" in msg
+    msg, _ = limits_contained(R(size={"column": "r", "unit": "arcsec"}), R(size={"column": "r", "unit": "kpc"}))
+    assert "cannot be compared" in msg
+    msg, _ = limits_contained(R(size={"column": "r", "redshift_column": "redshift_rsd"}), R(size="r"))
+    assert "cannot be compared" in msg
+    # a smaller exponent is deeper for large galaxies, beyond any finite grid
+    msg, _ = limits_contained(R(size="r", size_exponent=0.25, snr=15.0), R(size="r", size_exponent=0.5))
+    assert "size_exponent" in msg
+    assert limits_contained(R(size="r", size_exponent=0.75, snr=5.0), R(size="r", size_exponent=0.5))[0] is not None
+    assert limits_contained(R(size="r", size_exponent=0.75, snr=6.0), R(size="r", size_exponent=0.5))[0] is None   # the p = 0.75 curve is deeper between the two tabulated sizes
+    # a column request against a fixed-size base: only the point-source base contains every galaxy
+    assert limits_contained(R(size="r"), R(size=0.0))[0] is None
+    assert "point" not in limits_contained(R(size="r"), R(size=0.3))[0]
+    assert "in the base catalog" in limits_contained(R(size=0.3), R(size="r"))[0]
+    # the grid reaches the largest disks of the mock (80 kpc, tens of arcsec)
+    assert max(CONTAINMENT_SIZES_ARCSEC) >= 30.0
+    assert "deeper" in limits_contained(R(size="r"), R(size=1.0))[0]
 
 
 def test_pipeline_arrays_with_size_column(synthetic, cosmo):

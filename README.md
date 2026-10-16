@@ -285,16 +285,24 @@ sensitivity:
   type: roman_grism
   snr: 5.0
   secondary_snr: 2.0            # null: single tier
-  size: r50_disk_2d             # or 0.3 (arcsec); full form {column: r50_disk_2d, unit: kpc, redshift_column: redshift_true, scale: 1.0, floor: 0.0}
+  size: r50_disk_2d             # or 0.3 (arcsec); full form {column: r50_disk_2d, unit: kpc, redshift_column: redshift_true, scale: 1.0, floor: 0.0, fallback: null}
   exposure_time: 3600.0
   background: 2.0
 output:
   store_snr: true               # <line>_snr: the S/N of every line
 ```
 
+A galaxy whose size is not finite or negative is an error unless `fallback` gives the size [arcsec] it takes; the
+catalog reports how many galaxies used it (`cat.info["n_fallback_size"]`). The floor is a smallest size, not a
+missing-data policy.
+
 A base catalog contains a later selection when its primary limits are nowhere deeper (checked on a grid of
-wavelengths and sizes, `sensitivity.limits_contained`); a base built at a constant 1e-17 or with `size: 0` serves
-every later choice. The S/N route is explained in `RomanMock_SNR_Sensitivity_Note.md` of the project directory.
+wavelengths and, for sizes read from a column, of raw sizes of the same galaxy through each model's `scale` and
+`floor`; `sensitivity.limits_contained`). A base and a request that read the size from different columns cannot be
+compared and are refused, as is a `size_exponent` below the base one. A base built at a constant 1e-17 or with
+`size: 0` serves every later choice. A noisy detection model (`detection: {type: gaussian_noise}`) scatters
+galaxies across the limit, so `make_catalog` and the pipeline warn when the base is less than 1.5 times deeper than
+the requested limit. The S/N route is explained in `RomanMock_SNR_Sensitivity_Note.md` of the project directory.
 
 ### Line features and bit ordering
 
