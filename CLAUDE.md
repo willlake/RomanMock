@@ -1,6 +1,6 @@
 # CLAUDE.md — romanmock
 
-Roman-like emission-line spectroscopic mock built from a diffsky lightcone (version 0.3.0). The design
+Roman-like emission-line spectroscopic mock built from a diffsky lightcone (version 0.4.0). The design
 follows `/global/u2/w/willlake/Projects/Roman/RomanMock/Roman_Mock_Plan_and_Comments.pdf`
 (read it before changing the physics). README.md documents the user-facing behaviour; keep both files
 in step with the code.
@@ -41,6 +41,33 @@ in step with the code.
 - Properties of the mock that show up in results: [O III] 5007/4959 ≈ 3.04 and [S III] 9532/9069 ≈ 2.53 are
   nearly fixed, Hα/Hβ has a median of 4.0; Hα is almost always the brightest line where it is in the bandpass.
 
+### Galacticus mocks (added 2026-10-15)
+
+- `/global/cfs/cdirs/m4943/Galacticus/mockCatalogs/GP-MCMC-Calibration1_allUNIT_16sqDegMock_XMM-LSS/galaxyCatalogs/`:
+  400 files `romanUNIT-d<a>_<b>_16sqDeg.hdf5` (random subsamples of the merger trees, each covering the whole 4° × 4°
+  lightcone; 431 GB, 38.5 M galaxies, z 0.006–9.0, 7–135 k rows per file), read with plain h5py (`romanmock.galacticus`).
+  Line datasets are contiguous and uncompressed (all 51 dust-attenuated line columns of a file read in 0.15 s); the
+  cost is CFS latency per file, so `n_workers` (processes) helps little on a login node: 400 files take ~3 min for a
+  few columns, 4 min for the flux distribution of 16 features with 6 workers.
+- `/Lightcone/Output1/nodeData` (dust-free, `wavelength` attribute = air wavelength, `luminosity...` in erg/s) and
+  `/Lightcone/Output1/dustAttenuatedNodeData` (same names, no attributes; the dust metadata are attributes of the
+  group). A line is the sum of `luminosityEmissionLine{Disk,Spheroid,AGN}:<line>`; AGN and spheroid are usually
+  negligible (median 1e-5 and 2e-4 of Hα) but dominate in 0.7 % of the galaxies. 70 % of the galaxies have no line
+  attenuation at all (the dust model depends on stellar mass: median ratio 1.0 below 1e9 Msun, 0.47 at 1e9–1e10).
+- `nodeSubsamplingWeight` is 1 everywhere (no weights); `angularWeight` is a constant 15.99 (meaning unclear, unused).
+  The sky area is `angularSize**2` = 16 deg² (`Parameters/geometryLightcone`; RA 33.4–38.0, Dec −7.1 to −2.4, roll
+  −10°); the Readme's `rightAscension`/`declination` are in `nodeData`.
+- Cosmology `Parameters/cosmologyParameters`: H0 67.74, Ω_m 0.3089, Ω_b 0.0462, T_CMB 2.72548. The positions follow
+  `FlatLambdaCDM(H0=67.74, Om0=0.3089)` *without* radiation (2e-5), as the Readme says; with `Tcmb0` the distances are
+  off by 2e-4. `cosmology_from_header` therefore leaves `Tcmb0` at 0.
+- `GALACTICUS_TRANSITIONS` (`galacticus_transitions`) is a `LineSet` whose components are Galacticus line names; its
+  first seven features carry the `roman_transitions` names so `plotting.FEATURE_COLORS` / `FEATURE_LABELS` apply.
+  `KNOWN_LINE_WAVELENGTHS` (diffsky + Galacticus names) is what `LineSet` uses for component wavelengths.
+- The Galacticus mock is much deeper than diffsky (median M* 5e7 Msun, median Hα flux at z 1–1.5 of 2.5e-18 against
+  3–5e-17): fractions above a threshold are not comparable between the mocks, counts per deg² are.
+- Products go to `/global/cfs/cdirs/m4943/Simulations/RomanMocks/GP-MCMC-Calibration1_allUNIT_16sqDegMock_XMM-LSS/`
+  (`census/flux_distribution.npz`, z 0–4 in 0.01, from `romanmock galacticus-flux-distribution`). Notebook 07.
+
 ## Layout
 
 | Module | Role |
@@ -48,7 +75,8 @@ in step with the code.
 | `roman.py` | defaults: grism range 10000–19300 Å, primary limit 1.0e-16, secondary limit 4.0e-17, S/N at limit 6.5 |
 | `lines.py` | `LineFeature`/`LineSet`, presets, bit ordering (bit i = feature i, uint32) |
 | `cosmology.py`, `fluxes.py` | erg/s → erg/s/cm² via the OpenCosmo header cosmology (astropy or dsps backend) |
-| `sensitivity.py` | `SensitivityModel` + `DetectionModel` protocols and registries; two-tier rule (`apply_two_tier`) |
+| `sensitivity.py` | `SensitivityModel` + `DetectionModel` protocols and registries; two-tier rule (`apply_two_tier`); `RomanGrismSensitivity` (`type: roman_grism`, S/N thresholds, WFI grism tables vs wavelength and size); `limits_contained`, `nominal_flux_limit` |
+| `sizes.py` | `SizeSpec`: angular size of a galaxy, a number in arcsec or a column in proper kpc converted at `redshift_true` |
 | `detection.py` | `detect_lines`, `pack_bitmask`, `popcount`, `DetectionResult` |
 | `confusion.py` | `ConfusionMatrix` (fail column), `WavelengthBinnedConfusion`, `LineFractionTable` (`type: empirical`: the line mix of the single-line galaxies per observed wavelength and flux rank), `DEFAULT_CONFUSION_ROWS`, `build_confusion` |
 | `redshift.py` | `assign_redshifts`, `IdOutcome` codes, `MultiLineModel` hook |
@@ -59,13 +87,14 @@ in step with the code.
 | `randoms.py` | `make_random`: randoms of a `Catalog` for `which` = all / galaxies / interlopers; redshifts drawn from the data |
 | `catalog.py` | `BaseCatalog.make_catalog` -> `Catalog`: step 2 in memory from the base catalog (the everyday route), `Catalog.write/read`; `BaseCatalog.line_fractions` scans it for the `LineFractionTable` |
 | `reference_dndz.py` | Wang et al. (2022) Tables 1–2 with uncertainties |
-| `fluxdist.py` | `flux_distribution` / `FluxDistribution`: log-flux histograms of every galaxy per line and redshift bin, no cut; quantiles, fraction above a threshold |
+| `fluxdist.py` | `flux_distribution` / `FluxDistribution`: log-flux histograms of every galaxy per line and redshift bin, no cut; quantiles, fraction above a threshold, `rebin(step)` to merge redshift bins |
+| `galacticus.py` | `GalacticusMock`: the Galacticus lightcone mocks of the GRS-PIT (`read`, `iter_files`, `read_fluxes`, `flux_distribution`), plain h5py, no OpenCosmo; `resolve_column`, `read_file`, `air_to_vacuum` |
 | `census.py` | `line_census` / `LineCensus`: dN/dz of emitters above flux limits, single/multi-line, no confusion |
 | `diagnostics.py`, `plotting.py` | checks (confusion, contamination, completeness, dN/dz); notebook plot style |
 | `config.py`, `cli.py`, `io.py` | YAML config dataclasses, CLI, OpenCosmo I/O, manifests, index compression, memory budget |
 
-CLI commands: `info`, `lines`, `example-config`, `run`, `base`, `census`, `flux-distribution`, `catalog`, `line-fractions`,
-`random`, `assign`, `summary`, `select`, `compress-index`.
+CLI commands: `info`, `lines`, `example-config`, `run`, `base`, `census`, `flux-distribution`, `galacticus-flux-distribution`,
+`catalog`, `line-fractions`, `random`, `assign`, `summary`, `select`, `compress-index`.
 Scripts: `production.sh` (sbatch: base catalog + census from `configs/production.yaml`), `run_slices.sh` (job array
 for `run`), `example_analysis.py`.
 
@@ -105,6 +134,28 @@ General:
   (`romanmock line-fractions` writes it); it does not build the table itself.
 
 Detection (two-tier since 0.3.0):
+
+- Two ways of fixing the thresholds (the user's decision, 2026-10-15): flux limits (`type: constant`,
+  `make_catalog(flux_limit, secondary_flux_limit)`, kept as is) or S/N (`type: roman_grism`,
+  `make_catalog(snr=5, secondary_snr=2, size=...)`). In the S/N route a galaxy needs one line with S/N >= 5, its other
+  lines are detected at S/N >= 2; one detected line = single-line galaxy, primary + secondary lines = multi-line.
+  Noise: the 5-sigma line limits of the NASA WFI technical page (grism, v1.4; `roman.py`) for a point source and
+  r50 = 0.3" at ten wavelengths, 1 h, 2 x min zodi; `F_5sigma(lambda, r) = F_pt(lambda) (1 + (r/r_c)^2)^p (t/1h)^-1/2 (b/2)^1/2`,
+  `r_c(lambda)` fixed by the two rows (0.12-0.14"), `p = size_exponent` 0.5; S/N = 5 F / F_5sigma. Sizes above 0.3"
+  are an extrapolation. `snr=6.5, size=0.3` gives 1.05e-16 at 1.5 um, the old baseline.
+- Sizes (`sizes.SizeSpec`): a number (arcsec, 0 = point source) or a column (`r50_disk_2d`, proper kpc, converted with
+  `arcsec_per_kpc_proper(redshift_true)`; `scale`, `floor`, NaN -> floor). `detect_lines(size=)` broadcasts an `(n,)`
+  array against `(n, n_features)`; `primary_flux_limit` / `secondary_flux_limit` forward sizes only to a model that
+  takes them from a column (`needs_size`), so a fixed-size model keeps its size (matters for `limits_contained`).
+  `RomanMockPipeline.base_columns` = `base.columns` + the size columns: a base built with a size column stores it;
+  `make_catalog(size="r50_disk_2d")` needs `r50_disk_2d` in `base.columns` (production.yaml lists it since
+  2026-10-15; the production base must be rebuilt once). Workers get the `SizeSpec` and the cosmology
+  (`BaseCatalog.cosmology`, from the first base file) in their spec.
+- Containment of a selection in the base catalog is `sensitivity.limits_contained(requested, base)`: primary limits
+  on a wavelength grid and, when a model takes sizes from the catalog, a size grid (0-2"). `cat.settings` carries
+  `sensitivity` (the config) plus nominal `flux_limit` / `secondary_flux_limit` (1.5 um, size 0.3" for a column);
+  the Wang et al. lookup then needs an explicit `flux_limit` in `downsample`. `_check_table` compares the
+  sensitivity configs. Note of the implementation: `Projects/Roman/RomanMock/RomanMock_SNR_Sensitivity_Note.md`.
 
 - A galaxy needs one line above the primary limit (`flux_limit`, default 1.0e-16) inside the bandpass; its other
   lines are then detected above `secondary_flux_limit` (default 4.0e-17, `null` = off, must not exceed the primary
@@ -291,11 +342,12 @@ mock has 203 M galaxies with a line in 0.5 < z < 3.0 (74 % of all), against 59 M
 ## Working style
 
 - Plots (notebooks) use `romanmock.plotting` (fixed categorical order, single axis, thin marks).
-- `notebooks/` holds six production examples (01 dN/dz and flux limits, 02 catalog, 03 randoms, 04 line fluxes of the
+- `notebooks/` holds seven production examples (01 dN/dz and flux limits, 02 catalog, 03 randoms, 04 line fluxes of the
   whole mock: quantiles, fractions above thresholds, companion lines; explains 01; 05 single-line galaxies of the base
   catalog against observed wavelength: 0–90/90–99.9 % flux quantiles and the stacked line mix above a threshold per 775 Å
   range, lines under 1 % in every range dropped; in the mock they are 92 % Hα because of the fixed line ratios; 06 stacked single-line/multi-line composition of the
-  detected galaxies by line combination against redshift), edited as
+  detected galaxies by line combination against redshift; 07 = 04 for the Galacticus mock, with the diffsky mock and
+  Wang et al. 2022 alongside, added 2026-10-15), edited as
   notebooks; there is no generator. The ten earlier tutorials and their generator were moved by the user to
   `~/Projects/Roman/RomanMock/Notebooks/` (2026-09-28). Keep notebooks minimal: only what is needed for the task.
 - `configs/roman_grism_baseline.yaml` is the commented template for every config block; keep it complete (it was

@@ -33,6 +33,18 @@ def test_quantiles_and_fractions_match_direct(synthetic, cosmo):
     assert np.isnan(d.fraction_above("Ha", 1e-16)[d.n_gal == 0]).all() if (d.n_gal == 0).any() else True
 
 
+def test_rebin(synthetic, cosmo):
+    fine = np.round(np.arange(0.0, 4.0 + 1e-9, 0.1), 6)
+    parts = flux_histograms(synthetic, ROMAN_TRANSITIONS, cosmo, fine, LOGF_EDGES)
+    d = FluxDistribution.empty(fine, LOGF_EDGES, ROMAN_TRANSITIONS).add(*parts, step=1)
+    r = d.rebin(5)
+    np.testing.assert_allclose(r.z_edges, [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0])
+    assert r.n_gal.sum() == d.n_gal.sum() and r.counts.sum() == d.counts.sum() and r.counts.shape == (len(ROMAN_TRANSITIONS), 8, LOGF_EDGES.size - 1)
+    for j in range(8):
+        assert np.nan_to_num(r.number_above("Ha", 1e-16)[j]) == pytest.approx(np.nansum(d.number_above("Ha", 1e-16)[5 * j:5 * j + 5]), rel=1e-9)
+    assert d.rebin(3).z_edges.size == 14          # 39 bins kept, the 40th dropped
+
+
 def test_save_load(synthetic, cosmo, tmp_path):
     parts = flux_histograms(synthetic, ROMAN_TRANSITIONS, cosmo, Z_EDGES, LOGF_EDGES)
     d = FluxDistribution.empty(Z_EDGES, LOGF_EDGES, ROMAN_TRANSITIONS).add(*parts, step=3)

@@ -22,9 +22,11 @@ from .fluxes import luminosity_to_flux, feature_fluxes, add_line_fluxes
 from .sensitivity import (
     ConstantFluxLimit,
     TabulatedFluxLimit,
+    RomanGrismSensitivity,
     ThresholdDetection,
     GaussianNoiseDetection,
 )
+from .sizes import SizeSpec
 from .detection import detect_lines, DetectionResult, pack_bitmask, unpack_bitmask, popcount
 from .confusion import ConfusionMatrix, WavelengthBinnedConfusion, LineFractionTable, FAIL
 from .redshift import assign_redshifts, IdOutcome, RedshiftAssignment
@@ -51,6 +53,8 @@ __all__ = [
     "add_line_fluxes",
     "ConstantFluxLimit",
     "TabulatedFluxLimit",
+    "RomanGrismSensitivity",
+    "SizeSpec",
     "ThresholdDetection",
     "GaussianNoiseDetection",
     "detect_lines",

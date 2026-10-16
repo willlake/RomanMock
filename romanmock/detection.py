@@ -75,6 +75,7 @@ def detect_lines(
     detection_model: DetectionModel | None = None,
     rng: np.random.Generator | None = None,
     component_flux: dict | None = None,
+    size=None,
 ) -> DetectionResult:
     """Apply the detection model to feature fluxes and build the bitmask.
 
@@ -93,6 +94,11 @@ def detect_lines(
     component_flux : dict, optional
         ``{luminosity column: (n,) flux}`` from :func:`romanmock.fluxes.component_fluxes`;
         required when the line set has separated multi-component features.
+    size : float or (n,) array, optional
+        Angular half-light size of each galaxy [arcsec], for sensitivity models that depend
+        on it (:class:`~romanmock.sensitivity.RomanGrismSensitivity` with a size column;
+        ``model.sensitivity.angular_size(data, cosmology)`` computes it). Ignored by the
+        other models.
     """
     line_set = get_line_set(line_set)
     flux = np.asarray(flux, dtype=np.float64)
@@ -102,9 +108,19 @@ def detect_lines(
     rng = rng if rng is not None else np.random.default_rng()
     z_rsd = np.asarray(z_rsd, dtype=np.float64)
     wave_obs = observed_wavelength(line_set.rest_waves, z_rsd)
+    kw = {}
+    if size is not None:
+        size = np.asarray(size, dtype=np.float64)
+        if size.ndim == 1:
+            if size.shape[0] != flux.shape[0]:
+                raise ValueError(f"size must have one value per galaxy ({flux.shape[0]}); got {size.shape}")
+            size = size[:, None]                       # broadcasts against (n, n_features) wavelengths
+        elif size.ndim != 0:
+            raise ValueError("size is a number or an (n,) array")
+        kw["size"] = size
 
     if not line_set.has_separated_components:
-        det: Detection = model.detect(flux, wave_obs, rng)
+        det: Detection = model.detect(flux, wave_obs, rng, **kw)
         detected, flux_measured, snr = det.detected, det.flux_measured, det.snr
         primary = det.primary if det.primary is not None else detected
     else:
@@ -125,7 +141,7 @@ def detect_lines(
         owner = np.asarray(owner)
         f_cols = np.stack(cols, axis=1)
         w_cols = observed_wavelength(np.asarray(waves), z_rsd)
-        det = model.detect(f_cols, w_cols, rng)
+        det = model.detect(f_cols, w_cols, rng, **kw)
         n, nf = flux.shape
         detected = np.zeros((n, nf), dtype=bool)
         primary = np.zeros((n, nf), dtype=bool)

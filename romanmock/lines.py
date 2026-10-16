@@ -34,6 +34,33 @@ DIFFSKY_LINE_WAVELENGTHS: dict[str, float] = {
     "S_III_9532": 9533.378,
 }
 
+# Vacuum rest-frame wavelengths (Angstrom) of the 17 Galacticus emission lines of the Roman
+# GRS-PIT mocks (``luminosityEmissionLine<Component>:<name>``). Galacticus stores the air
+# wavelength in the ``wavelength`` attribute of the dust-free datasets; these are those values
+# converted to vacuum with the IAU (Morton 1991) formula, see ``galacticus.air_to_vacuum``.
+GALACTICUS_LINE_WAVELENGTHS: dict[str, float] = {
+    "balmerAlpha6565": 6564.631,
+    "balmerBeta4863": 4862.693,
+    "balmerGamma4342": 4341.683,
+    "balmerDelta4103": 4102.897,
+    "nitrogenII6550": 6549.867,
+    "nitrogenII6585": 6585.262,
+    "oxygenII3727": 3727.087,
+    "oxygenII3730": 3729.878,
+    "oxygenIII4933": 4932.609,
+    "oxygenIII4960": 4960.282,
+    "oxygenIII5008": 5008.248,
+    "paschenAlpha18756": 18756.126,
+    "paschenBeta12822": 12821.590,
+    "sulfurII6718": 6718.299,
+    "sulfurII6733": 6732.689,
+    "sulfurIII9071": 9071.086,
+    "sulfurIII9533": 9533.231,
+}
+
+#: Rest wavelength of every known component column (diffsky and Galacticus names).
+KNOWN_LINE_WAVELENGTHS: dict[str, float] = {**DIFFSKY_LINE_WAVELENGTHS, **GALACTICUS_LINE_WAVELENGTHS}
+
 MAX_FEATURES = 32  # bitmask is stored as uint32
 
 
@@ -95,9 +122,9 @@ class LineFeature:
             comps = [comps]
         rest_wave = d.get("rest_wave")
         if rest_wave is None:
-            if len(comps) != 1 or comps[0] not in DIFFSKY_LINE_WAVELENGTHS:
+            if len(comps) != 1 or comps[0] not in KNOWN_LINE_WAVELENGTHS:
                 raise ValueError(f"rest_wave must be given for feature {d['name']!r}")
-            rest_wave = DIFFSKY_LINE_WAVELENGTHS[comps[0]]
+            rest_wave = KNOWN_LINE_WAVELENGTHS[comps[0]]
         return cls(d["name"], float(rest_wave), tuple(comps), d.get("label", ""), bool(d.get("blend", False)))
 
 
@@ -124,7 +151,7 @@ class LineSet:
         self._component_waves = {}
         for f in features:
             for c in f.components:
-                w = DIFFSKY_LINE_WAVELENGTHS.get(c, f.rest_wave if len(f.components) == 1 else None)
+                w = KNOWN_LINE_WAVELENGTHS.get(c, f.rest_wave if len(f.components) == 1 else None)
                 if w is None:
                     raise ValueError(f"unknown rest wavelength for component {c!r} of feature {f.name!r}")
                 self._component_waves[c] = float(w)
@@ -284,10 +311,45 @@ ALL_TRANSITIONS = LineSet(
     name="all_transitions",
 )
 
+
+def _g(col):
+    return GALACTICUS_LINE_WAVELENGTHS[col]
+
+
+_GALACTICUS_OII_BLEND_WAVE = 0.5 * (_g("oxygenII3727") + _g("oxygenII3730"))
+
+#: The 17 Galacticus lines as Roman-resolvable transitions ([O II] doublet blended), for the
+#: Galacticus mocks read by :mod:`romanmock.galacticus`. The first seven features carry the
+#: names of ``roman_transitions`` (same colours and labels in the notebooks); the rest are the
+#: lines Galacticus has and diffsky does not. Each component is the dust-attenuated
+#: disk + spheroid + AGN luminosity of the line (summed by the reader).
+GALACTICUS_TRANSITIONS = LineSet(
+    [
+        LineFeature("Ha", _g("balmerAlpha6565"), ("balmerAlpha6565",), "H-alpha 6563"),
+        LineFeature("Hb", _g("balmerBeta4863"), ("balmerBeta4863",), "H-beta 4861"),
+        LineFeature("OIII_5007", _g("oxygenIII5008"), ("oxygenIII5008",), "[O III] 5007"),
+        LineFeature("OIII_4959", _g("oxygenIII4960"), ("oxygenIII4960",), "[O III] 4959"),
+        LineFeature("OII_3727", _GALACTICUS_OII_BLEND_WAVE, ("oxygenII3727", "oxygenII3730"), "[O II] 3726+3729 blend", blend=True),
+        LineFeature("SIII_9532", _g("sulfurIII9533"), ("sulfurIII9533",), "[S III] 9532"),
+        LineFeature("SIII_9069", _g("sulfurIII9071"), ("sulfurIII9071",), "[S III] 9069"),
+        LineFeature("NII_6585", _g("nitrogenII6585"), ("nitrogenII6585",), "[N II] 6585"),
+        LineFeature("NII_6550", _g("nitrogenII6550"), ("nitrogenII6550",), "[N II] 6550"),
+        LineFeature("SII_6718", _g("sulfurII6718"), ("sulfurII6718",), "[S II] 6718"),
+        LineFeature("SII_6733", _g("sulfurII6733"), ("sulfurII6733",), "[S II] 6733"),
+        LineFeature("Hg", _g("balmerGamma4342"), ("balmerGamma4342",), "H-gamma 4341"),
+        LineFeature("Hd", _g("balmerDelta4103"), ("balmerDelta4103",), "H-delta 4102"),
+        LineFeature("PaB", _g("paschenBeta12822"), ("paschenBeta12822",), "Paschen-beta 12822"),
+        LineFeature("PaA", _g("paschenAlpha18756"), ("paschenAlpha18756",), "Paschen-alpha 18756"),
+        LineFeature("OIII_4933", _g("oxygenIII4933"), ("oxygenIII4933",), "[O III] 4932"),
+    ],
+    name="galacticus_transitions",
+)
+
 LINE_SET_PRESETS: dict[str, LineSet] = {
     "roman_transitions": ROMAN_TRANSITIONS,
     "plan_species": PLAN_SPECIES,
     "all_transitions": ALL_TRANSITIONS,
+    "galacticus_transitions": GALACTICUS_TRANSITIONS,
 }
 
 DEFAULT_LINE_SET = "roman_transitions"

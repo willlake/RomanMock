@@ -27,6 +27,24 @@ FEATURE_COLORS = {
     "SIII_9069": CATEGORICAL[6],
     "OIII_4363": CATEGORICAL[7],
     "SIII_6312": TEXT_SECONDARY,
+    # lines of the Galacticus mocks that diffsky does not have
+    "NII_6585": "#8c6d31",
+    "NII_6550": "#bd9e39",
+    "SII_6718": "#7b4173",
+    "SII_6733": "#a55194",
+    "Hg": "#637939",
+    "Hd": "#8ca252",
+    "PaB": "#843c39",
+    "PaA": "#ad494a",
+    "OIII_4933": "#9c9ede",
+}
+
+#: Display labels of the line features used in the notebooks.
+FEATURE_LABELS = {
+    "Ha": "Hα", "Hb": "Hβ", "Hg": "Hγ", "Hd": "Hδ", "PaA": "Paα", "PaB": "Paβ",
+    "OIII_5007": "[O III] λ5007", "OIII_4959": "[O III] λ4959", "OIII_4363": "[O III] λ4363", "OIII_4933": "[O III] λ4932",
+    "OII_3727": "[O II] λ3727", "SIII_9532": "[S III] λ9532", "SIII_9069": "[S III] λ9069", "SIII_6312": "[S III] λ6312",
+    "NII_6585": "[N II] λ6585", "NII_6550": "[N II] λ6550", "SII_6718": "[S II] λ6718", "SII_6733": "[S II] λ6733",
 }
 
 OUTCOME_COLORS = {
@@ -40,6 +58,10 @@ OUTCOME_COLORS = {
 
 def feature_color(name: str) -> str:
     return FEATURE_COLORS.get(name, TEXT_SECONDARY)
+
+
+def feature_label(name: str) -> str:
+    return FEATURE_LABELS.get(name, name)
 
 
 def use_style():

@@ -104,7 +104,7 @@ def cmd_base(args):
     outputs = pipe.build_base(files=args.files, steps=args.steps, z_min=args.z_min, z_max=args.z_max,
                               verbose=not args.quiet, n_workers=_n_workers(args))
     print(f"[romanmock] base catalog: {len(outputs)} file(s) in {cfg.base.dir} "
-          f"(limits {pipe.sensitivity}; columns {cfg.base.columns} + redshift_rsd + line fluxes)")
+          f"(limits {pipe.sensitivity}; columns {pipe.base_columns} + redshift_rsd + line fluxes)")
 
 
 def cmd_assign(args):
@@ -140,6 +140,40 @@ def cmd_assign(args):
     print(f"[romanmock] effective configuration: {effective}  (use it for `romanmock select` / `romanmock summary`)")
 
 
+def _sensitivity_args(args) -> dict:
+    """The two ways of fixing the detection thresholds of `romanmock catalog` / `line-fractions`:
+    flux limits (--flux-limit, --secondary-flux-limit) or S/N thresholds (--snr, --secondary-snr, with
+    --size, --exposure-time, --background); make_catalog refuses a mix."""
+    out = {}
+    if args.flux_limit is not None:
+        out["flux_limit"] = args.flux_limit
+    if args.secondary_flux_limit is not None:
+        out["secondary_flux_limit"] = None if args.secondary_flux_limit <= 0 else args.secondary_flux_limit
+    for name in ("snr", "exposure_time", "background"):
+        if getattr(args, name) is not None:
+            out[name] = getattr(args, name)
+    if args.secondary_snr is not None:
+        out["secondary_snr"] = None if args.secondary_snr <= 0 else args.secondary_snr
+    if args.size is not None:
+        try:
+            out["size"] = float(args.size)
+        except ValueError:
+            out["size"] = args.size                       # a column of the base catalog, e.g. r50_disk_2d
+    return out
+
+
+def _add_sensitivity_options(s, what: str):
+    s.add_argument("--flux-limit", type=float, help=f"primary flux limit [erg/s/cm^2] of {what} (default: the base catalog's)")
+    s.add_argument("--secondary-flux-limit", type=float, help="limit for the other lines (default 4e-17; 0 = no second tier)")
+    s.add_argument("--snr", type=float, help="instead of flux limits: a galaxy needs a line with S/N >= this (5) in the Roman "
+                                             "grism model (NASA WFI technical page: wavelength, source size, exposure, background)")
+    s.add_argument("--secondary-snr", type=float, help="S/N of the other lines of such a galaxy (default 2; 0 = no second tier)")
+    s.add_argument("--size", help="angular size of the galaxies for the S/N: arcsec (default 0.3; 0 = point source) or a "
+                                  "column of the base catalog in proper kpc, e.g. r50_disk_2d")
+    s.add_argument("--exposure-time", type=float, help="exposure time [s] of the S/N model (default 3600)")
+    s.add_argument("--background", type=float, help="background in units of the minimum zodiacal light (default 2; HLWAS ~1.4)")
+
+
 def cmd_catalog(args):
     """Step 2 in one call: a catalog with the given settings from the base catalog, written to a file."""
     _jax_platform(args)
@@ -159,13 +193,12 @@ def cmd_catalog(args):
         confusion = confusion.get("confusion", confusion) if isinstance(confusion, dict) else confusion
         if isinstance(confusion, dict) and "type" not in confusion and "rows" in confusion:
             confusion = confusion["rows"]
-    secondary = "default" if args.secondary_flux_limit is None else (None if args.secondary_flux_limit <= 0 else args.secondary_flux_limit)
     downsample = None
     if args.downsample:
         downsample = {"reference": args.downsample, "dust_av": args.dust_av}
     columns = args.columns if args.columns != ["all"] else "all"
     cat = base.make_catalog(
-        flux_limit=args.flux_limit, secondary_flux_limit=secondary, confusion=confusion, z_range=args.z_range,
+        **_sensitivity_args(args), confusion=confusion, z_range=args.z_range,
         z_column=args.z_column, lines=args.lines, membership=args.membership, n_det_min=args.n_det_min, downsample=downsample, columns=columns,
         seed=args.seed, n_workers=None if args.workers == "auto" else int(args.workers), verbose=not args.quiet)
     print(cat.summary())
@@ -178,8 +211,7 @@ def cmd_line_fractions(args):
     from .catalog import BaseCatalog
 
     base = BaseCatalog(args.base_dir)
-    secondary = "default" if args.secondary_flux_limit is None else (None if args.secondary_flux_limit <= 0 else args.secondary_flux_limit)
-    base.line_fractions(flux_limit=args.flux_limit, secondary_flux_limit=secondary, wave_bin=args.wave_bin,
+    base.line_fractions(**_sensitivity_args(args), wave_bin=args.wave_bin,
                         galaxies_per_bin=args.galaxies_per_bin, n_flux_bins=args.n_flux_bins, flux_quantiles=args.flux_quantiles,
                         min_count=args.min_count, mode=args.mode, p_fail=args.p_fail, seed=args.seed,
                         n_workers=None if args.workers == "auto" else int(args.workers), write_to=args.output, verbose=not args.quiet)
@@ -216,6 +248,20 @@ def cmd_flux_distribution(args):
                                verbose=not args.quiet)
     path = result.save(args.output)
     print(f"[romanmock] flux distribution of {len(result.steps)} slices, {int(result.n_gal.sum()):,} galaxies -> {path}")
+
+
+def cmd_galacticus_flux_distribution(args):
+    """Histograms of the line fluxes of every galaxy of a Galacticus mock per redshift bin (no flux cut)."""
+    import numpy as np
+
+    from .galacticus import GalacticusMock
+
+    lo, hi = args.z_range
+    edges = np.round(lo + args.dz * np.arange(int(round((hi - lo) / args.dz)) + 1), 6)
+    mock = GalacticusMock(args.mock, dust=not args.no_dust)
+    result = mock.flux_distribution(edges, line_set=args.line_set, n_workers=_n_workers(args, 0.5), verbose=not args.quiet)
+    path = result.save(args.output)
+    print(f"[romanmock] flux distribution of {len(result.steps)} files of {mock.name}, {int(result.n_gal.sum()):,} galaxies -> {path}")
 
 
 def cmd_random(args):
@@ -330,8 +376,7 @@ def main(argv=None):
                                        "limits, confusion matrix, lines and redshift range, and write it to a file")
     s.add_argument("base_dir", help="directory of the base catalog (written by `romanmock base`)")
     s.add_argument("-o", "--output", required=True, help="output file (.hdf5, .fits or .npz); replaced if it exists")
-    s.add_argument("--flux-limit", type=float, help="primary flux limit [erg/s/cm^2] (default: the base catalog's)")
-    s.add_argument("--secondary-flux-limit", type=float, help="limit for the other lines (default 4e-17; 0 = no second tier)")
+    _add_sensitivity_options(s, "the catalog")
     s.add_argument("--confusion", help="YAML file with the rows {true line: {assigned line: probability}}; or a line-fraction "
                                        "table (.npz, from `romanmock line-fractions`); or `empirical` to build that table first")
     s.add_argument("--lines", nargs="+", help="keep galaxies in which one of these lines is identified, e.g. Ha")
@@ -355,8 +400,7 @@ def main(argv=None):
                                               "(`romanmock catalog --confusion table.npz`, YAML `confusion: {type: empirical, file: ...}`)")
     s.add_argument("base_dir", help="directory of the base catalog (written by `romanmock base`)")
     s.add_argument("-o", "--output", required=True, help="output file (.npz), read with LineFractionTable.load")
-    s.add_argument("--flux-limit", type=float, help="primary flux limit of the catalog the table is for (default: the base catalog's)")
-    s.add_argument("--secondary-flux-limit", type=float, help="limit for the other lines (default 4e-17; 0 = no second tier)")
+    _add_sensitivity_options(s, "the catalog the table is for")
     s.add_argument("--wave-bin", type=float, default=250.0, help="width of the observed-wavelength bins [A] (default 250)")
     s.add_argument("--galaxies-per-bin", type=int, default=500, help="each wavelength bin is cut into as many equal-count flux-rank "
                                                                       "bins as hold at least this many galaxies (default 500)")
@@ -397,6 +441,19 @@ def main(argv=None):
     s.add_argument("--jax-platform", default="cpu", help="JAX_PLATFORMS value (default cpu)")
     s.add_argument("--quiet", action="store_true")
     s.set_defaults(func=cmd_flux_distribution)
+
+    s = sub.add_parser("galacticus-flux-distribution", help="the same for a Galacticus mock (directory with galaxyCatalogs/): "
+                                                            "dust-attenuated disk + spheroid + AGN line luminosities, D_L at the "
+                                                            "cosmological redshift; runs on a login node")
+    s.add_argument("mock", help="directory of the Galacticus mock (or its galaxyCatalogs directory)")
+    s.add_argument("-o", "--output", required=True, help="output file (.npz), read with FluxDistribution.load")
+    s.add_argument("--z-range", nargs=2, type=float, default=[0.0, 4.0], metavar=("ZMIN", "ZMAX"))
+    s.add_argument("--dz", type=float, default=0.1, help="width of the redshift bins")
+    s.add_argument("--line-set", default="galacticus_transitions")
+    s.add_argument("--no-dust", action="store_true", help="use the dust-free luminosities (nodeData) instead")
+    s.add_argument("--workers", default="4", help="number of parallel file processes, or 'auto' (I/O bound, ~0.5 GB each)")
+    s.add_argument("--quiet", action="store_true")
+    s.set_defaults(func=cmd_galacticus_flux_distribution)
 
     s = sub.add_parser("random", help="random catalogs for a catalog: uniform inside the footprint, redshifts drawn "
                                       "from the data; N files of the size of the data")

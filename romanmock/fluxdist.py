@@ -62,6 +62,15 @@ class FluxDistribution:
         self.steps.append(int(step))
         return self
 
+    def rebin(self, step: int) -> "FluxDistribution":
+        """The same histograms with ``step`` consecutive redshift bins merged (trailing bins dropped)."""
+        step = int(step)
+        nz = (self.z_edges.size - 1) // step * step
+        merge = lambda a: a[..., :nz, :].reshape(*a.shape[:-2], nz // step, step, a.shape[-1]).sum(axis=-2) if a.ndim == 3 \
+            else a[..., :nz].reshape(*a.shape[:-1], nz // step, step).sum(axis=-1)
+        return FluxDistribution(list(self.line_names), self.z_edges[: nz + 1 : step], self.logf_edges.copy(), self.z_column,
+                                merge(self.counts), merge(self.below), merge(self.above), merge(self.n_gal), list(self.steps))
+
     # ---- access -------------------------------------------------------------------------
     @property
     def z(self) -> np.ndarray:

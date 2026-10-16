@@ -10,7 +10,9 @@ catalog:
 
 base:
   dir: /global/cfs/cdirs/m4943/Simulations/RomanMocks/sdss_feniks_hizels_260710_09_07_2026/base
-  columns: [gal_id, ra, dec, redshift_true]     # copied from the input mock, next to redshift_rsd and the line fluxes
+  # copied from the input mock, next to redshift_rsd and the line fluxes. r50_disk_2d (half-mass radius of the disk,
+  # proper kpc) is the size column of the S/N route of step 2 (make_catalog(snr=5, secondary_snr=2, size="r50_disk_2d")).
+  columns: [gal_id, ra, dec, redshift_true, r50_disk_2d]
   overwrite: true                               # a rerun replaces the base catalog
 
 line_set: roman_transitions

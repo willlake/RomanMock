@@ -13,6 +13,13 @@ that can be repeated freely::
     cat["ra"], cat["redshift_assigned"], len(cat)     # numpy arrays
     cat.write("halpha.hdf5")                          # only if you want it on disk
 
+The thresholds can be flux limits, as above, or S/N thresholds of the Roman grism
+(:class:`~romanmock.sensitivity.RomanGrismSensitivity`: the 5-sigma line sensitivity of the
+NASA WFI technical page against observed wavelength and source size, scaled to the exposure
+time and background): ``make_catalog(snr=5, secondary_snr=2, size="r50_disk_2d")`` keeps
+the galaxies with a line of S/N >= 5 and detects their other lines down to S/N >= 2, with
+the size of each galaxy from the base catalog (``size=0.3`` for one size for all).
+
 Single lines can instead be identified from the line mix of the mock itself
 (``confusion="empirical"``: the share of each line among the single-line galaxies at the
 same observed wavelength and flux rank, :meth:`BaseCatalog.line_fractions`).
@@ -43,7 +50,20 @@ from .redshift import IdOutcome, PerfectMultiLine, assign_redshifts, single_line
 from .roman import DEFAULT_LINE_FLUX_LIMIT, DEFAULT_SECONDARY_LINE_FLUX_LIMIT
 from .samples import THINNING_STREAM
 from .selection import TargetDNDZ, tracer_membership, dndz_from_counts, keep_probability, probability_per_galaxy, sky_area_deg2
-from .sensitivity import ConstantFluxLimit, build_detection, build_sensitivity
+from .sensitivity import (
+    ConstantFluxLimit,
+    RomanGrismSensitivity,
+    build_detection,
+    build_sensitivity,
+    describe_sensitivity,
+    limits_contained,
+    needs_size,
+    nominal_flux_limit,
+    nominal_secondary_limit,
+)
+#: the arguments of make_catalog / line_fractions that fix the detection thresholds
+SENSITIVITY_ARGS = ("flux_limit", "secondary_flux_limit", "wave_range", "sensitivity", "snr", "secondary_snr", "size",
+                    "exposure_time", "background")
 
 #: columns of a catalog when ``columns`` is not given
 DEFAULT_COLUMNS = ["ra", "dec", "redshift_true", "redshift_rsd", "redshift_assigned", "id_outcome"]
@@ -114,8 +134,11 @@ class Catalog:
 
     def __repr__(self) -> str:
         s = self.settings
-        lims = f"F > {s.get('flux_limit', float('nan')):.2e}" + (
-            f" (other lines > {s['secondary_flux_limit']:.2e})" if s.get("secondary_flux_limit") else "")
+        if s.get("sensitivity"):
+            lims = describe_sensitivity(s["sensitivity"])
+        else:
+            lims = f"F > {s.get('flux_limit', float('nan')):.2e}" + (
+                f" (other lines > {s['secondary_flux_limit']:.2e})" if s.get("secondary_flux_limit") else "")
         cuts = ", ".join(str(x) for x in [
             f"lines {s['lines']}" if s.get("lines") else None,
             f"{s.get('z_column', 'redshift_assigned')} in {tuple(s['z_range'])}" if s.get("z_range") else None,
@@ -297,6 +320,7 @@ class BaseCatalog:
         self._area = None
         self.area_source = None            # "user", "footprint" or "healpix", once the area is known
         self._footprint = None
+        self._cosmology = None
         if area_deg2 is not None:
             self.area_deg2 = area_deg2
 
@@ -307,8 +331,18 @@ class BaseCatalog:
 
     @property
     def flux_limit(self) -> float:
-        """Primary flux limit of the base catalog: the deepest limit step 2 can use."""
-        return float(self.sensitivity.flux_limit(np.array([np.mean(self.sensitivity.wave_range)]))[0])
+        """Primary flux limit of the base catalog: the deepest limit step 2 can use (for a
+        wavelength- or size-dependent base sensitivity, its nominal value, in the middle of
+        the bandpass; the actual check is made limit against limit)."""
+        return nominal_flux_limit(self.sensitivity)
+
+    @property
+    def cosmology(self):
+        """The cosmology of the lightcone (from the header of the base files), for the kpc -> arcsec
+        conversion of the galaxy sizes."""
+        if self._cosmology is None:
+            self._cosmology = oc.open(str(self.files[0])).cosmology
+        return self._cosmology
 
     @property
     def wave_range(self) -> tuple[float, float]:
@@ -459,6 +493,12 @@ class BaseCatalog:
         self,
         flux_limit: float | None = None,
         secondary_flux_limit: float | None | str = "default",
+        snr: float | None = None,
+        secondary_snr: float | None | str = "default",
+        size=None,
+        exposure_time: float | None = None,
+        background: float | None = None,
+        sensitivity=None,
         confusion=None,
         z_range: tuple[float | None, float | None] | None = None,
         z_column: str = "redshift_assigned",
@@ -488,6 +528,23 @@ class BaseCatalog:
         secondary_flux_limit : float or None
             Limit for the other lines of such a galaxy. ``None`` = no second tier.
             Default: 4.0e-17 (never above the primary limit).
+        snr, secondary_snr, size, exposure_time, background
+            The other way of fixing the thresholds: S/N in the Roman grism
+            (:class:`~romanmock.sensitivity.RomanGrismSensitivity`, the 5-sigma line
+            sensitivity of the NASA WFI technical page against observed wavelength and
+            source size). A galaxy needs one line with S/N >= ``snr`` (5) inside the bandpass;
+            its other lines are detected with S/N >= ``secondary_snr`` (2; ``None`` = no second
+            tier). ``size`` is the angular size of the galaxies: a number in arcsec for all
+            (0.3 by default; 0 = point source) or a column of the base catalog in proper kpc
+            (``"r50_disk_2d"``; it must be in ``base.columns``), converted at ``redshift_true``;
+            ``exposure_time`` in seconds (3600) and ``background`` in units of the minimum
+            zodiacal light (2; a typical HLWAS field is about 1.4) rescale the noise. Giving any
+            of these selects the S/N route; the flux limits must then be left alone. The S/N of
+            every line is available as the ``<line>_snr`` columns of the file route
+            (``store_snr``) and in ``cat.settings["sensitivity"]`` as the model used.
+        sensitivity : dict or model
+            Full control: any sensitivity model config (``{"type": "roman_grism", ...}``,
+            ``{"type": "tabulated", ...}``) or object, instead of the arguments above.
         confusion : dict, str, ConfusionMatrix, LineFractionTable or None
             How single-line galaxies are identified. A confusion matrix: ``{true line:
             {assigned line: probability, "fail": probability}}``, lines not listed identified
@@ -546,9 +603,11 @@ class BaseCatalog:
         """
         if n_workers is None:
             n_workers = suggest_n_workers(max_workers=32, per_worker_gb=2.5)     # memory-limited: ~12 on a login node
-        confusion = self._resolve_confusion(confusion, flux_limit, secondary_flux_limit, wave_range, detection, seed, n_workers, verbose)
-        spec = self._spec(flux_limit, secondary_flux_limit, confusion, z_range, z_column, lines, membership, outcomes, n_det_min,
-                          cuts, downsample, columns, wave_range, detection, sigma_z, seed)
+        sens_kw = dict(flux_limit=flux_limit, secondary_flux_limit=secondary_flux_limit, wave_range=wave_range, sensitivity=sensitivity,
+                       snr=snr, secondary_snr=secondary_snr, size=size, exposure_time=exposure_time, background=background)
+        confusion = self._resolve_confusion(confusion, sens_kw, detection, seed, n_workers, verbose)
+        spec = self._spec(sens_kw, confusion, z_range, z_column, lines, membership, outcomes, n_det_min,
+                          cuts, downsample, columns, detection, sigma_z, seed)
         populations = spec["populations"]
         if area_deg2 is not None:
             self.area_deg2 = area_deg2
@@ -577,8 +636,8 @@ class BaseCatalog:
                                           spec["z_column"], z_cover, spec["line_bits"], confusion_probabilities(spec["confusion"]),
                                           counts, spec["outcome_codes"], spec["membership"],
                                           probability_kind="expected" if isinstance(spec["confusion"], LineFractionTable) else "matrix")
-        settings = {k: spec[k] for k in ("flux_limit", "secondary_flux_limit", "wave_range", "z_range", "z_column", "lines", "membership",
-                                         "outcomes", "n_det_min", "cuts", "sigma_z", "seed", "detection")}
+        settings = {k: spec[k] for k in ("sensitivity", "flux_limit", "secondary_flux_limit", "wave_range", "z_range", "z_column", "lines",
+                                         "membership", "outcomes", "n_det_min", "cuts", "sigma_z", "seed", "detection")}
         settings.update(confusion=spec["confusion_config"], downsample=spec["downsample_label"], base=str(self.dir), base_tag=self.tag)
         info["area_deg2"], info["area_source"] = area, self.area_source
         cat = Catalog(data, settings, info, self.line_set.names, area)
@@ -596,22 +655,45 @@ class BaseCatalog:
         return cat
 
     # ---- settings -> a picklable description for the workers -------------------------
-    def _sensitivity(self, flux_limit, secondary, wave_range) -> ConstantFluxLimit:
-        """The flux limits and bandpass of a catalog, validated against the base catalog."""
-        flux_limit = self.flux_limit if flux_limit is None else float(flux_limit)
-        if flux_limit < self.flux_limit * (1 - 1e-9):
-            raise ValueError(f"flux_limit {flux_limit:.3g} is deeper than the base catalog ({self.flux_limit:.3g}); "
-                             "rebuild the base catalog deeper")
+    def _sensitivity(self, flux_limit=None, secondary_flux_limit="default", wave_range=None, sensitivity=None, snr=None,
+                     secondary_snr="default", size=None, exposure_time=None, background=None):
+        """The sensitivity model of a catalog: flux limits (``ConstantFluxLimit``), S/N thresholds
+        (``RomanGrismSensitivity``) or a given model; validated against the base catalog."""
         wave_range = self.wave_range if wave_range is None else (float(wave_range[0]), float(wave_range[1]))
-        if wave_range[0] < self.wave_range[0] - 1e-6 or wave_range[1] > self.wave_range[1] + 1e-6:
-            raise ValueError(f"wave_range {wave_range} extends beyond the bandpass of the base catalog {self.wave_range}")
-        if isinstance(secondary, str):
-            if secondary != "default":
-                raise ValueError("secondary_flux_limit must be a number, None or 'default'")
-            secondary = min(DEFAULT_SECONDARY_LINE_FLUX_LIMIT, flux_limit)
-        return ConstantFluxLimit(flux_limit, wave_range, secondary_flux_limit=secondary)    # validates the pair
+        flux_given = flux_limit is not None or not (isinstance(secondary_flux_limit, str) and secondary_flux_limit == "default")
+        snr_given = {k: v for k, v in dict(snr=snr, size=size, exposure_time=exposure_time, background=background).items()
+                     if v is not None}
+        if not (isinstance(secondary_snr, str) and secondary_snr == "default"):
+            snr_given["secondary_snr"] = secondary_snr
+        if sensitivity is not None:
+            if flux_given or snr_given:
+                raise ValueError("give either sensitivity=... or the flux limits / S/N thresholds, not both")
+            if isinstance(sensitivity, Mapping):
+                sensitivity = {**sensitivity, "wave_range": list(wave_range)} if "wave_range" not in sensitivity else sensitivity
+            sens = build_sensitivity(sensitivity)
+        elif snr_given:
+            if flux_given:
+                raise ValueError("flux limits (flux_limit, secondary_flux_limit) and S/N thresholds (snr, secondary_snr, size, "
+                                 "exposure_time, background) are two ways of fixing the detection; give one of them")
+            sens = RomanGrismSensitivity(wave_range=wave_range, **snr_given)
+        else:
+            flux_limit = self.flux_limit if flux_limit is None else float(flux_limit)
+            secondary = secondary_flux_limit
+            if isinstance(secondary, str):
+                if secondary != "default":
+                    raise ValueError("secondary_flux_limit must be a number, None or 'default'")
+                secondary = min(DEFAULT_SECONDARY_LINE_FLUX_LIMIT, flux_limit)
+            sens = ConstantFluxLimit(flux_limit, wave_range, secondary_flux_limit=secondary)    # validates the pair
+        problem, _ = limits_contained(sens, self.sensitivity)
+        if problem is not None:
+            raise ValueError(f"{problem}; rebuild the base catalog" + (" deeper" if "deeper" in problem else ""))
+        missing = [c for c in getattr(sens, "required_columns", []) if c not in self.description["columns"]]
+        if missing:
+            raise KeyError(f"the sizes need the columns {missing}, which the base catalog does not store (it has "
+                           f"{self.description['columns']}); add them to base.columns and rebuild it, or use size=<arcsec>")
+        return sens
 
-    def _resolve_confusion(self, confusion, flux_limit, secondary, wave_range, detection, seed, n_workers, verbose):
+    def _resolve_confusion(self, confusion, sens_kw, detection, seed, n_workers, verbose):
         """Build the line-fraction table when ``confusion`` asks for the empirical model without one."""
         if isinstance(confusion, str):
             confusion = {"type": confusion}
@@ -622,15 +704,15 @@ class BaseCatalog:
             if unknown:
                 raise KeyError(f"unknown options {unknown} for the empirical confusion model; known: {list(FRACTION_OPTIONS)}, "
                                "or file / table")
-            return self.line_fractions(flux_limit=flux_limit, secondary_flux_limit=secondary, wave_range=wave_range,
-                                       detection=detection, seed=seed, n_workers=n_workers, verbose=verbose, **options)
+            return self.line_fractions(**sens_kw, detection=detection, seed=seed, n_workers=n_workers, verbose=verbose, **options)
         return confusion
 
-    def _spec(self, flux_limit, secondary, confusion, z_range, z_column, lines, membership, outcomes, n_det_min, cuts, downsample,
-              columns, wave_range, detection, sigma_z, seed) -> dict:
+    def _spec(self, sens_kw, confusion, z_range, z_column, lines, membership, outcomes, n_det_min, cuts, downsample,
+              columns, detection, sigma_z, seed) -> dict:
         names = self.line_set.names
-        sens = self._sensitivity(flux_limit, secondary, wave_range)
-        flux_limit, wave_range = sens.flux_limit_value, tuple(sens.wave_range)
+        sens = self._sensitivity(**sens_kw)
+        flux_limit, wave_range = nominal_flux_limit(sens), tuple(sens.wave_range)
+        secondary = nominal_secondary_limit(sens)
 
         if confusion is None:
             model = default_confusion(self.line_set)
@@ -644,7 +726,7 @@ class BaseCatalog:
         if list(model.names) != names:
             raise ValueError(f"the confusion model is for the lines {list(model.names)}, not {names}")
         if isinstance(model, LineFractionTable):
-            _check_table(model, flux_limit, sens.secondary_flux_limit_value if sens.two_tier else None, wave_range)
+            _check_table(model, flux_limit, secondary, wave_range, sens.to_config())
         confusion_config = model.to_config() if hasattr(model, "to_config") else repr(model)
 
         if z_column not in REDSHIFT_COLUMNS:
@@ -679,8 +761,8 @@ class BaseCatalog:
         populations, label = self._targets(downsample, flux_limit)
         return {
             "line_set": self.line_set.to_config(), "flux_columns": self.flux_columns, "flux_suffix": self.flux_suffix,
-            "sensitivity": sens.to_config(), "flux_limit": flux_limit,
-            "secondary_flux_limit": sens.secondary_flux_limit_value if sens.two_tier else None,
+            "sensitivity": sens.to_config(), "flux_limit": flux_limit, "secondary_flux_limit": secondary,
+            **self._size_spec(sens),
             "wave_range": list(wave_range), "detection": dict(detection or {"type": "threshold"}),
             "confusion": model, "confusion_config": confusion_config, "sigma_z": float(sigma_z), "seed": int(seed),
             "z_range": None if z_range is None else list(z_range), "z_column": z_column,
@@ -690,6 +772,13 @@ class BaseCatalog:
             "n_det_min": n_det_min, "cuts": {k: list(v) for k, v in cuts.items()},
             "columns": list(columns), "populations": populations, "downsample_label": label,
         }
+
+    def _size_spec(self, sens) -> dict:
+        """What the workers need to compute the angular sizes: the size spec of the model (``None`` for
+        models without one or with a fixed size) and the cosmology."""
+        if not needs_size(sens):
+            return {"size": None, "size_columns": [], "cosmology": None}
+        return {"size": sens.size_spec, "size_columns": list(sens.required_columns), "cosmology": self.cosmology}
 
     def _targets(self, downsample, flux_limit: float) -> tuple[dict, object]:
         """Resolve ``downsample`` into ``{line: {"bit", "edges", "target"}}``."""
@@ -744,6 +833,12 @@ class BaseCatalog:
         flux_limit: float | None = None,
         secondary_flux_limit: float | None | str = "default",
         wave_range: tuple[float, float] | None = None,
+        snr: float | None = None,
+        secondary_snr: float | None | str = "default",
+        size=None,
+        exposure_time: float | None = None,
+        background: float | None = None,
+        sensitivity=None,
         detection: Mapping | None = None,
         wave_bin: float = 250.0,
         wave_edges=None,
@@ -772,9 +867,10 @@ class BaseCatalog:
         ``n_flux_bins`` bins, or at the quantiles ``flux_quantiles`` (``[0, 0.5, 0.9, 0.99, 1]``
         resolves the bright tail, where the rare lines are). Lines that are the single line of
         fewer than ``min_count`` galaxies in all
-        are left out of the identification. Build the table at the ``flux_limit``,
-        ``secondary_flux_limit`` and ``wave_range`` of the catalog it is for; ``make_catalog``
-        warns when they differ.
+        are left out of the identification. Build the table at the thresholds of the catalog it
+        is for (``flux_limit``, ``secondary_flux_limit`` and ``wave_range``, or the S/N route
+        ``snr``, ``secondary_snr``, ``size``, ``exposure_time``, ``background``, or a
+        ``sensitivity`` model, as in :meth:`make_catalog`); ``make_catalog`` warns when they differ.
 
         ``mode`` is ``"draw"`` (a galaxy gets each line with the probability of its cell) or
         ``"max"`` (the most common line of its cell); ``p_fail`` a uniform probability of no
@@ -783,9 +879,10 @@ class BaseCatalog:
         detection models. ``verbose`` prints :meth:`LineFractionTable.summary`: the galaxies
         and the shares per wavelength bin, and the smallest cell, to judge the binning.
         """
-        sens = self._sensitivity(flux_limit, secondary_flux_limit, wave_range)
-        flux_limit, wave_range = sens.flux_limit_value, tuple(sens.wave_range)
-        secondary = sens.secondary_flux_limit_value if sens.two_tier else None
+        sens = self._sensitivity(flux_limit, secondary_flux_limit, wave_range, sensitivity, snr, secondary_snr, size,
+                                 exposure_time, background)
+        flux_limit, wave_range = nominal_flux_limit(sens), tuple(sens.wave_range)
+        secondary = nominal_secondary_limit(sens)
         if wave_edges is None:
             n_bins = max(1, int(round((wave_range[1] - wave_range[0]) / float(wave_bin))))
             wave_edges = np.linspace(wave_range[0], wave_range[1], n_bins + 1)
@@ -793,17 +890,18 @@ class BaseCatalog:
         comp_cols = {c: f"{c}{self.flux_suffix}" for feat in self.line_set if not feat.is_blend for c in feat.components} \
             if self.line_set.has_separated_components else {}
         spec = {"line_set": self.line_set.to_config(), "flux_columns": self.flux_columns, "component_columns": comp_cols,
-                "sensitivity": sens.to_config(), "detection": dict(detection or {"type": "threshold"}), "seed": int(seed)}
+                "sensitivity": sens.to_config(), "detection": dict(detection or {"type": "threshold"}), "seed": int(seed),
+                **self._size_spec(sens)}
         if n_workers is None:
             n_workers = suggest_n_workers(max_workers=32, per_worker_gb=2.5)
         tasks = [(spec, str(self.dir / v["output"]), step) for step, v in self.slices.items()]
         if verbose:
             print(f"[romanmock] line fractions: scanning {len(tasks)} slices of {self.dir.name} for single-line galaxies "
-                  f"(F > {flux_limit:.2g}" + (f", other lines < {secondary:.2g}" if secondary else "") + f"), {n_workers} worker(s)",
-                  flush=True)
+                  f"({sens.describe()}), {n_workers} worker(s)", flush=True)
         results = _run(tasks, n_workers, _single_lines_slice)
         wave, flux, line = (np.concatenate([r[k] for r in results]) for k in ("wave", "flux", "line"))
-        settings = {"base": str(self.dir), "base_tag": self.tag, "flux_limit": flux_limit, "secondary_flux_limit": secondary,
+        settings = {"base": str(self.dir), "base_tag": self.tag, "sensitivity": sens.to_config(), "flux_limit": flux_limit,
+                    "secondary_flux_limit": secondary,
                     "wave_range": list(wave_range), "detection": spec["detection"], "wave_bin": float(np.median(np.diff(wave_edges))),
                     "n_base": int(sum(r["n"] for r in results)),
                     "built": _dt.datetime.now().isoformat(timespec="seconds")}
@@ -823,18 +921,23 @@ def make_catalog(base_dir, **settings) -> Catalog:
     return BaseCatalog(base_dir).make_catalog(**settings)
 
 
-def _check_table(table: LineFractionTable, flux_limit: float, secondary: float | None, wave_range) -> None:
+def _check_table(table: LineFractionTable, flux_limit: float, secondary: float | None, wave_range, sensitivity: dict | None = None) -> None:
     """Warn when a line-fraction table was built at other limits than the catalog uses: its flux-rank
     bins then describe another population."""
     s = table.settings
-    if "flux_limit" not in s:
+    if "flux_limit" not in s and "sensitivity" not in s:
         return
     mismatch = []
-    if not np.isclose(s["flux_limit"], flux_limit, rtol=1e-6, atol=0.0):       # fluxes ~1e-16: the default atol would hide it
-        mismatch.append(f"flux_limit {s['flux_limit']:.3g} (table) vs {flux_limit:.3g} (catalog)")
-    if (s.get("secondary_flux_limit") is None) != (secondary is None) or \
-            (secondary is not None and not np.isclose(s["secondary_flux_limit"], secondary, rtol=1e-6, atol=0.0)):
-        mismatch.append(f"secondary_flux_limit {s.get('secondary_flux_limit')} (table) vs {secondary} (catalog)")
+    if sensitivity is not None and s.get("sensitivity") is not None:
+        same = json.dumps(s["sensitivity"], sort_keys=True, default=_json_default) == json.dumps(sensitivity, sort_keys=True, default=_json_default)
+        if not same:
+            mismatch.append(f"sensitivity {describe_sensitivity(s['sensitivity'])} (table) vs {describe_sensitivity(sensitivity)} (catalog)")
+    elif "flux_limit" in s:
+        if not np.isclose(s["flux_limit"], flux_limit, rtol=1e-6, atol=0.0):       # fluxes ~1e-16: the default atol would hide it
+            mismatch.append(f"flux_limit {s['flux_limit']:.3g} (table) vs {flux_limit:.3g} (catalog)")
+        if (s.get("secondary_flux_limit") is None) != (secondary is None) or \
+                (secondary is not None and not np.isclose(s["secondary_flux_limit"], secondary, rtol=1e-6, atol=0.0)):
+            mismatch.append(f"secondary_flux_limit {s.get('secondary_flux_limit')} (table) vs {secondary} (catalog)")
     if "wave_range" in s and not np.allclose(s["wave_range"], wave_range, rtol=1e-6, atol=0.0):
         mismatch.append(f"wave_range {s['wave_range']} (table) vs {list(wave_range)} (catalog)")
     if mismatch:
@@ -868,7 +971,7 @@ def _catalog_slice(spec: dict, path: str, step: int) -> dict:
         if line_set.has_separated_components else {}
     derived = set(DERIVED_COLUMNS)
     wanted = [c for c in dict.fromkeys([*spec["columns"], *spec["cuts"], spec["z_column"]]) if c not in derived]
-    read = list(dict.fromkeys([*flux_columns, *comp_cols.values(), "redshift_rsd", *wanted]))
+    read = list(dict.fromkeys([*flux_columns, *comp_cols.values(), "redshift_rsd", *spec["size_columns"], *wanted]))
     rng = np.random.default_rng([spec["seed"], int(step)])              # the pipeline's stream for this slice
     rng_thin = np.random.default_rng([spec["seed"], THINNING_STREAM, int(step)])   # the stream `romanmock select` uses
     model = build_detection(spec["detection"], build_sensitivity(spec["sensitivity"]))
@@ -886,7 +989,7 @@ def _catalog_slice(spec: dict, path: str, step: int) -> dict:
             z_rsd = np.asarray(data["redshift_rsd"], dtype=np.float64)
             flux = np.stack([np.asarray(data[c], dtype=np.float64) for c in flux_columns], axis=1)
             comp = {lum: np.asarray(data[name], dtype=np.float64) for lum, name in comp_cols.items()} or None
-            det = detect_lines(flux, z_rsd, line_set, model, rng, component_flux=comp)
+            det = detect_lines(flux, z_rsd, line_set, model, rng, component_flux=comp, size=_sizes(spec, data))
             za = assign_redshifts(det, z_rsd, line_set, spec["confusion"], rng, multi_line)
             cols = dict(data)
             cols.update(redshift_assigned=za.z_assigned, id_outcome=za.outcome, line_bitmask=det.bitmask, n_det=det.n_det,
@@ -946,6 +1049,13 @@ def _catalog_slice(spec: dict, path: str, step: int) -> dict:
     return out
 
 
+def _sizes(spec: dict, data: Mapping[str, np.ndarray]):
+    """Angular sizes [arcsec] of the galaxies of a chunk for a size-dependent sensitivity, else ``None``."""
+    if spec.get("size") is None:
+        return None
+    return spec["size"].angular_size(data, spec["cosmology"])
+
+
 def base_data_group(h):
     """The HDF5 group with the columns of a base-catalog file (``<step>_data/data`` as OpenCosmo writes it)."""
     import h5py
@@ -967,7 +1077,7 @@ def _single_lines_slice(spec: dict, path: str, step: int) -> dict:
 
     line_set = get_line_set(spec["line_set"])
     flux_columns, comp_cols = spec["flux_columns"], spec["component_columns"]
-    read = list(dict.fromkeys([*flux_columns, *comp_cols.values(), "redshift_rsd"]))
+    read = list(dict.fromkeys([*flux_columns, *comp_cols.values(), "redshift_rsd", *spec["size_columns"]]))
     rng = np.random.default_rng([spec["seed"], FRACTION_STREAM, int(step)])
     model = build_detection(spec["detection"], build_sensitivity(spec["sensitivity"]))
     waves, fluxes, lines, n = [], [], [], 0
@@ -980,7 +1090,7 @@ def _single_lines_slice(spec: dict, path: str, step: int) -> dict:
             z_rsd = np.asarray(data["redshift_rsd"], dtype=np.float64)
             flux = np.stack([np.asarray(data[c], dtype=np.float64) for c in flux_columns], axis=1)
             comp = {lum: np.asarray(data[name], dtype=np.float64) for lum, name in comp_cols.items()} or None
-            det = detect_lines(flux, z_rsd, line_set, model, rng, component_flux=comp)
+            det = detect_lines(flux, z_rsd, line_set, model, rng, component_flux=comp, size=_sizes(spec, data))
             w, f, i = single_lines(det)
             waves.append(w); fluxes.append(f); lines.append(i.astype(np.int8))
     cat = lambda parts, dtype: np.concatenate(parts) if parts else np.zeros(0, dtype=dtype)

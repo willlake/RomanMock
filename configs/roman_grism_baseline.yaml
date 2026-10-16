@@ -62,6 +62,18 @@ sensitivity:                      # initial model: constant thresholds inside th
   # file: sensitivity_curve.txt   # two columns: wavelength [A], flux limit
   # wave_unit: angstrom
   # secondary_ratio: 0.4          # secondary limit = ratio x tabulated limit (omit: single tier)
+  # S/N thresholds in the Roman grism (NASA WFI technical page: 5-sigma line sensitivity against observed
+  # wavelength for a point source and r50 = 0.3", 1 h, 2 x minimum zodi, scaled as t^-1/2 b^1/2):
+  # type: roman_grism
+  # snr: 5.0                      # a galaxy needs one line with S/N >= snr inside the bandpass
+  # secondary_snr: 2.0            # its other lines are detected with S/N >= secondary_snr (null: single tier)
+  # size: r50_disk_2d             # angular size of each galaxy: a column in proper kpc (converted at redshift_true;
+  #                               # with `romanmock base` it is added to base.columns), or a number in arcsec (0.3; 0 = point source)
+  # exposure_time: 3600.0         # s
+  # background: 2.0               # x minimum zodiacal light (a typical HLWAS field: ~1.4)
+  # size_exponent: 0.5            # noise ~ (1 + (r / r_c)^2)^p, r_c fixed by the two tabulated sizes
+  # wave_range: [10000.0, 19300.0]
+  # output.store_snr: true writes the S/N of every line (<line>_snr)
 
 detection:
   type: threshold                 # F > F_lim(lambda_obs); or gaussian_noise with snr_at_limit / snr_threshold

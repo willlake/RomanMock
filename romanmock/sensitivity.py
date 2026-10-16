@@ -1,13 +1,18 @@
-"""Sensitivity (flux limit versus wavelength) and detection models.
+"""Sensitivity (flux limit versus wavelength and source size) and detection models.
 
 Two small protocols keep the first-stage physics replaceable (plan comment 6):
 
 * :class:`SensitivityModel` -- ``flux_limit(wave_obs)`` in erg/s/cm^2, ``inf`` outside
   the bandpass. :class:`ConstantFluxLimit` is the plan's initial model;
-  :class:`TabulatedFluxLimit` is a wavelength-dependent replacement. A model may also
-  define ``secondary_flux_limit(wave_obs)``, the lower limit that applies to the other
-  lines of a galaxy once one of its lines passes ``flux_limit`` (see below).
-* :class:`DetectionModel` -- ``detect(flux, wave_obs, rng)`` returning a
+  :class:`TabulatedFluxLimit` is a wavelength-dependent replacement;
+  :class:`RomanGrismSensitivity` is the Roman WFI grism model (wavelength, source size,
+  exposure time and background, from the NASA WFI technical page) whose thresholds are
+  S/N values. A model may also define ``secondary_flux_limit(wave_obs)``, the lower limit
+  that applies to the other lines of a galaxy once one of its lines passes ``flux_limit``
+  (see below). A model with ``uses_size = True`` takes the angular size of each galaxy as a
+  second argument, ``flux_limit(wave_obs, size)``, and tells through ``size_spec`` /
+  ``required_columns`` where the sizes come from (:mod:`romanmock.sizes`).
+* :class:`DetectionModel` -- ``detect(flux, wave_obs, rng, size=None)`` returning a
   :class:`Detection` (boolean mask, measured flux, S/N). :class:`ThresholdDetection` is
   the deterministic ``F > F_thres`` rule; :class:`GaussianNoiseDetection` adds flux
   noise and a S/N cut as a first step towards detection scatter.
@@ -17,7 +22,8 @@ Two-tier detection: a galaxy enters the catalog only if at least one line exceed
 other line inside the bandpass is detected if it exceeds the *secondary* limit (default
 4.0e-17). A galaxy with no primary line has no detected line, however many of its lines
 exceed the secondary limit. Setting the secondary limit equal to the primary one (or to
-``None``) recovers the single-threshold rule.
+``None``) recovers the single-threshold rule. With :class:`RomanGrismSensitivity` the two
+limits are S/N thresholds (5 and 2 by default) times the 5-sigma noise of each line.
 
 Register additional models in :data:`SENSITIVITY_MODELS` / :data:`DETECTION_MODELS`
 so they can be selected by name from a configuration file.
@@ -33,10 +39,19 @@ import numpy as np
 
 from .roman import (
     DEFAULT_LINE_FLUX_LIMIT,
+    DEFAULT_PRIMARY_SNR,
     DEFAULT_SECONDARY_LINE_FLUX_LIMIT,
+    DEFAULT_SECONDARY_SNR,
     DEFAULT_SNR_AT_LIMIT,
     GRISM_WAVE_RANGE_ANGSTROM,
+    WFI_GRISM_5SIGMA_POINT,
+    WFI_GRISM_5SIGMA_R50_0P3,
+    WFI_GRISM_REFERENCE_BACKGROUND,
+    WFI_GRISM_REFERENCE_EXPOSURE_S,
+    WFI_GRISM_REFERENCE_SIZE_ARCSEC,
+    WFI_GRISM_SENSITIVITY_WAVE_ANGSTROM,
 )
+from .sizes import SizeSpec
 
 
 @runtime_checkable
@@ -57,6 +72,8 @@ class ConstantFluxLimit:
     primary limit; ``None`` disables the second tier (secondary = primary); a number must
     satisfy ``0 < secondary <= flux_limit``.
     """
+
+    uses_size = False
 
     def __init__(
         self,
@@ -93,15 +110,19 @@ class ConstantFluxLimit:
         lo, hi = self.wave_range
         return (wave_obs > lo) & (wave_obs < hi)
 
-    def flux_limit(self, wave_obs):
+    def flux_limit(self, wave_obs, size=None):
         return np.where(self._inside(wave_obs), self.flux_limit_value, np.inf)
 
-    def secondary_flux_limit(self, wave_obs):
+    def secondary_flux_limit(self, wave_obs, size=None):
         return np.where(self._inside(wave_obs), self.secondary_flux_limit_value, np.inf)
 
     def to_config(self) -> dict:
         return {"type": "constant", "flux_limit": self.flux_limit_value, "wave_range": list(self.wave_range),
                 "secondary_flux_limit": self.secondary_flux_limit_value if self.two_tier else None}
+
+    def describe(self) -> str:
+        return f"F > {self.flux_limit_value:.2e}" + (
+            f" (other lines > {self.secondary_flux_limit_value:.2e})" if self.two_tier else "")
 
     def __repr__(self):
         second = f", secondary {self.secondary_flux_limit_value:.3g}" if self.two_tier else ""
@@ -115,6 +136,8 @@ class TabulatedFluxLimit:
     ``secondary_ratio`` (``0 < r <= 1``, default ``None`` = no second tier) sets the
     secondary limit to ``r`` times the tabulated one, e.g. 0.4 for 4e-17 at 1e-16.
     """
+
+    uses_size = False
 
     def __init__(self, wave: np.ndarray, flux_limit: np.ndarray, wave_range=None, secondary_ratio: float | None = None):
         wave = np.asarray(wave, dtype=np.float64)
@@ -136,7 +159,7 @@ class TabulatedFluxLimit:
     def two_tier(self) -> bool:
         return self.secondary_ratio < 1.0
 
-    def secondary_flux_limit(self, wave_obs):
+    def secondary_flux_limit(self, wave_obs, size=None):
         return self.flux_limit(wave_obs) * self.secondary_ratio
 
     @classmethod
@@ -151,7 +174,7 @@ class TabulatedFluxLimit:
             raise ValueError("wave_unit must be 'angstrom' or 'micron'")
         return cls(wave, flim, wave_range=wave_range, secondary_ratio=secondary_ratio)
 
-    def flux_limit(self, wave_obs):
+    def flux_limit(self, wave_obs, size=None):
         wave_obs = np.asarray(wave_obs, dtype=np.float64)
         lo, hi = self.wave_range
         inside = (wave_obs > lo) & (wave_obs < hi)
@@ -162,11 +185,192 @@ class TabulatedFluxLimit:
         return {"type": "tabulated", "wave": self.wave.tolist(), "flux_limit": self.flim.tolist(),
                 "wave_range": list(self.wave_range), "secondary_ratio": self.secondary_ratio if self.two_tier else None}
 
+    def describe(self) -> str:
+        return f"F > tabulated limit ({self.flim.min():.2e}-{self.flim.max():.2e})" + (
+            f" (other lines > {self.secondary_ratio:g} x limit)" if self.two_tier else "")
+
     def __repr__(self):
         return f"TabulatedFluxLimit({self.wave.size} points, {self.wave_range} A)"
 
 
-SENSITIVITY_MODELS = {"constant": ConstantFluxLimit, "tabulated": TabulatedFluxLimit}
+class RomanGrismSensitivity:
+    """Roman WFI grism line sensitivity: wavelength, source size, exposure time, background.
+
+    The NASA WFI technical page tabulates the 5-sigma line-flux limit of the grism at ten
+    observed wavelengths for one hour at twice the minimum zodiacal background, for a point
+    source and for a source with ``r50 = 0.3"`` (:mod:`romanmock.roman`). The 5-sigma flux
+    of a line of a galaxy of angular half-light size ``r`` at observed wavelength ``lambda`` is
+
+    ``F_5sigma(lambda, r) = F_5sigma,point(lambda) * [1 + (r / r_c(lambda))^2]^p * (t / 1 h)^(-1/2) * (b / 2)^(1/2)``
+
+    with the point-source row interpolated linearly in log F; the size factor has one scale
+    ``r_c(lambda)`` per tabulated wavelength, fixed so that ``r = 0.3"`` reproduces the
+    extended-source row exactly (``r_c`` is 0.12-0.14", close to the PSF; ``p`` =
+    ``size_exponent``, 1/2 by default: the noise grows with the square root of the number of
+    pixels the line is spread over, which is linear in the size for a line that is only
+    smeared in the cross-dispersion direction). Sizes beyond 0.3" are an extrapolation of the
+    two tabulated rows. Wavelengths between the bandpass edges and the first / last tabulated
+    point take the nearest tabulated value.
+
+    The thresholds are S/N values: a line is above the primary limit when
+    ``S/N = 5 F / F_5sigma >= snr`` (5 by default), and the other lines of such a galaxy are
+    detected when ``S/N >= secondary_snr`` (2; ``None`` = single tier). ``size`` is a number
+    in arcsec for every galaxy (0.3 by default; 0 = point source) or the column the size
+    of each galaxy is read from (``"r50_disk_2d"``; :class:`~romanmock.sizes.SizeSpec`).
+    ``exposure_time`` in seconds and ``background`` in units of the minimum zodiacal
+    background (2 = the reference of the tables, ~1.4 = a typical HLWAS field).
+    """
+
+    uses_size = True
+
+    def __init__(
+        self,
+        snr: float = DEFAULT_PRIMARY_SNR,
+        secondary_snr: float | None = DEFAULT_SECONDARY_SNR,
+        size=WFI_GRISM_REFERENCE_SIZE_ARCSEC,
+        exposure_time: float = WFI_GRISM_REFERENCE_EXPOSURE_S,
+        background: float = WFI_GRISM_REFERENCE_BACKGROUND,
+        size_exponent: float = 0.5,
+        wave_range: tuple[float, float] = GRISM_WAVE_RANGE_ANGSTROM,
+        wave=WFI_GRISM_SENSITIVITY_WAVE_ANGSTROM,
+        flux_5sigma_point=WFI_GRISM_5SIGMA_POINT,
+        flux_5sigma_extended=WFI_GRISM_5SIGMA_R50_0P3,
+        reference_size: float = WFI_GRISM_REFERENCE_SIZE_ARCSEC,
+        reference_exposure_time: float = WFI_GRISM_REFERENCE_EXPOSURE_S,
+        reference_background: float = WFI_GRISM_REFERENCE_BACKGROUND,
+    ):
+        if snr <= 0:
+            raise ValueError("snr must be positive")
+        if secondary_snr is None:
+            secondary_snr = snr
+        if not 0 < secondary_snr <= snr:
+            raise ValueError(f"secondary_snr ({secondary_snr:g}) must be positive and not exceed snr ({snr:g})")
+        if exposure_time <= 0 or background <= 0:
+            raise ValueError("exposure_time and background must be positive")
+        if size_exponent <= 0:
+            raise ValueError("size_exponent must be positive")
+        lo, hi = wave_range
+        if not lo < hi:
+            raise ValueError("wave_range must be (min, max) with min < max")
+        wave = np.asarray(wave, dtype=np.float64)
+        f_pt = np.asarray(flux_5sigma_point, dtype=np.float64)
+        f_ext = np.asarray(flux_5sigma_extended, dtype=np.float64)
+        if wave.ndim != 1 or wave.shape != f_pt.shape or wave.shape != f_ext.shape or wave.size < 2:
+            raise ValueError("wave, flux_5sigma_point and flux_5sigma_extended must be 1-D arrays of equal length >= 2")
+        if np.any(np.diff(wave) <= 0) or np.any(f_pt <= 0) or np.any(f_ext <= f_pt):
+            raise ValueError("wave must increase and the extended-source limits must exceed the point-source ones")
+        if reference_size <= 0:
+            raise ValueError("reference_size must be positive")
+        self.snr = float(snr)
+        self.secondary_snr = float(secondary_snr)
+        self.size_spec = SizeSpec.parse(size)
+        self.exposure_time = float(exposure_time)
+        self.background = float(background)
+        self.size_exponent = float(size_exponent)
+        self.wave_range = (float(lo), float(hi))
+        self.wave, self.flux_5sigma_point, self.flux_5sigma_extended = wave, f_pt, f_ext
+        self.reference_size = float(reference_size)
+        self.reference_exposure_time = float(reference_exposure_time)
+        self.reference_background = float(reference_background)
+        # size scale per tabulated wavelength: (1 + (r_ref / r_c)^2)^p = F_ext / F_pt
+        ratio = f_ext / f_pt
+        self.size_scale = self.reference_size / np.sqrt(ratio ** (1.0 / self.size_exponent) - 1.0)
+        # exposure time and background: F_lim ~ t^(-1/2) b^(1/2)
+        self.depth_factor = float(np.sqrt(self.reference_exposure_time / self.exposure_time)
+                                  * np.sqrt(self.background / self.reference_background))
+
+    # ---- what the model needs from the catalog -------------------------------------
+    @property
+    def required_columns(self) -> list[str]:
+        return self.size_spec.required_columns
+
+    def angular_size(self, data=None, cosmology=None):
+        """Angular size [arcsec] of the galaxies (a float for a fixed size); see :class:`~romanmock.sizes.SizeSpec`."""
+        return self.size_spec.angular_size(data, cosmology)
+
+    @property
+    def two_tier(self) -> bool:
+        return self.secondary_snr < self.snr
+
+    @property
+    def snr_at_limit(self) -> float:
+        """S/N of a line exactly at the primary limit (= ``snr``)."""
+        return self.snr
+
+    # ---- the limits ----------------------------------------------------------------
+    def _resolve_size(self, size):
+        if size is None:
+            if not self.size_spec.is_fixed:
+                raise ValueError(f"RomanGrismSensitivity takes the size from the column {self.size_spec.column!r}: "
+                                 "pass size=... (romanmock.detection.detect_lines(size=...))")
+            return self.size_spec.fixed
+        return np.asarray(size, dtype=np.float64)
+
+    def flux_5sigma(self, wave_obs, size=None):
+        """5-sigma line flux [erg/s/cm^2] at ``wave_obs`` [A] for a source of angular size ``size``
+        [arcsec] (``None``: the fixed size of the model), for the model's exposure time and
+        background; ``inf`` outside the bandpass."""
+        wave_obs = np.asarray(wave_obs, dtype=np.float64)
+        size = self._resolve_size(size)
+        lo, hi = self.wave_range
+        inside = (wave_obs > lo) & (wave_obs < hi)
+        f_pt = 10.0 ** np.interp(wave_obs, self.wave, np.log10(self.flux_5sigma_point))
+        r_c = np.interp(wave_obs, self.wave, self.size_scale)
+        growth = (1.0 + (size / r_c) ** 2) ** self.size_exponent
+        return np.where(inside, f_pt * growth * self.depth_factor, np.inf)
+
+    def flux_limit(self, wave_obs, size=None):
+        """Primary limit: the flux with ``S/N = snr``."""
+        return self.flux_5sigma(wave_obs, size) * (self.snr / 5.0)
+
+    def secondary_flux_limit(self, wave_obs, size=None):
+        """Secondary limit: the flux with ``S/N = secondary_snr``."""
+        return self.flux_5sigma(wave_obs, size) * (self.secondary_snr / 5.0)
+
+    def snr_of(self, flux, wave_obs, size=None):
+        """S/N of lines of flux ``flux`` at ``wave_obs`` (0 outside the bandpass)."""
+        with np.errstate(divide="ignore", invalid="ignore"):
+            f5 = self.flux_5sigma(wave_obs, size)
+            return np.where(np.isfinite(f5), 5.0 * np.asarray(flux, dtype=np.float64) / f5, 0.0)
+
+    def nominal_flux_limit(self, wave: float = 15_000.0) -> float:
+        """The primary limit at one wavelength for the fixed size, or the reference size (0.3") for
+        a size column: a representative number, used for labels and for the lookup of reference dN/dz."""
+        size = self.size_spec.fixed if self.size_spec.is_fixed else self.reference_size
+        return float(self.flux_limit(np.array([wave]), size)[0])
+
+    def nominal_secondary_limit(self, wave: float = 15_000.0) -> float | None:
+        if not self.two_tier:
+            return None
+        return self.nominal_flux_limit(wave) * self.secondary_snr / self.snr
+
+    # ---- bookkeeping ---------------------------------------------------------------
+    def to_config(self) -> dict:
+        cfg = {"type": "roman_grism", "snr": self.snr, "secondary_snr": self.secondary_snr if self.two_tier else None,
+               "size": self.size_spec.to_config(), "exposure_time": self.exposure_time, "background": self.background,
+               "size_exponent": self.size_exponent, "wave_range": list(self.wave_range)}
+        default_table = (np.array_equal(self.wave, WFI_GRISM_SENSITIVITY_WAVE_ANGSTROM)
+                         and np.array_equal(self.flux_5sigma_point, WFI_GRISM_5SIGMA_POINT)
+                         and np.array_equal(self.flux_5sigma_extended, WFI_GRISM_5SIGMA_R50_0P3)
+                         and self.reference_size == WFI_GRISM_REFERENCE_SIZE_ARCSEC
+                         and self.reference_exposure_time == WFI_GRISM_REFERENCE_EXPOSURE_S
+                         and self.reference_background == WFI_GRISM_REFERENCE_BACKGROUND)
+        if not default_table:
+            cfg.update(wave=self.wave.tolist(), flux_5sigma_point=self.flux_5sigma_point.tolist(),
+                       flux_5sigma_extended=self.flux_5sigma_extended.tolist(), reference_size=self.reference_size,
+                       reference_exposure_time=self.reference_exposure_time, reference_background=self.reference_background)
+        return cfg
+
+    def describe(self) -> str:
+        hours = self.exposure_time / 3600.0
+        return (f"S/N >= {self.snr:g}" + (f" (other lines S/N >= {self.secondary_snr:g})" if self.two_tier else "")
+                + f", size {self.size_spec.describe()}, {hours:g} h, {self.background:g} x min zodi")
+
+    def __repr__(self):
+        return f"RomanGrismSensitivity({self.describe()}; {self.wave_range} A)"
+
+
+SENSITIVITY_MODELS = {"constant": ConstantFluxLimit, "tabulated": TabulatedFluxLimit, "roman_grism": RomanGrismSensitivity}
 
 
 def build_sensitivity(cfg) -> SensitivityModel:
@@ -189,14 +393,107 @@ def build_sensitivity(cfg) -> SensitivityModel:
         raise KeyError(f"unknown sensitivity model {kind!r}; known: {sorted(SENSITIVITY_MODELS)}")
 
 
-def secondary_flux_limit(sensitivity, wave_obs, primary_limit=None) -> np.ndarray:
+# ---------------------------------------------------------------------------------
+# helpers that work for every sensitivity model
+# ---------------------------------------------------------------------------------
+def uses_size(sensitivity) -> bool:
+    """Does the model take a source size (``flux_limit(wave_obs, size)``)?"""
+    return bool(getattr(sensitivity, "uses_size", False))
+
+
+def needs_size(sensitivity) -> bool:
+    """Does the model take the size of each galaxy from the catalog (a size column)? A model with a
+    fixed size keeps that size whatever sizes are passed to the helpers below."""
+    spec = getattr(sensitivity, "size_spec", None)
+    return uses_size(sensitivity) and spec is not None and not spec.is_fixed
+
+
+def primary_flux_limit(sensitivity, wave_obs, size=None) -> np.ndarray:
+    """``sensitivity.flux_limit`` at ``wave_obs``, with the sizes when the model takes them from the catalog."""
+    if size is not None and needs_size(sensitivity):
+        return sensitivity.flux_limit(wave_obs, size)
+    return sensitivity.flux_limit(wave_obs)
+
+
+def secondary_flux_limit(sensitivity, wave_obs, primary_limit=None, size=None) -> np.ndarray:
     """Secondary limit of ``sensitivity`` at ``wave_obs``, never above the primary limit.
     Models without a ``secondary_flux_limit`` method have a single tier."""
-    primary = sensitivity.flux_limit(wave_obs) if primary_limit is None else primary_limit
+    primary = primary_flux_limit(sensitivity, wave_obs, size) if primary_limit is None else primary_limit
     method = getattr(sensitivity, "secondary_flux_limit", None)
     if method is None:
         return primary
-    return np.minimum(method(wave_obs), primary)
+    second = method(wave_obs, size) if (size is not None and needs_size(sensitivity)) else method(wave_obs)
+    return np.minimum(second, primary)
+
+
+def nominal_flux_limit(sensitivity) -> float:
+    """One number for the primary limit of a model: the constant value, the model's own
+    ``nominal_flux_limit()``, or the limit in the middle of the bandpass."""
+    if hasattr(sensitivity, "flux_limit_value"):
+        return float(sensitivity.flux_limit_value)
+    if hasattr(sensitivity, "nominal_flux_limit"):
+        return float(sensitivity.nominal_flux_limit())
+    lo, hi = sensitivity.wave_range
+    return float(np.asarray(sensitivity.flux_limit(np.array([0.5 * (lo + hi)]))).ravel()[0])
+
+
+def nominal_secondary_limit(sensitivity) -> float | None:
+    """One number for the secondary limit of a model, ``None`` for a single tier."""
+    if not getattr(sensitivity, "two_tier", False):
+        return None
+    if hasattr(sensitivity, "secondary_flux_limit_value"):
+        return float(sensitivity.secondary_flux_limit_value)
+    if hasattr(sensitivity, "nominal_secondary_limit"):
+        return sensitivity.nominal_secondary_limit()
+    lo, hi = sensitivity.wave_range
+    return float(np.asarray(sensitivity.secondary_flux_limit(np.array([0.5 * (lo + hi)]))).ravel()[0])
+
+
+def describe_sensitivity(sensitivity) -> str:
+    """Short text of the limits of a model or of its config dict (``"F > 1.00e-16 (...)"``)."""
+    if isinstance(sensitivity, dict):
+        try:
+            sensitivity = build_sensitivity(sensitivity)
+        except Exception:                         # pragma: no cover - unknown model in a settings dict
+            return str(sensitivity)
+    if hasattr(sensitivity, "describe"):
+        return sensitivity.describe()
+    return repr(sensitivity)
+
+
+CONTAINMENT_SIZES_ARCSEC = (0.0, 0.1, 0.3, 0.6, 1.0, 2.0)
+
+
+def limits_contained(requested, base, n_wave: int = 4001, sizes=CONTAINMENT_SIZES_ARCSEC) -> tuple[str | None, float]:
+    """Is every galaxy ``requested`` can select in a base catalog built with ``base``?
+
+    The primary limits are compared on a grid of wavelengths inside the requested bandpass
+    and, when either model uses sizes, on a grid of sizes. Returns ``(message, min_ratio)``:
+    ``message`` is ``None`` when the requested limits are nowhere deeper than the base ones
+    and the bandpass is inside the base one, else it says where; ``min_ratio`` is the
+    smallest requested / base limit.
+    """
+    lo, hi = requested.wave_range
+    wave = np.linspace(lo, hi, n_wave)[1:-1]
+    with_size = needs_size(requested) or needs_size(base)
+    min_ratio = np.inf
+    for size in (sizes if with_size else (None,)):
+        req = primary_flux_limit(requested, wave, size)
+        ref = primary_flux_limit(base, wave, size)
+        inside = np.isfinite(req)
+        if np.any(inside & ~np.isfinite(ref)):
+            return (f"requested bandpass {requested.wave_range} extends beyond the bandpass of the base catalog "
+                    f"{tuple(base.wave_range)}", 0.0)
+        if not inside.any():
+            continue
+        ratio = req[inside] / ref[inside]
+        k = int(np.argmin(ratio))
+        min_ratio = min(min_ratio, float(ratio[k]))
+        if ratio[k] < 1.0 - 1e-9:
+            where = f"at {wave[inside][k]:.0f} A" + (f" for a size of {size:g} arcsec" if size is not None else "")
+            return (f"requested flux limit {req[inside][k]:.3g} is deeper than the base catalog limit "
+                    f"{ref[inside][k]:.3g} ({where})", float(ratio[k]))
+    return None, float(min_ratio)
 
 
 def apply_two_tier(primary: np.ndarray, secondary: np.ndarray) -> np.ndarray:
@@ -228,23 +525,34 @@ class DetectionModel(Protocol):
         ...
 
 
+def _snr_at_limit(sensitivity, value) -> float:
+    """S/N of a line at the primary limit: the given value, else the model's own (``snr_at_limit``),
+    else the project default (6.5, the HLSS reference depth)."""
+    if value is not None:
+        return float(value)
+    return float(getattr(sensitivity, "snr_at_limit", DEFAULT_SNR_AT_LIMIT))
+
+
 class ThresholdDetection:
-    """Deterministic rule of the plan: detected iff ``F > F_lim(lambda_obs)`` and the
+    """Deterministic rule of the plan: detected iff ``F > F_lim(lambda_obs[, size])`` and the
     line falls inside the bandpass; with a two-tier sensitivity, the other lines of a
-    galaxy with such a line are detected iff ``F > F_lim,secondary(lambda_obs)``.
-    ``snr`` is the nominal ``snr_at_limit * F / F_lim`` (primary limit)."""
+    galaxy with such a line are detected iff ``F > F_lim,secondary(lambda_obs[, size])``.
+    ``snr`` is the nominal ``snr_at_limit * F / F_lim`` (primary limit); ``snr_at_limit``
+    defaults to the value of the sensitivity model (the ``snr`` of
+    :class:`RomanGrismSensitivity`, where it makes ``snr`` the estimated S/N of the line)
+    or 6.5."""
 
-    def __init__(self, sensitivity: SensitivityModel | None = None, snr_at_limit: float = DEFAULT_SNR_AT_LIMIT):
+    def __init__(self, sensitivity: SensitivityModel | None = None, snr_at_limit: float | None = None):
         self.sensitivity = sensitivity if sensitivity is not None else ConstantFluxLimit()
-        self.snr_at_limit = float(snr_at_limit)
+        self.snr_at_limit = _snr_at_limit(self.sensitivity, snr_at_limit)
 
-    def detect(self, flux, wave_obs, rng=None) -> Detection:
+    def detect(self, flux, wave_obs, rng=None, size=None) -> Detection:
         flux = np.asarray(flux, dtype=np.float64)
-        flim = self.sensitivity.flux_limit(wave_obs)
+        flim = primary_flux_limit(self.sensitivity, wave_obs, size)
         with np.errstate(divide="ignore", invalid="ignore"):
             snr = np.where(np.isfinite(flim), self.snr_at_limit * flux / flim, 0.0)
         primary = flux > flim
-        detected = apply_two_tier(primary, flux > secondary_flux_limit(self.sensitivity, wave_obs, flim))
+        detected = apply_two_tier(primary, flux > secondary_flux_limit(self.sensitivity, wave_obs, flim, size))
         return Detection(detected=detected, flux_measured=flux, snr=snr, primary=primary)
 
     def to_config(self) -> dict:
@@ -255,26 +563,27 @@ class GaussianNoiseDetection:
     """Flux noise ``sigma = F_lim / snr_at_limit`` added to each line; detected iff the
     measured flux exceeds ``snr_threshold * sigma`` (and the line is in the bandpass).
 
-    With ``snr_threshold == snr_at_limit`` this reduces to the threshold rule on
+    With ``snr_threshold == snr_at_limit`` (the default) this reduces to the threshold rule on
     average but introduces detection scatter near the limit (plan comment 6). With a
     two-tier sensitivity the other lines of a galaxy with a primary detection need
     ``S/N > snr_threshold * F_lim,secondary / F_lim``; pure noise can then pass the
-    lower cut, as it would in real spectra.
+    lower cut, as it would in real spectra. With :class:`RomanGrismSensitivity`
+    ``sigma`` is the 1-sigma noise of the line (``F_5sigma / 5``).
     """
 
     def __init__(
         self,
         sensitivity: SensitivityModel | None = None,
-        snr_at_limit: float = DEFAULT_SNR_AT_LIMIT,
-        snr_threshold: float = DEFAULT_SNR_AT_LIMIT,
+        snr_at_limit: float | None = None,
+        snr_threshold: float | None = None,
     ):
         self.sensitivity = sensitivity if sensitivity is not None else ConstantFluxLimit()
-        self.snr_at_limit = float(snr_at_limit)
-        self.snr_threshold = float(snr_threshold)
+        self.snr_at_limit = _snr_at_limit(self.sensitivity, snr_at_limit)
+        self.snr_threshold = self.snr_at_limit if snr_threshold is None else float(snr_threshold)
 
-    def detect(self, flux, wave_obs, rng: np.random.Generator) -> Detection:
+    def detect(self, flux, wave_obs, rng: np.random.Generator, size=None) -> Detection:
         flux = np.asarray(flux, dtype=np.float64)
-        flim = self.sensitivity.flux_limit(wave_obs)
+        flim = primary_flux_limit(self.sensitivity, wave_obs, size)
         inside = np.isfinite(flim)
         sigma = np.where(inside, flim / self.snr_at_limit, np.inf)
         noise = rng.standard_normal(flux.shape) * np.where(inside, sigma, 0.0)
@@ -283,7 +592,7 @@ class GaussianNoiseDetection:
             snr = np.where(inside, flux_meas / sigma, 0.0)
         primary = inside & (snr > self.snr_threshold)
         with np.errstate(divide="ignore", invalid="ignore"):
-            ratio = np.where(inside, secondary_flux_limit(self.sensitivity, wave_obs, flim) / flim, 1.0)
+            ratio = np.where(inside, secondary_flux_limit(self.sensitivity, wave_obs, flim, size) / flim, 1.0)
         detected = apply_two_tier(primary, inside & (snr > self.snr_threshold * ratio))
         return Detection(detected=detected, flux_measured=flux_meas, snr=snr, primary=primary)
 

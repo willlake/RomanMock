@@ -57,7 +57,7 @@ from .selection import (
     keep_probability,
     sky_area_deg2,
 )
-from .sensitivity import ConstantFluxLimit, ThresholdDetection, build_detection, build_sensitivity
+from .sensitivity import ConstantFluxLimit, ThresholdDetection, build_detection, build_sensitivity, limits_contained
 
 #: bitmask at the limits of the base catalog. It must not be called ``line_bitmask``: OpenCosmo writes the stored
 #: column instead of a new one of the same name, so step 2 would silently keep the base bitmask.
@@ -95,6 +95,7 @@ class RomanMockPipeline:
         self.aux_data = aux_data
         self.line_set = line_set
         self.sensitivity = build_sensitivity(config.sensitivity)
+        self.size_spec = getattr(self.sensitivity, "size_spec", None)    # where the sizes come from, if the model uses them
         self.detection = build_detection(config.detection, self.sensitivity)
         self.confusion = build_confusion(config.confusion, self.line_set)
         self.multi_line = PerfectMultiLine(config.redshift.sigma_z)
@@ -112,10 +113,28 @@ class RomanMockPipeline:
     def input_columns(self) -> list[str]:
         cfg = self.config
         cols = list(self.line_set.required_columns)
-        for c in [cfg.flux.redshift_column, cfg.redshift.rsd_column, *cfg.redshift.context_columns, *cfg.output.passthrough_columns]:
+        for c in [cfg.flux.redshift_column, cfg.redshift.rsd_column, *self.size_columns, *cfg.redshift.context_columns,
+                  *cfg.output.passthrough_columns]:
             if c not in cols:
                 cols.append(c)
         return cols
+
+    @property
+    def size_columns(self) -> list[str]:
+        """Input columns the angular sizes of the galaxies are computed from (size-dependent sensitivity)."""
+        return list(self.size_spec.required_columns) if self.size_spec is not None else []
+
+    @property
+    def base_columns(self) -> list[str]:
+        """Input columns copied into the base catalog: ``base.columns`` plus the size columns of the
+        sensitivity model, so that step 2 can recompute the sizes."""
+        return list(dict.fromkeys([*self.config.base.columns, *self.size_columns]))
+
+    def angular_sizes(self, data: Mapping[str, np.ndarray], cosmology):
+        """Angular size [arcsec] of the galaxies for the sensitivity model (``None`` when it has none)."""
+        if self.size_spec is None:
+            return None
+        return self.size_spec.angular_size(data, cosmology)
 
     @property
     def flux_columns(self) -> list[str]:
@@ -128,7 +147,8 @@ class RomanMockPipeline:
                        f"dust attenuation included; D_L from column {self.config.flux.redshift_column}")
         for feat in self.line_set:
             d[f"{feat.name}_wave_obs"] = f"Observed wavelength of {feat.name} [Angstrom] = rest_wave (1 + {self.config.redshift.rsd_column})"
-            d[f"{feat.name}_snr"] = f"Signal-to-noise ratio of {feat.name} from the detection model"
+            d[f"{feat.name}_snr"] = (f"Signal-to-noise ratio of {feat.name} from the detection model: "
+                                     "snr_at_limit x flux / primary flux limit (the S/N estimate for the roman_grism sensitivity)")
             d[f"{feat.name}_flux_measured"] = f"Measured (noisy) flux of {feat.name} from the detection model"
         d["line_bitmask"] = "Detected-line bitmask; bit i = feature i of the line set (see header/run metadata)"
         d["n_det"] = "Number of detected features = popcount(line_bitmask)"
@@ -156,16 +176,18 @@ class RomanMockPipeline:
         cfg = self.config
         flux, comp = self.compute_fluxes(data, cosmology)
         context = {c: np.asarray(data[c]) for c in cfg.redshift.context_columns}
-        return self.process_fluxes(flux, data[cfg.redshift.rsd_column], rng, component_flux=comp, context=context)
+        return self.process_fluxes(flux, data[cfg.redshift.rsd_column], rng, component_flux=comp, context=context,
+                                   size=self.angular_sizes(data, cosmology))
 
     def process_fluxes(self, flux: np.ndarray, z_rsd, rng: np.random.Generator, component_flux: dict | None = None,
-                       context: Mapping[str, np.ndarray] | None = None) -> dict[str, np.ndarray]:
+                       context: Mapping[str, np.ndarray] | None = None, size=None) -> dict[str, np.ndarray]:
         """Detection, bitmask and redshift assignment from observed fluxes (the part of
-        stage A that does not need the input mock)."""
+        stage A that does not need the input mock). ``size`` is the angular size of the
+        galaxies [arcsec] for a size-dependent sensitivity model."""
         cfg = self.config
         z_rsd = np.asarray(z_rsd, dtype=np.float64)
         comp = component_flux
-        det = detect_lines(flux, z_rsd, self.line_set, self.detection, rng, component_flux=comp)
+        det = detect_lines(flux, z_rsd, self.line_set, self.detection, rng, component_flux=comp, size=size)
         za = assign_redshifts(det, z_rsd, self.line_set, self.confusion, rng, self.multi_line, extra_context=dict(context or {}))
 
         out: dict[str, np.ndarray] = {}
@@ -446,7 +468,7 @@ class RomanMockPipeline:
             "flux": _asdict(cfg.flux),
             "rsd_column": cfg.redshift.rsd_column,
             "sensitivity": _to_config(self.sensitivity),
-            "columns": list(cfg.base.columns),
+            "columns": list(self.base_columns),
             "store_bitmask": cfg.base.store_bitmask,
             "bitmask_column": BASE_BITMASK_COLUMN,
             "flux_dtype": str(np.dtype(cfg.base.flux_dtype)),
@@ -474,11 +496,12 @@ class RomanMockPipeline:
         bandpass, with ``base.columns``, ``redshift_rsd``, the flux of every line and the
         bitmask at the base limits."""
         cfg = self.config
-        clash = sorted(set(cfg.base.columns) & {*BASE_DERIVED_COLUMNS, *self.flux_columns, *self.component_flux_columns.values()})
+        base_columns = self.base_columns
+        clash = sorted(set(base_columns) & {*BASE_DERIVED_COLUMNS, *self.flux_columns, *self.component_flux_columns.values()})
         if clash:
             raise ValueError(f"base.columns must name input-catalog columns; {clash} are written by the pipeline itself")
         cols = list(dict.fromkeys([*self.line_set.required_columns, cfg.flux.redshift_column, cfg.redshift.rsd_column,
-                                   *cfg.base.columns]))
+                                   *base_columns]))
         missing = [c for c in cols if c not in dataset.columns]
         if missing:
             raise KeyError(f"catalog lacks required columns: {missing}")
@@ -486,7 +509,8 @@ class RomanMockPipeline:
         flux, comp = self.compute_fluxes(data, dataset.cosmology)
         z_rsd = np.asarray(data[cfg.redshift.rsd_column], dtype=np.float64)
         # the base selection is always the deterministic rule on true fluxes
-        det = detect_lines(flux, z_rsd, self.line_set, ThresholdDetection(self.sensitivity), component_flux=comp)
+        det = detect_lines(flux, z_rsd, self.line_set, ThresholdDetection(self.sensitivity), component_flux=comp,
+                           size=self.angular_sizes(data, dataset.cosmology))
         keep = np.where(det.bitmask > 0)[0]
         dtype = np.dtype(cfg.base.flux_dtype)
         new = {"redshift_rsd": z_rsd[keep]}
@@ -497,7 +521,7 @@ class RomanMockPipeline:
         if cfg.base.store_bitmask:
             new[BASE_BITMASK_COLUMN] = det.bitmask[keep]
         descriptions = self.base_column_descriptions()
-        base = dataset.select(*cfg.base.columns).take_rows(keep)
+        base = dataset.select(*base_columns).take_rows(keep)
         return base.with_new_columns(descriptions={k: descriptions[k] for k in new}, **new)
 
     def process_base_file(self, path, verbose: bool = True) -> tuple[Path, int]:
@@ -652,22 +676,14 @@ class RomanMockPipeline:
             raise ValueError("output.dir/output.tag must differ from base.dir/base.tag")
         base = self.base_manifest["base"]
         base_sens = build_sensitivity(base["sensitivity"])
-        lo, hi = self.sensitivity.wave_range
-        wave = np.linspace(lo, hi, 4001)[1:-1]
-        req, ref = self.sensitivity.flux_limit(wave), base_sens.flux_limit(wave)
-        inside = np.isfinite(req)
-        if np.any(inside & ~np.isfinite(ref)):
-            raise ValueError(f"requested bandpass {self.sensitivity.wave_range} extends beyond the bandpass of the "
-                             f"base catalog {base_sens.wave_range}; rebuild the base catalog")
-        if np.any(req[inside] < ref[inside] * (1.0 - 1e-9)):
-            k = np.argmin(req[inside] / ref[inside])
-            raise ValueError(f"requested flux limit {req[inside][k]:.3g} is deeper than the base catalog limit "
-                             f"{ref[inside][k]:.3g} (at {wave[inside][k]:.0f} A); rebuild the base catalog deeper")
-        if not isinstance(self.detection, ThresholdDetection) and np.any(req[inside] < ref[inside] * 1.5):
+        problem, min_ratio = limits_contained(self.sensitivity, base_sens)
+        if problem is not None:
+            raise ValueError(f"{problem}; rebuild the base catalog" + (" deeper" if "deeper" in problem else ""))
+        if not isinstance(self.detection, ThresholdDetection) and min_ratio < 1.5:
             warnings.warn("a noisy detection model scatters galaxies across the flux limit, but the base catalog has "
                           "none below its own limit; use a base catalog clearly deeper than the requested limit",
                           stacklevel=3)
-        missing = [c for c in [*cfg.output.passthrough_columns, *cfg.redshift.context_columns]
+        missing = [c for c in [*cfg.output.passthrough_columns, *cfg.redshift.context_columns, *self.size_columns]
                    if c not in [*base["columns"], "redshift_rsd"]]
         if missing:
             raise KeyError(f"columns {missing} are not in the base catalog (it has {base['columns']}); add them to "
@@ -696,7 +712,8 @@ class RomanMockPipeline:
         """Step 2 for one base-catalog dataset: parent-catalog rows (same columns as stage A)."""
         cfg = self.config
         comp_cols = self.component_flux_columns
-        need = list(dict.fromkeys([*self.flux_columns, *comp_cols.values(), "redshift_rsd", *cfg.redshift.context_columns]))
+        need = list(dict.fromkeys([*self.flux_columns, *comp_cols.values(), "redshift_rsd", *self.size_columns,
+                                   *cfg.redshift.context_columns]))
         missing = [c for c in need if c not in base.columns]
         if missing:
             raise KeyError(f"base catalog lacks required columns: {missing}")
@@ -710,7 +727,8 @@ class RomanMockPipeline:
         flux = np.stack([np.asarray(data[c], dtype=np.float64) for c in self.flux_columns], axis=1)
         comp = {lum: np.asarray(data[name], dtype=np.float64) for lum, name in comp_cols.items()} or None
         context = {c: np.asarray(data[c]) for c in cfg.redshift.context_columns}
-        result = self.process_fluxes(flux, data["redshift_rsd"], rng, component_flux=comp, context=context)
+        result = self.process_fluxes(flux, data["redshift_rsd"], rng, component_flux=comp, context=context,
+                                     size=self.angular_sizes(data, base.cosmology))
         # columns that already exist in the base catalog are copied, not recreated
         copied = ["redshift_rsd", *(self.flux_columns if cfg.output.store_fluxes else [])]
         for c in ["redshift_rsd", *self.flux_columns]:

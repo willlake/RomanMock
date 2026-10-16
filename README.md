@@ -34,6 +34,9 @@ used for the luminosity distances.
 
 `romanmock info <catalog_dir>` lists the slices, their redshift ranges and the cosmology.
 
+The package also reads the Galacticus lightcone mocks of the Roman GRS-PIT (`romanmock.galacticus`, see
+[Galacticus mocks](#galacticus-mocks) below).
+
 ## Quick start: the two-step workflow
 
 Reading the 340 GB input mock is the expensive part and does not depend on the things one wants to
@@ -48,7 +51,8 @@ sbatch scripts/production.sh                  # configs/production.yaml: base ca
 romanmock base cfg.yaml --workers 32          # the base catalog alone
 ```
 
-`cfg.yaml` needs `catalog.path`, `base.dir` and, to change the defaults, `sensitivity` and `base.columns`.
+`cfg.yaml` needs `catalog.path`, `base.dir` and, to change the defaults, `sensitivity` and `base.columns`. Add
+`r50_disk_2d` to `base.columns` (as `configs/production.yaml` does) to use the size of each galaxy in step 2.
 `configs/production.yaml` is the configuration of the production run, `configs/roman_grism_baseline.yaml` a
 commented template of every option.
 
@@ -74,10 +78,24 @@ print(cat.summary())                              # counts per identification ou
 cat.write("halpha.hdf5")                          # optional: .hdf5, .fits or .npz; Catalog.read() brings it back
 ```
 
+The thresholds can also be S/N values in the Roman grism instead of flux limits (the second way of building a
+catalog, see *S/N thresholds* below): a galaxy needs one line with S/N ≥ 5 and its other lines are detected with
+S/N ≥ 2, where the noise depends on the observed wavelength and on the angular size of the galaxy, either one size
+for all or the size of each galaxy from the mock.
+
+```python
+cat = base.make_catalog(snr=5, secondary_snr=2, size="r50_disk_2d", lines=["Ha"], z_range=(1.0, 1.9))
+cat = base.make_catalog(snr=5, secondary_snr=2, size=0.3)        # 0.3 arcsec for every galaxy; 0 = point source
+```
+
 | argument | meaning | default |
 |---|---|---|
 | `flux_limit` | primary limit; cannot be deeper than the base catalog | the base catalog's limit |
 | `secondary_flux_limit` | limit for the other lines of a detected galaxy; `None` = no second tier | 4.0e-17 |
+| `snr`, `secondary_snr` | instead of the flux limits: S/N of the primary line and of the other lines (`None` = no second tier) in the Roman grism | 5, 2 |
+| `size` | angular size of the galaxies for the S/N: arcsec for all, or a column of the base catalog in proper kpc (`"r50_disk_2d"`, must be in `base.columns`) | 0.3 |
+| `exposure_time`, `background` | exposure [s] and background in units of the minimum zodiacal light, rescaling the noise | 3600, 2 |
+| `sensitivity` | any sensitivity model config or object, instead of the arguments above | |
 | `confusion` | rows of the confusion matrix, a full config, or a model object; `"empirical"` or a `LineFractionTable` for the line mix of the mock (below) | package default |
 | `lines` | keep galaxies in which one of these lines is identified | every line |
 | `membership` | multi-line galaxies: `"detected"` = each detected line is identified (a galaxy with Hα and [O III] is in both samples); `"assigned"` = only the brightest line, disjoint samples. `romanmock select` defaults to `assigned` | `"detected"` |
@@ -210,7 +228,7 @@ identical settings and seed (tested) and is the route to take when the output mu
 | Plan step | Module | What it does |
 |---|---|---|
 | fluxes | `romanmock.fluxes`, `romanmock.cosmology` | `F = L / (4 pi D_L^2)` with the catalog cosmology from OpenCosmo (`astropy` backend) or `dsps.cosmology.luminosity_distance_to_z` (`dsps` backend; agree to 5e-6) |
-| 1. detectability | `romanmock.sensitivity`, `romanmock.detection` | `lambda_obs = lambda_0 (1+z_rsd)`; `ConstantFluxLimit` (primary limit 1.0e-16 erg/s/cm², secondary limit 4.0e-17) or `TabulatedFluxLimit` (wavelength dependent, `secondary_ratio`); `ThresholdDetection` or `GaussianNoiseDetection` |
+| 1. detectability | `romanmock.sensitivity`, `romanmock.detection`, `romanmock.sizes` | `lambda_obs = lambda_0 (1+z_rsd)`; `ConstantFluxLimit` (primary limit 1.0e-16 erg/s/cm², secondary limit 4.0e-17), `TabulatedFluxLimit` (wavelength dependent, `secondary_ratio`) or `RomanGrismSensitivity` (S/N thresholds 5 and 2; noise from the WFI grism tables against wavelength and source size, exposure time and background); `ThresholdDetection` or `GaussianNoiseDetection` |
 | 2. bitmask | `romanmock.lines`, `romanmock.detection` | bit *i* = feature *i* of a `LineSet`; `n_det = popcount`; ordering written to the run metadata |
 | 3. redshift | `romanmock.confusion`, `romanmock.redshift` | multi-line: `z_assigned = z_rsd` (optional `sigma_z`); single-line: draw identity *j* from `C_ij` (+ fail column) or from the line mix of the mock at the line's observed wavelength and flux rank (`LineFractionTable`), `z_assigned = lambda_i,0 (1+z_rsd)/lambda_j,0 - 1` |
 | two-step | `RomanMockPipeline.build_base`, `romanmock.catalog.BaseCatalog` | base flux catalog written once; catalogs made from it in memory (`make_catalog`) or as files (`source: base`) |
@@ -241,6 +259,42 @@ brightest detected line (`line_true`) is always above the primary limit, so popu
 dN/dz at the primary limit is unaffected; `membership: detected` samples do include secondary detections.
 `TabulatedFluxLimit` takes the second tier as `secondary_ratio` (off by default), and
 `GaussianNoiseDetection` applies it in signal-to-noise terms. Note that 4e-17 is 2.6σ for a 6.5σ limit of 1e-16.
+
+### S/N thresholds: the Roman grism sensitivity
+
+The second way of fixing the detection (`type: roman_grism`, `RomanGrismSensitivity`) replaces the two flux limits by
+two S/N thresholds and a noise model from the NASA WFI technical page (grism section, v1.4): the 5σ line-flux limit at
+ten observed wavelengths for one hour at twice the minimum zodiacal light, for a point source and for a source
+with r50 = 0.3", scaling as `t^-1/2 b^1/2`. The 5σ flux of a line at wavelength λ in a galaxy of angular size r is
+
+```
+F_5σ(λ, r) = F_5σ,point(λ) · [1 + (r / r_c(λ))²]^p · (t / 3600 s)^-1/2 · (b / 2)^1/2        S/N = 5 F / F_5σ
+```
+
+with `r_c(λ)` fixed by the two tabulated sizes (0.12–0.14", close to the PSF) and `p = size_exponent` (0.5). A galaxy
+needs one line with `S/N >= snr` (5) inside the bandpass; its other lines are detected with `S/N >= secondary_snr`
+(2): one detected line makes a single-line galaxy, a primary line plus secondary ones a multi-line galaxy. The size
+is one number in arcsec for all galaxies (`size: 0.3`; `0` = point source) or a column of the mock in proper kpc
+(`size: r50_disk_2d`, the half-mass radius of the disk, converted at `redshift_true`; `romanmock base` then stores the
+column, and `make_catalog` needs it in `base.columns`). `exposure_time` and `background` (in units of the minimum
+zodiacal light; a typical HLWAS field is about 1.4) rescale the noise. With `snr: 6.5, size: 0.3` the limit at 1.5 µm
+is 1.05e-16, the baseline of the flux-limit route. Sizes above 0.3" extrapolate the two tabulated rows.
+
+```yaml
+sensitivity:
+  type: roman_grism
+  snr: 5.0
+  secondary_snr: 2.0            # null: single tier
+  size: r50_disk_2d             # or 0.3 (arcsec); full form {column: r50_disk_2d, unit: kpc, redshift_column: redshift_true, scale: 1.0, floor: 0.0}
+  exposure_time: 3600.0
+  background: 2.0
+output:
+  store_snr: true               # <line>_snr: the S/N of every line
+```
+
+A base catalog contains a later selection when its primary limits are nowhere deeper (checked on a grid of
+wavelengths and sizes, `sensitivity.limits_contained`); a base built at a constant 1e-17 or with `size: 0` serves
+every later choice. The S/N route is explained in `RomanMock_SNR_Sensitivity_Note.md` of the project directory.
 
 ### Line features and bit ordering
 
@@ -292,7 +346,8 @@ preserved). OpenCosmo adds its own `redshift` column (equal to `redshift_true`).
 
 `output.passthrough_columns` copies further columns (`gal_id`, and with `romanmock run` any input column such as
 `logsm_obs`, `roman_F158`); `store_fluxes`, `store_wave_obs`, `store_snr`, `store_measured_flux` add per-feature
-columns (`<feature>_flux` in erg/s/cm², ...).
+columns (`<feature>_flux` in erg/s/cm², `<feature>_snr` = `snr_at_limit × F / F_lim`, the S/N estimate of the
+`roman_grism` sensitivity, ...).
 
 **Base catalog** (`romanmock base`): `base.columns` (default `gal_id, ra, dec, redshift_true`), `redshift_rsd`,
 `<feature>_flux` for every feature of the line set (float64; `base.flux_dtype: float32` saves 4 bytes per line
@@ -415,8 +470,51 @@ cuts only, for several limits in one pass, split into single-line and multi-line
 (one threshold for every line, the population of the Wang et al. tables) or a `(primary, secondary)` pair (the
 two-tier rule). `romanmock census` writes it to a file and notebook 01 plots it. `romanmock flux-distribution`
 (`romanmock.fluxdist.FluxDistribution`) histograms the flux of every line of every galaxy per redshift bin with no
-cut, for `quantile(line, q)`, `fraction_above(line, flux)` and `number_above` as functions of redshift (notebook 04). With one threshold at 1.0e-16 the mock has 1.5 times the forecast Hα
+cut, for `quantile(line, q)`, `fraction_above(line, flux)` and `number_above` as functions of redshift (notebook 04; `rebin(step)` merges redshift bins). With one threshold at 1.0e-16 the mock has 1.5 times the forecast Hα
 counts over 0.5 < z < 2.0 and 3 times the [O III] counts over 1.0 < z < 3.0.
+
+## Galacticus mocks
+
+`/global/cfs/cdirs/m4943/Galacticus/mockCatalogs/GP-MCMC-Calibration1_allUNIT_16sqDegMock_XMM-LSS/` (Andrew
+Robertson, June 2026) is a 4° × 4° lightcone (16 deg², centred on RA 35.71°, Dec −4.75°) from the UNIT simulation:
+`galaxyCatalogs/` holds 400 files `romanUNIT-d<a>_<b>_16sqDeg.hdf5` (431 GB, most of it star-formation histories),
+random subsamples of the merger trees that each cover the whole volume, 38.5 M galaxies at 0 < z < 9 in all. The
+galaxy properties are the datasets of `/Lightcone/Output1/nodeData` (dust-free) and
+`/Lightcone/Output1/dustAttenuatedNodeData` (same names, dust applied: Calzetti law, stellar-mass and redshift
+dependent attenuation of the lines). Seventeen emission lines (`balmerAlpha6565`, `balmerBeta4863`, `balmerGamma4342`,
+`balmerDelta4103`, `nitrogenII6550`, `nitrogenII6585`, `oxygenII3727`, `oxygenII3730`, `oxygenIII4933`, `oxygenIII4960`,
+`oxygenIII5008`, `paschenAlpha18756`, `paschenBeta12822`, `sulfurII6718`, `sulfurII6733`, `sulfurIII9071`,
+`sulfurIII9533`) come as one dataset per component, `luminosityEmissionLine{Disk,Spheroid,AGN}:<line>` in erg/s;
+the luminosity of a line is the sum of the three. `lightconeRedshiftCosmological` is the cosmological redshift,
+`lightconeRedshiftObserved` includes the peculiar velocity. Cosmology: flat ΛCDM, H0 = 67.74, Ω_m = 0.3089 (no
+radiation; it reproduces the stored comoving positions to 2e-5).
+
+```python
+from romanmock.galacticus import GalacticusMock
+
+mock = GalacticusMock("/global/cfs/cdirs/m4943/Galacticus/mockCatalogs/GP-MCMC-Calibration1_allUNIT_16sqDegMock_XMM-LSS")
+print(mock)                                     # 400 files, dust-attenuated lines, 16 deg², H0, Om0
+data = mock.read(["redshift_true", "redshift_rsd", "ra", "dec", "balmerAlpha6565", "oxygenIII5008"],
+                 z_range=(1.0, 2.0), n_workers=4)       # combined arrays of all files; a line = disk + spheroid + AGN
+fluxes = mock.read_fluxes("galacticus_transitions", z_range=(0.5, 2.9), n_workers=4)   # Ha_flux, Hb_flux, ... erg/s/cm²
+for path, chunk in mock.iter_files(["redshift_true", "balmerAlpha6565"]):             # file by file, a few MB each
+    ...
+dist = mock.flux_distribution(np.arange(0, 4.001, 0.01), n_workers=6)                  # FluxDistribution, as notebook 04
+```
+
+Columns are the package's names (`redshift_true`, `redshift_rsd`, `ra`, `dec`, `gal_id`, `is_central`), Galacticus line
+names (summed over the components, dust-attenuated by default, `GalacticusMock(path, dust=False)` or `read(..., dust=False)`
+for the dust-free values), explicit component datasets (`luminosityEmissionLineAGN:balmerAlpha6565`), magnitudes
+(`apparentMagnitudeRomanWFI:F158`) or any other dataset of `nodeData` (`diskMassStellar`). `z_range=(lo, hi)` keeps
+`lo <= z < hi` in `z_column` (default `redshift_true`); `files=` restricts to some files; `n_workers` reads files in
+parallel processes (I/O bound: the whole mock's redshifts and one line take 3 minutes with four workers on a login node).
+
+The line set `galacticus_transitions` (`romanmock lines`) has 16 features: the seven of `roman_transitions` under the
+same names (`Ha`, `Hb`, `OIII_5007`, `OIII_4959`, `OII_3727` blend, `SIII_9532`, `SIII_9069`), then `NII_6585`, `NII_6550`,
+`SII_6718`, `SII_6733`, `Hg`, `Hd`, `PaB`, `PaA`, `OIII_4933`. Rest wavelengths are the vacuum values of the air wavelengths
+stored in the files (`romanmock.lines.GALACTICUS_LINE_WAVELENGTHS`, `galacticus.air_to_vacuum`). `romanmock
+galacticus-flux-distribution <mock_dir> -o out.npz --dz 0.01 --workers 6` is the command-line form of
+`mock.flux_distribution` (4 minutes for the whole mock on a login node); notebook 07 is notebook 04 for this mock.
 
 ## Resources
 
@@ -464,13 +562,17 @@ The products for the mock `sdss_feniks_hizels_260710_09_07_2026` are in
 4. `04_line_flux_distribution.ipynb` – the line fluxes of every galaxy of the mock (no flux cut): quantiles and fractions above the thresholds versus redshift, the companion lines of a selected galaxy; what explains the counts of notebook 01.
 5. `05_line_flux_vs_wavelength.ipynb` – the single-line galaxies (one in-band line above 1.5e-16, no other above 6e-17), read from the base catalog, against observed wavelength: 0–90 % and 90–99.9 % quantiles of the flux of the single line, and the stacked share of each line among the single-line galaxies above a flux threshold in twelve 775 Å ranges of the bandpass; lines that are the single line of fewer than 1 % of the galaxies in every range are left out of the plots.
 6. `06_line_combinations.ipynb` – stacked composition of the detected galaxies (primary 1.5e-16, secondary 6e-17) against redshift, 0.5 to 3.0: single-line galaxies per line at the bottom, multi-line galaxies per combination of detected lines above.
+7. `07_galacticus_line_flux_distribution.ipynb` – notebook 04 for the Galacticus mock `GP-MCMC-Calibration1_allUNIT_16sqDegMock_XMM-LSS` (dust-attenuated disk + spheroid + AGN luminosities): flux quantiles and fractions above the thresholds versus redshift with the diffsky mock alongside, emitters per square degree against the diffsky mock and the Wang et al. (2022) forecast, the companion lines of a selected galaxy. Its flux distribution is `/global/cfs/cdirs/m4943/Simulations/RomanMocks/GP-MCMC-Calibration1_allUNIT_16sqDegMock_XMM-LSS/census/flux_distribution.npz`.
 
 ## Extending (hooks for the plan's comments)
 
-* **Wavelength-dependent sensitivity** (comment 6): `sensitivity: {type: tabulated, file: curve.txt}`
-  or register a class in `romanmock.sensitivity.SENSITIVITY_MODELS`. A model that defines
-  `secondary_flux_limit(wave_obs)` gets the two-tier rule.
-* **Detection scatter / source size / overlap**: implement `DetectionModel.detect(flux, wave_obs, rng)`
+* **Wavelength-dependent sensitivity** (comment 6): `sensitivity: {type: tabulated, file: curve.txt}`,
+  `{type: roman_grism, ...}` (wavelength, source size, exposure, background; the WFI tables can be replaced by
+  the constructor arguments `wave`, `flux_5sigma_point`, `flux_5sigma_extended`), or register a class in
+  `romanmock.sensitivity.SENSITIVITY_MODELS`. A model that defines `secondary_flux_limit(wave_obs)` gets the
+  two-tier rule; a model with `uses_size = True`, a `size_spec` (`romanmock.sizes.SizeSpec`) and
+  `flux_limit(wave_obs, size)` gets the angular size of each galaxy from the pipeline.
+* **Detection scatter / overlap**: implement `DetectionModel.detect(flux, wave_obs, rng, size=None)`
   and register it in `DETECTION_MODELS` (`GaussianNoiseDetection` is the first example).
 * **Confusion depending on `lambda_obs`, S/N, photometry** (comment 3): implement
   `ConfusionModel.assign(true_index, context, rng)`; `context` carries `wave_obs`, `snr`,
