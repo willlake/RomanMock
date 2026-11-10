@@ -26,6 +26,10 @@ DEFAULT_SECONDARY_LINE_FLUX_LIMIT = 4.0e-17
 # Gaussian-noise detection model.
 DEFAULT_SNR_AT_LIMIT = 6.5
 
+# Default redshift bins (edges): the six H-alpha bins of the Roman full-shape forecast of Spezzati, Wang & Hearin
+# (2026, arXiv:2604.14504, Table I), made on a diffsky Last Journey mock.
+DEFAULT_REDSHIFT_BINS = (0.5, 0.8, 1.0, 1.2, 1.4, 1.6, 2.0)
+
 # ---------------------------------------------------------------------------------------
 # Roman WFI grism sensitivity (NASA WFI technical page, "Grism" section, v1.4 March 2026;
 # https://science.nasa.gov/mission/roman-space-telescope/wfi-technical/)

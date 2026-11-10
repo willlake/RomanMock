@@ -144,6 +144,45 @@ def test_flux_distribution_matches_direct_and_saves(small_mock, tmp_path):
     assert np.log10(nodust.quantile("Ha", 0.5)[1] / dist.quantile("Ha", 0.5)[1]) == pytest.approx(np.log10(2.0), abs=0.03)
 
 
+def test_line_fractions_match_direct(small_mock, tmp_path):
+    from romanmock.confusion import LineFractionTable
+    from romanmock.detection import detect_lines
+    from romanmock.redshift import single_lines
+    from romanmock.sensitivity import ConstantFluxLimit, ThresholdDetection
+
+    root, _ = small_mock
+    mock = GalacticusMock(root)
+    kw = dict(wave_bin=1000.0, galaxies_per_bin=20, min_count=1)
+    table = mock.line_fractions(2e-17, 1e-17, verbose=False, write_to=tmp_path / "lf.npz", **kw)
+    fl = mock.read_fluxes()
+    flux = np.stack([fl[f"{n}_flux"] for n in GALACTICUS_TRANSITIONS.names], axis=1)
+    det = detect_lines(flux, fl["redshift_rsd"], GALACTICUS_TRANSITIONS, ThresholdDetection(ConstantFluxLimit(2e-17, secondary_flux_limit=1e-17)))
+    wave, f, line = single_lines(det)
+    direct = LineFractionTable.from_single_lines(GALACTICUS_TRANSITIONS, wave, f, line, table.wave_edges, 20, min_count=1)
+    assert table.n_single == wave.size > 100 and table.settings["n_base"] == 7500 and table.settings["flux_limit"] == 2e-17
+    np.testing.assert_array_equal(table.counts, direct.counts)
+    np.testing.assert_allclose(table.flux_edges, direct.flux_edges)
+    np.testing.assert_array_equal(LineFractionTable.load(tmp_path / "lf.npz").counts, table.counts)
+    # the single lines themselves, with columns of their galaxies
+    single = mock.single_lines(2e-17, 1e-17, columns=["redshift_rsd", "diskMassStellar"], n_workers=2, verbose=False)
+    rows = np.flatnonzero(det.n_det == 1)
+    np.testing.assert_array_equal(single["line"], line)
+    np.testing.assert_allclose(single["wave"], wave)
+    np.testing.assert_allclose(single["flux"], f)
+    np.testing.assert_array_equal(single["redshift_rsd"], fl["redshift_rsd"][rows])
+    np.testing.assert_array_equal(single["diskMassStellar"], mock.read(["diskMassStellar"])["diskMassStellar"][rows])
+    # the same with two workers, and the S/N route needs a fixed size
+    np.testing.assert_array_equal(mock.line_fractions(2e-17, 1e-17, n_workers=2, verbose=False, **kw).counts, table.counts)
+    with pytest.raises(ValueError, match="fixed size"):
+        mock.line_fractions(snr=5, size="r50_disk_2d", verbose=False)
+    # cuts on any column remove galaxies before the detection
+    cut = mock.line_fractions(2e-17, 1e-17, cuts={"diskMassStellar": (1e9, None)}, verbose=False, **kw)
+    big = mock.read(["diskMassStellar"])["diskMassStellar"] >= 1e9
+    det_cut = detect_lines(flux[big], fl["redshift_rsd"][big], GALACTICUS_TRANSITIONS,
+                           ThresholdDetection(ConstantFluxLimit(2e-17, secondary_flux_limit=1e-17)))
+    assert cut.n_single == np.sum(det_cut.n_det == 1) and cut.settings["n_cut"] == np.sum(~big) > 0
+
+
 @pytest.mark.skipif(not galacticus_available(), reason="Galacticus mock not available")
 def test_real_mock_serial_equals_parallel():
     mock = GalacticusMock(GALACTICUS_DIR)

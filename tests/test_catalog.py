@@ -182,7 +182,7 @@ def test_line_report(base, capsys):
     _, b = base
     cat = b.make_catalog(confusion=ROWS, seed=5, columns=ALL, n_workers=1, verbose=True, **LIMITS)
     printed = capsys.readouterr().out
-    assert cat.line_report() in printed and "line interlopers" in printed
+    assert cat.line_report() in printed and cat.summary() in printed and "── Interlopers" in printed
     rep = cat.info["line_report"]
     lo, hi = b.wave_range
     names = cat.line_names
@@ -261,7 +261,7 @@ def test_sky_area_given_or_estimated(base, capsys):
     edges = np.array([0.25, 0.4])
     given = b.make_catalog(n_workers=1, area_deg2=1000.0, **LIMITS)
     assert given.area_deg2 == 1000.0 and given.info["area_source"] == "user" and b.area_deg2 == 1000.0
-    assert "1000.00 deg2 (given)" in capsys.readouterr().out
+    assert "1000.00 deg² (given)" in capsys.readouterr().out
     np.testing.assert_allclose(given.dndz(edges) * 1000.0, est.dndz(edges) * est.area_deg2)
     assert BaseCatalog(b.dir, area_deg2=2500.0).area_deg2 == 2500.0
     b.area_deg2 = None                                                  # back to the estimate
@@ -349,3 +349,197 @@ def test_empirical_confusion_catalog(base):
         b.make_catalog(confusion=table, flux_limit=2e-16, seed=5, n_workers=1, verbose=False)
     with pytest.raises(KeyError):
         b.make_catalog(confusion={"type": "empirical", "wave_bins": 3}, seed=5, n_workers=1, verbose=False, **LIMITS)
+
+
+def _key(cat):
+    """One key per galaxy (gal_id with its redshift: an id can repeat across box replicas)."""
+    return np.char.add(cat["gal_id"].astype(str), np.char.add("_", np.round(cat["redshift_rsd"], 9).astype(str)))
+
+
+def test_rescaling_and_doublet_rule(base):
+    """`rescaling=` and `doublets=`: the fluxes of the catalog are the stored ones rescaled galaxy by galaxy, a doublet rule
+    with no [O III] in the bandpass (z ~ 0.3) changes nothing, and a table is checked for the same choices."""
+    from romanmock.rescaling import GalacticusLike
+
+    tmp, b = base
+    flux_cols = b.flux_columns
+    cols = ["gal_id", "redshift_rsd", *flux_cols, "n_det", "doublet_merged"]
+    stored = b.make_catalog(confusion={}, columns=cols, outcomes=None, n_workers=1, verbose=False, **LIMITS)
+    assert stored.settings["rescaling"] is None and stored.settings["doublets"] is None and not stored["doublet_merged"].any()
+    for doublets in ("separated", {"mode": "per_galaxy", "size": 0.3}):
+        same = b.make_catalog(confusion={}, columns=cols, outcomes=None, doublets=doublets, n_workers=1, verbose=False, **LIMITS)
+        for c in cols:
+            np.testing.assert_array_equal(same[c], stored[c], err_msg=c)
+        assert same.settings["doublets"]["mode"] in ("separated", "per_galaxy")
+    with pytest.raises(KeyError, match="r50_disk_2d"):                  # the test base stores no size column
+        b.make_catalog(doublets="per_galaxy", n_workers=1, verbose=False, **LIMITS)
+    with pytest.raises(KeyError, match="PaA"):        # the old mock has no Paα: the dust per galaxy cannot be read
+        b.make_catalog(rescaling="galacticus_like", n_workers=1, verbose=False, **LIMITS)
+    constant = {"type": "galacticus_like", "galaxy_dust": []}              # the first version: constant dust terms
+    with pytest.warns(RuntimeWarning, match="brightens a line"):          # a 1e-16 base is not deep enough at 5 sigma
+        resc = b.make_catalog(confusion={}, columns=cols, outcomes=None, rescaling=constant, n_workers=1, verbose=False, **LIMITS)
+    assert resc.settings["rescaling"]["type"] == "galacticus_like" and "rescaled" in repr(resc)
+    common, i_s, i_r = np.intersect1d(_key(stored), _key(resc), return_indices=True)
+    assert common.size > 1000
+    expect = GalacticusLike(galaxy_dust=()).apply_columns({"gal_id": stored["gal_id"][i_s], **{c: stored[c][i_s] for c in flux_cols}},
+                                                          b.line_set)
+    for c in flux_cols:
+        np.testing.assert_allclose(resc[c][i_r], expect[c], rtol=1e-12, err_msg=c)
+    # a table built with the rescaling, used for a catalog without it, warns
+    with pytest.warns(RuntimeWarning):
+        table = b.line_fractions(rescaling=constant, n_workers=1, verbose=False, **LIMITS)
+    assert table.settings["rescaling"]["type"] == "galacticus_like" and table.settings["doublets"] is None
+    with pytest.warns(RuntimeWarning, match="rescaling"):
+        b.make_catalog(confusion=table, n_workers=1, verbose=False, **LIMITS)
+
+
+def test_proposal_then_catalog(base, tmp_path):
+    """Step 1 counts what step 2 builds: the target sample of the proposal is the clean catalog, and every potential
+    interloper taken for the target line lands in the catalog. At z ~ 0.3 the target is [S III] 9069 at 0.33-0.40; its
+    potential interlopers are the single-line [S III] 9532 galaxies at 0.27-0.33."""
+    from romanmock import Proposal
+    from romanmock.proposal import CATALOG_COLUMNS
+
+    tmp, b = base
+    with pytest.raises(ValueError, match="propose the thresholds"):
+        b.make_proposal((0.33, 0.40), line="SIII_9069", n_workers=1, verbose=False)
+    p = b.make_proposal((0.33, 0.40), line="SIII_9069", rescaling=None, doublets=None, min_count=1, n_workers=1, verbose=False,
+                        **LIMITS)
+    assert p.n_sample > 1000 and "SIII_9532" in p.major_inside and "SIII_9532" in p.major_interlopers
+    assert "Potential interlopers" in p.summary() and p.interlopers()["SIII_9532"]["n"] > 100
+    name = p.default_name()
+    clean = p.make_catalog({}, tmp_path / "clean", n_workers=1, verbose=False)
+    for suffix in (".hdf5", "_summary.json", "_proposal.npz"):
+        assert (tmp_path / "clean" / f"{name}{suffix}").exists()
+    direct = b.make_catalog(confusion={}, lines=["SIII_9069"], z_range=(0.33, 0.40), columns=CATALOG_COLUMNS, n_workers=1,
+                            verbose=False, **LIMITS)
+    back = Catalog.read(tmp_path / "clean" / f"{name}.hdf5")
+    for c in CATALOG_COLUMNS:
+        np.testing.assert_array_equal(clean[c], direct[c], err_msg=c)
+        np.testing.assert_array_equal(back[c], clean[c], err_msg=c)
+    assert len(clean) == p.n_sample
+    # every single [S III] 9532 taken for 9069: the interlopers of the catalog are the proposal's potential ones
+    rows = p.confusion_template(p_interloper=1.0)
+    assert rows["SIII_9532"] == {"SIII_9069": 1.0}
+    cont = p.make_catalog(rows, tmp_path / "cont", name="cont", n_workers=1, verbose=False)
+    expected = sum(p.counts["n_assigned"][p.inside, b.line_set.names.index(x), 0].sum() for x in rows if x != "SIII_9069")
+    assert (cont["id_outcome"] == 3).sum() == expected > 100
+    q = Proposal.load(tmp_path / "cont" / "cont_proposal.npz", base=b)
+    assert q.settings == p.settings and q.n_sample == p.n_sample
+
+
+def test_proposal_of_every_line_then_catalog(base, tmp_path, capsys):
+    """line="all": the hint is printed, the sample is the clean catalog of every galaxy, and a single line taken for
+    another line is an interloper wherever its new redshift falls inside the range: the single [S III] 9532 galaxies
+    at 0.27-0.33 taken for 9069 come in, those at 0.33-0.36 leave unless they land below 0.40."""
+    from romanmock.proposal import CATALOG_COLUMNS
+
+    tmp, b = base
+    p = b.make_proposal((0.33, 0.40), line="all", rescaling=None, doublets=None, min_count=1, n_workers=1, **LIMITS)
+    printed = capsys.readouterr().out
+    assert 'line = "all"' in printed and all(f'"{k}"' in printed for k in ("Ha", "OIII_5007")) and "every galaxy" in printed
+    assert "━━ Proposal · every galaxy at 0.33 ≤ z ≤ 0.4" in printed and "done in" in printed
+    assert p.all_lines and {"SIII_9532", "SIII_9069"} <= set(p.targets) and p.default_name() == "all_z0p33_0p4"
+    clean = p.make_catalog({}, tmp_path / "clean", n_workers=1, verbose=False)
+    direct = b.make_catalog(confusion={}, z_range=(0.33, 0.40), columns=CATALOG_COLUMNS, n_workers=1, verbose=False, **LIMITS)
+    np.testing.assert_array_equal(clean["gal_id"], direct["gal_id"])
+    # every detected galaxy here has [S III] 9532 detected (the brightest line in the bandpass at z 0.33-0.36)
+    assert len(clean) == p.n_sample > 1000 and p.n_sample == b.make_proposal(
+        (0.33, 0.40), line="SIII_9532", rescaling=None, doublets=None, n_workers=1, verbose=False, **LIMITS).n_sample
+    i, k = b.line_set.names.index("SIII_9532"), p.targets.index("SIII_9069")
+    cont = p.make_catalog({"SIII_9532": {"SIII_9069": 1.0}}, tmp_path / "cont", n_workers=1, verbose=False)
+    wrong = cont["id_outcome"] == 3
+    assert wrong.sum() == p.counts["n_assigned"][p.inside, i, k].sum() > 100
+    assert (~wrong).sum() == p.n_sample - p.counts["n_single"][p.inside, i].sum()
+
+
+def test_catalog_by_design(base, tmp_path, capsys):
+    """A catalog designed by its interloper fractions: the single [S III] 9532 lines taken for 9069 make the share of the
+    catalog asked for (within their binomial scatter) and nothing else changes: the galaxies with a correct redshift are
+    the clean catalog. The scan of the secondary limit agrees with the counts against redshift, and another secondary
+    limit makes the catalog with that limit."""
+    import json
+
+    tmp, b = base
+    names = b.line_set.names
+    i, k = names.index("SIII_9532"), names.index("SIII_9069")
+    p = b.make_proposal((0.33, 0.40), line="SIII_9069", rescaling=None, doublets=None, min_count=1, n_workers=1, verbose=False,
+                        interloper_fraction=0.05, **LIMITS)
+    n_sample, pairs = p._numbers(np.array([p.secondary / p.primary]))
+    assert n_sample[0] == pytest.approx(p.n_sample, rel=2e-3)
+    assert pairs[("SIII_9532", "SIII_9069")][0][0] == pytest.approx(p.counts["n_window_single"][:, i, 0].sum(), rel=0.02)
+    assert "Interlopers against the secondary limit" in p.summary()
+    asked = {"SIII_9069": {"SIII_9532": 0.02}}
+    d = p.design(asked)
+    cat = p.make_catalog(fractions=asked, out_dir=tmp_path / "design", n_workers=1)
+    printed = capsys.readouterr().out
+    assert "━━ Interlopers by design" in printed and "asked and made" in printed and "by design, shares of the catalog" in printed
+    wrong = cat["id_outcome"] == 3
+    assert (~wrong).sum() == p.n_sample                                  # no galaxy of the sample is lost
+    assert set(zip(cat["line_true"][wrong].tolist(), cat["line_assigned"][wrong].tolist())) == {(i, k)}
+    expected = d["pairs"][0]["n_expected"]
+    assert expected > 20 and abs(wrong.sum() - expected) < 5 * np.sqrt(expected)
+    assert abs(wrong.mean() - 0.02) < 5 * np.sqrt(expected) / len(cat)
+    summary = json.loads((tmp_path / "design" / f"{p.default_name()}_summary.json").read_text())
+    assert summary["design"]["made"][0]["n"] == wrong.sum() and summary["design"]["fractions"] == asked
+    assert cat.settings["confusion"]["type"] == "windowed" and cat.settings["confusion"]["meta"]["fractions"] == asked
+    other = p.make_catalog(fractions=asked, out_dir=tmp_path / "design2", secondary_flux_limit=1.2e-16, n_workers=1,
+                           verbose=False)
+    assert other.settings["secondary_flux_limit"] == pytest.approx(1.2e-16, abs=0)
+    # a higher secondary limit detects 9069 as a second line in fewer galaxies: a smaller sample, as the scan says
+    clean = (other["id_outcome"] != 3).sum()
+    assert clean < p.n_sample and clean == pytest.approx(p.interloper_scan([1.2e-16])["n_sample"][0], rel=1e-3)
+    with pytest.raises(ValueError, match="one of"):
+        p.make_catalog({}, tmp_path / "both", fractions=asked)
+    with pytest.raises(ValueError, match="too few single lines"):
+        p.design({"SIII_9069": {"SIII_9532": 0.9}})
+
+
+def test_every_line_by_design(base, tmp_path):
+    """line="all": an interloper whose true redshift is inside the range is in the sample already; the catalog grows only
+    by the ones from outside it, and the design accounts for that."""
+    tmp, b = base
+    names = b.line_set.names
+    p = b.make_proposal((0.33, 0.40), line="all", rescaling=None, doublets=None, min_count=1, n_workers=1, verbose=False,
+                        **LIMITS)
+    asked = {"SIII_9069": {"SIII_9532": 0.01}}
+    d = p.design(asked)
+    cat = p.make_catalog(fractions=asked, out_dir=tmp_path, n_workers=1, verbose=False)
+    wrong = cat["id_outcome"] == 3
+    z = cat["redshift_rsd"]
+    outside = (z < 0.33) | (z >= 0.40)
+    assert len(cat) - p.n_sample == (wrong & outside).sum() > 0
+    assert set(cat["line_true"][wrong].tolist()) == {names.index("SIII_9532")}
+    expected = d["pairs"][0]["n_expected"]
+    assert abs(wrong.sum() - expected) < 5 * np.sqrt(expected)
+    assert d["n_catalog"] == pytest.approx(len(cat), abs=5 * np.sqrt(expected))
+
+
+def test_single_line_catalog(base, tmp_path):
+    """make_proposal without a secondary limit: single-line clean catalogs. Without a secondary limit the catalog holds
+    the galaxies with the target line above the primary limit, one line each, every one single-line; with one, the same
+    galaxies with their other lines above it, the single-line ones as many as the proposal counts at that limit. No
+    interlopers either way."""
+    tmp, b = base
+    i = b.line_set.names.index("SIII_9532")
+    kw = dict(line="SIII_9532", flux_limit=1.5e-16, rescaling=None, doublets=None, min_count=1, n_workers=1, verbose=False)
+    p = b.make_proposal((0.28, 0.33), **kw)
+    assert p.single_line and p.settings["detection"]["single_line"] and p.secondary == np.inf
+    assert "single-line galaxies against redshift" in p.summary()
+    one = p.make_catalog(out_dir=tmp_path / "one", n_workers=1, verbose=False)
+    assert len(one) == p.n_sample == p.counts["n_primary"][p.inside, i].sum() > 1000
+    assert np.all(one["n_det"] == 1) and np.all(one["id_outcome"] == 2) and np.all(one["line_assigned"] == i)
+    assert one.settings["detection"]["single_line"] and "one line per galaxy" in one.summary()
+    two = p.make_catalog({}, tmp_path / "two", secondary_flux_limit=7.5e-17, n_workers=1, verbose=False)
+    np.testing.assert_array_equal(np.sort(two["gal_id"]), np.sort(one["gal_id"]))        # the same galaxies
+    assert two.settings["detection"]["primary_line"] == "SIII_9532" and "single_line" not in two.settings["detection"]
+    assert set(np.unique(two["id_outcome"]).tolist()) == {1, 2} and "λ9532 above the primary limit" in " ".join(two.summary().split())
+    j = p.settings["secondary_ratios"].index(0.5)
+    assert (two["id_outcome"] == 2).sum() == p.counts["nq_single"][j][p.inside, i].sum() > 0
+    assert np.all((two["n_det"] == 1) == (two["id_outcome"] == 2))
+    with pytest.raises(ValueError, match="single-line clean catalogs"):
+        p.make_catalog(fractions={"SIII_9532": {"SIII_9069": 0.01}}, out_dir=tmp_path / "x")
+    # with an expected interloper fraction a proposal without a secondary limit is for catalogs by design: a single tier
+    d = b.make_proposal((0.28, 0.33), interloper_fraction=0.01, **kw)
+    assert not d.single_line and d.secondary == d.primary == 1.5e-16 and "single_line" not in d.settings["detection"]
+    assert d.n_sample == p.n_sample and "Interlopers against the secondary limit" in d.summary()

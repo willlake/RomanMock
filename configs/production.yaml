@@ -2,26 +2,36 @@
 #
 #   sbatch scripts/production.sh            # base catalog and dN/dz census, one CPU node, a few minutes
 #
-# Step 2 (catalogs and randoms) needs no configuration file: see notebooks/02_build_catalog.ipynb
-# and notebooks/03_build_randoms.ipynb, or `romanmock catalog` and `romanmock random`.
+# Step 2 (catalogs and randoms) needs no configuration file: see notebooks/01_catalog_z1p0_1p2.ipynb
+# and notebooks/03_randoms.ipynb, or `romanmock catalog` and `romanmock random`.
 
+# OpenCosmo version of the 80-patch mock with ray-traced lensing (2578 deg2). The synthetic cores (log Mhalo 11.0-11.5,
+# random positions) are left out, as OpenCosmo does by default. The line columns of this mock are lensed: flux =
+# unlensed flux x magnification. The mock of 2026-09 is at /global/cfs/cdirs/m4943/Simulations/sdss_feniks_hizels_260710_09_07_2026
+# (its base catalog stays in RomanMocks/sdss_feniks_hizels_260710_09_07_2026/base).
 catalog:
-  path: /global/cfs/cdirs/m4943/Simulations/sdss_feniks_hizels_260710_09_07_2026
+  path: /global/cfs/cdirs/hacc/OpenCosmo/LastJourney/synthetic_galaxies/sdss_feniks_hizels_261013_10_14_2026
 
 base:
-  dir: /global/cfs/cdirs/m4943/Simulations/RomanMocks/sdss_feniks_hizels_260710_09_07_2026/base
+  dir: /global/cfs/cdirs/m4943/Simulations/RomanMocks/sdss_feniks_hizels_261013_10_14_2026/base
   # copied from the input mock, next to redshift_rsd and the line fluxes. r50_disk_2d (half-mass radius of the disk,
   # proper kpc) is the size column of the S/N route of step 2 (make_catalog(snr=5, secondary_snr=2, size="r50_disk_2d")).
-  columns: [gal_id, ra, dec, redshift_true, r50_disk_2d]
+  # ra, dec are the unlensed positions; ra_obs, dec_obs the lensed ones; flux / magnification is the unlensed flux.
+  columns: [gal_id, ra, dec, redshift_true, r50_disk_2d, ra_obs, dec_obs, magnification]
   overwrite: true                               # a rerun replaces the base catalog
 
-line_set: roman_transitions
+# roman_transitions + Paα (bit 9); Paα is inside the grism at z < 0.029. The mock of 2026-09 has no Paα: use
+# roman_transitions for it.
+line_set: roman_transitions_paa
 
 # The base catalog keeps every galaxy with a line above flux_limit inside the bandpass. It is the
-# deepest primary limit step 2 can use; the limits of a catalog are chosen in step 2 (1.0e-16 and
-# 4.0e-17 by default). 1.0e-17 keeps 74 % of the galaxies of the mock: about 30 GB.
+# deepest primary limit step 2 can use; the limits of a catalog are chosen in step 2.
+# 1.0e-18 (2026-11-09; 1.0e-17 before): step 2 can brighten a line before the selection, by up to 11.8 times with
+# the rescaling "galacticus_like" (a 5-sigma deviate) and 15.8 times with the merged [O III] doublet on top, so the
+# base must be that much deeper than the primary threshold. The S/N route (S/N 5 in one hour, 2 x minimum zodiacal
+# light) reaches 3.1e-17 for a point source, 30 times 1.0e-18; at 1.0e-17 it was only 3 times deeper.
 sensitivity:
   type: constant
-  flux_limit: 1.0e-17               # erg/s/cm^2
-  secondary_flux_limit: 1.0e-17     # must not exceed flux_limit; only the stored line_bitmask_base depends on it
+  flux_limit: 1.0e-18               # erg/s/cm^2
+  secondary_flux_limit: 1.0e-18     # must not exceed flux_limit; only the stored line_bitmask_base depends on it
   wave_range: [10000.0, 19300.0]    # Angstrom

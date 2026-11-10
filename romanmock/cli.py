@@ -18,7 +18,7 @@ def cmd_info(args):
     import numpy as np
 
     from .io import file_info, list_catalog_files, mock_name, open_catalog
-    from .lines import DIFFSKY_LINE_WAVELENGTHS
+    from .lines import DIFFSKY_ADDED_LINE_WAVELENGTHS, DIFFSKY_LINE_WAVELENGTHS
 
     files = list_catalog_files(args.catalog_dir)
     print(f"mock: {mock_name(files[0])}   ({len(files)} slices)")
@@ -30,7 +30,7 @@ def cmd_info(args):
     print(f"total galaxies: {tot:,}")
     cat = open_catalog([files[-1]])
     print("cosmology:", cat.cosmology)
-    present = [c for c in DIFFSKY_LINE_WAVELENGTHS if c in cat.columns]
+    present = [c for c in {**DIFFSKY_LINE_WAVELENGTHS, **DIFFSKY_ADDED_LINE_WAVELENGTHS} if c in cat.columns]
     print("line luminosity columns:", present, "unit:", cat.units.get(present[0]) if present else None)
 
 
@@ -265,14 +265,15 @@ def cmd_galacticus_flux_distribution(args):
 
 
 def cmd_random(args):
-    """Random catalogs for a catalog written by `romanmock catalog` / `Catalog.write`."""
+    """The random catalog of a catalog written by `romanmock catalog` / `Catalog.write`, or of a part of it."""
     from .catalog import Catalog
 
     cat = Catalog.read(args.catalog)
-    which = args.which[0] if len(args.which) == 1 else args.which
-    output = args.output or str(Path(args.catalog).with_name(Path(args.catalog).stem + "_random.hdf5"))
-    cat.make_random(which=which, n_times=args.n_times, z_column=args.z_column, seed=args.seed, write_to=output,
-                    first=args.first, verbose=not args.quiet)
+    if args.subset:
+        cat = cat.subset(args.subset)
+    tag = f"_{args.subset}" if args.subset else ""
+    output = args.output or str(Path(args.catalog).with_name(f"{Path(args.catalog).stem}{tag}_random.hdf5"))
+    cat.make_random(n_times=args.n_times, seed=args.seed, z_column=args.z_column, write_to=output, verbose=not args.quiet)
 
 
 def cmd_compress_index(args):
@@ -455,15 +456,15 @@ def main(argv=None):
     s.add_argument("--quiet", action="store_true")
     s.set_defaults(func=cmd_galacticus_flux_distribution)
 
-    s = sub.add_parser("random", help="random catalogs for a catalog: uniform inside the footprint, redshifts drawn "
-                                      "from the data; N files of the size of the data")
+    s = sub.add_parser("random", help="the random catalog of a catalog: uniform inside the footprint, redshifts drawn "
+                                      "from the data, N times as many points")
     s.add_argument("catalog", help="catalog file (.hdf5 or .npz) written by `romanmock catalog`")
-    s.add_argument("-o", "--output", help="name.hdf5 gives name_00.hdf5, name_01.hdf5, ... (default: <catalog>_random.hdf5)")
-    s.add_argument("-n", "--n-times", type=int, default=1, help="number of random catalogs, each of the size of the data")
-    s.add_argument("--which", nargs="+", default=["all"], choices=["all", "galaxies", "interlopers"],
-                   help="data catalog: all, galaxies (correct redshift), interlopers (wrong redshift)")
+    s.add_argument("-o", "--output", help="random catalog file (default: <catalog>[_<subset>]_random.hdf5)")
+    s.add_argument("-n", "--n-times", type=int, default=1, help="points: N times the galaxies of the data")
+    s.add_argument("--subset", help="the randoms of a part of the catalog: multi_line, single_correct, galaxies (correct "
+                                    "redshift), interlopers (wrong redshift), or <true>_as_<assigned> (one kind of "
+                                    "interloper, e.g. OIII_5007_as_Ha)")
     s.add_argument("--z-column", help="redshift column (default: the one of the redshift cut)")
-    s.add_argument("--first", type=int, default=0, help="index of the first random catalog")
     s.add_argument("--seed", type=int, default=12345)
     s.add_argument("--quiet", action="store_true")
     s.set_defaults(func=cmd_random)

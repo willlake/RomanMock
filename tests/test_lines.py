@@ -6,6 +6,7 @@ from romanmock.lines import (
     DIFFSKY_LINE_WAVELENGTHS,
     PLAN_SPECIES,
     ROMAN_TRANSITIONS,
+    ROMAN_TRANSITIONS_PAA,
     LineFeature,
     LineSet,
     get_line_set,
@@ -17,6 +18,15 @@ def test_presets_have_documented_bit_order():
     assert ROMAN_TRANSITIONS.bit("Ha") == 0 and ROMAN_TRANSITIONS.bit_value("OIII_5007") == 4
     assert PLAN_SPECIES.names == ["Ha", "Hb", "OIII", "OII", "SIII"]
     assert len(ALL_TRANSITIONS) == len(DIFFSKY_LINE_WAVELENGTHS)
+
+
+def test_paa_preset_appends_one_bit():
+    """Bits 0-8 of roman_transitions_paa are those of roman_transitions; Paα is bit 9, in band at z < 0.029."""
+    assert ROMAN_TRANSITIONS_PAA.names == [*ROMAN_TRANSITIONS.names, "PaA"]
+    np.testing.assert_array_equal(ROMAN_TRANSITIONS_PAA.rest_waves[:-1], ROMAN_TRANSITIONS.rest_waves)
+    assert ROMAN_TRANSITIONS_PAA.bit("PaA") == 9 and ROMAN_TRANSITIONS_PAA.required_columns[-1] == "Pa_alpha_1p8751um"
+    assert get_line_set("roman_transitions_paa") is ROMAN_TRANSITIONS_PAA
+    assert 19300.0 / ROMAN_TRANSITIONS_PAA["PaA"].rest_wave - 1 == pytest.approx(0.029, abs=5e-4)
 
 
 def test_required_columns_cover_components():

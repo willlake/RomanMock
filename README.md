@@ -20,13 +20,19 @@ this by default).
 
 ## Input
 
-A diffsky mock directory such as
-`/global/cfs/cdirs/m4943/Simulations/sdss_feniks_hizels_260710_09_07_2026/`: 67 lightcone
-slices `lc_cores-<step>.diffsky_gals.hdf5` (z = 0-4, 324 M galaxies, 2063 deg²) plus the auxiliary
-`*_ssp_data.hdf5`, `*_param_collection.hdf5`, `*_t_table.hdf5`, `*_transmission_curves.hdf5`.
+A diffsky mock directory in OpenCosmo format, such as
+`/global/cfs/cdirs/hacc/OpenCosmo/LastJourney/synthetic_galaxies/sdss_feniks_hizels_261013_10_14_2026/` (the
+production mock since 2026-10-29): 67 lightcone slices `lc_cores-<step>.diffsky_gals.hdf5` (z = 0-4, 413 M
+galaxies, 2578 deg², ray-traced lensing) plus the auxiliary `*_ssp_data.hdf5`, `*_param_collection.hdf5`,
+`*_t_table.hdf5`, `*_transmission_curves.hdf5` and `lc_cores-decomposition.txt`. The previous mock,
+`/global/cfs/cdirs/m4943/Simulations/sdss_feniks_hizels_260710_09_07_2026/` (324 M galaxies, 2063 deg², no
+lensing), reads the same way.
 The line columns (`Ba_alpha_6563`, `Ba_beta_4861`, `O_III_4363`, `O_III_4959`, `O_III_5007`,
 `O_II_3726`, `O_II_3729`, `S_III_6312`, `S_III_9069`, `S_III_9532`) are dust-attenuated,
-continuum-subtracted luminosities in erg/s, one column per transition.
+continuum-subtracted luminosities in erg/s, one column per transition. In the lensed mock they include the
+magnification (`<line>_unlensed` x `magnification`); `ra`/`dec` are the unlensed positions and `ra_obs`/`dec_obs`
+the lensed ones. Its synthetic cores (777 M centrals of log Mhalo 11.0–11.5 at random, unclustered positions)
+are left out, as OpenCosmo does unless it is opened with `synth_cores=True`.
 `redshift_obs` includes the line-of-sight peculiar velocity (`z_rsd` of the plan);
 `redshift_true` is the cosmological redshift. The cosmology is read from the file header
 (h = 0.6766, Ω_m = 0.3096, the Planck 2018 cosmology of the parent N-body simulation) and is
@@ -97,6 +103,8 @@ cat = base.make_catalog(snr=5, secondary_snr=2, size=0.3)        # 0.3 arcsec fo
 | `exposure_time`, `background` | exposure [s] and background in units of the minimum zodiacal light, rescaling the noise | 3600, 2 |
 | `sensitivity` | any sensitivity model config or object, instead of the arguments above | |
 | `confusion` | rows of the confusion matrix, a full config, or a model object; `"empirical"` or a `LineFractionTable` for the line mix of the mock (below) | package default |
+| `rescaling` | rescale the line fluxes before the detection: `"galacticus_like"` (the diffsky lines toward Galacticus) or any rescaling config; the catalog's flux columns are then the rescaled ones (see *Rescaling the line fluxes*) | stored fluxes |
+| `doublets` | [O III] λ4959 a line of its own (`"separated"`), added to λ5007 (`"merged"`), or each where its doublet is resolved for the galaxy's size (`"per_galaxy"`, needs `r50_disk_2d`); see *The [O III] doublet* | separated |
 | `lines` | keep galaxies in which one of these lines is identified | every line |
 | `membership` | multi-line galaxies: `"detected"` = each detected line is identified (a galaxy with Hα and [O III] is in both samples); `"assigned"` = only the brightest line, disjoint samples. `romanmock select` defaults to `assigned` | `"detected"` |
 | `z_range`, `z_column` | redshift range, on `redshift_assigned`, `redshift_rsd` or `redshift_true` | no cut, assigned |
@@ -108,11 +116,19 @@ cat = base.make_catalog(snr=5, secondary_snr=2, size=0.3)        # 0.3 arcsec fo
 | `area_deg2` | sky area of the lightcone, for dN/dz and the downsampling; also `BaseCatalog(path, area_deg2=...)` | estimated |
 | `verbose` | print the progress and the line report (below) | `True` |
 
-**Line report.** With `verbose=True` the call prints which lines fall inside the bandpass for the redshift
-cut, and the line interlopers: single-line galaxies given a wrong line. It lists the potential ones (a line
-that, taken for another, passes the redshift cut, with its probability `P` in the confusion matrix) next to
-the number that is actually in the catalog. `cat.line_report()` returns the same text and
-`cat.info["line_report"]` the numbers.
+**What it prints.** With `verbose=True` the call prints a progress line, `[romanmock] catalog: scanning 67 slices
+with 64 worker(s) … done in 28 s`, then two blocks:
+
+* **the summary** (`cat.summary()`): thresholds, line fluxes, identification (for a confusion matrix, its entries),
+  sky area, base galaxies detected, columns, and the galaxies per identification outcome;
+* **the line report** (`cat.line_report()`, the numbers in `cat.info["line_report"]`): the lines inside the
+  bandpass for the redshift cut, and the line interlopers, single-line galaxies given a wrong line. It lists the
+  potential ones (a line that, taken for another, passes the redshift cut, with its probability `P` in the
+  confusion matrix) next to the number that is actually in the catalog.
+
+`make_proposal`, `line_fractions` (the line mix) and `Proposal.make_catalog` print in the same layout
+(`romanmock/report.py`): a title rule, aligned settings, tables with a rule under the header, and notes with
+footnote marks, at most 100 characters wide.
 
 | column | galaxies of the catalog in which |
 |---|---|
@@ -123,19 +139,36 @@ the number that is actually in the catalog. `cat.line_report()` returns the same
 | interlopers | another line was taken for this line |
 
 detected = identified + mistaken. The sample of a line is its identified galaxies plus its interlopers, and
-`contamination` is the share of one interloper in it.
+`share` is the share of one interloper in it. For the Hα catalog at 1.0–1.2 of `notebooks/01_catalog_z1p0_1p2.ipynb`:
 
 ```text
-[romanmock] lines inside 10000 - 19300 A for redshift_assigned in 1 - 1.9 (lightcone: z_rsd 0.01 - 4.06)
-  line        rest [A]    redshift      observed [A]       detected   identified    brightest    mistaken  interlopers
-  Ha            6564.7  1.000 - 1.900   13129 - 19038    22,505,531   21,129,958   21,125,951   1,375,573      333,709
-  OIII_5007     5008.3  1.000 - 1.900   10017 - 14524    18,199,510   18,004,823            0     194,687    1,375,573
+━━ Catalog · Hα · 1.0 ≤ z_assigned ≤ 1.2 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  thresholds       F > 1.50e-16 (other lines > 6.00e-17)
+  line fluxes      rescaled (galacticus_like); [O III] doublet per_galaxy
+  identification   confusion matrix: Ha → OIII_5007 0.005, Ha → SIII_9532 0.005, OIII_5007 → Ha
+                   0.05, SIII_9532 → Ha 0.05
+  sky area         2578.31 deg² (estimated from the sky patches of the mock)
+  base catalog     100,805,121 of its 403,068,868 galaxies detected
   ...
-[romanmock] line interlopers: single-line galaxies given a wrong line and so a wrong redshift
-  true line  taken for   true z_rsd     assigned z     observed [A]        P   in catalog  contamination
-  OIII_5007  Ha         1.622 - 2.801  1.000 - 1.900   13129 - 19038   0.500      194,687          0.91%
-  SIII_9532  Ha         0.377 - 0.997  1.000 - 1.900   13129 - 19038   0.500      139,022          0.65%
-  Ha         OIII_5007  0.526 - 1.212  1.000 - 1.900   10017 - 14524   0.500    1,375,573          7.10%
+  galaxies                                       number     share
+  ─────────────────────────────────────────  ──────────  ────────
+  multi-line                                 14,845,961   99.21 %
+  single line, correct redshift                 114,349    0.76 %
+  single line taken for another: interloper       4,040    0.03 %
+  all                                        14,964,350  100.00 %
+
+── Lines in the bandpass, 10000–19300 Å, for 1.0 ≤ z_assigned ≤ 1.2 ────────────────────────────────
+  line         redshift     λ_obs [Å]      detected  identified  brightest  mistaken  interlopers
+  ───────────  ───────────  ───────────  ──────────  ──────────  ─────────  ────────  ───────────
+  Ha           1.000–1.200  13129–14442  14,960,310  14,960,310  7,250,586         0        4,040
+  OIII_5007 ○  1.000–1.200  10017–11018  14,816,182  14,814,785  7,709,724     1,397            0
+  ...
+
+── Interlopers: single lines given a wrong line, and so a wrong redshift ───────────────────────────
+  true line  taken for  true z       assigned z   λ_obs [Å]       P¹  in catalog  share²
+  ─────────  ─────────  ───────────  ───────────  ───────────  ─────  ──────────  ──────
+  OIII_5007  Ha         1.622–1.884  1.000–1.200  13129–14442  0.050       1,397  0.01 %
+  SIII_9532  Ha         0.377–0.515  1.000–1.200  13129–14442  0.050       2,643  0.02 %
   ...
 ```
 
@@ -188,29 +221,36 @@ romanmock catalog /path/to/base -o halpha.hdf5 --flux-limit 1.5e-16 --secondary-
 Notebook 02 walks through this. In a script, call `make_catalog` below `if __name__ == "__main__":` because
 the slices are read by worker processes.
 
-**Random catalogs.** `cat.make_random` makes the randoms of a catalog: uniform on the sky inside the footprint
-of the lightcone, with redshifts drawn (with replacement) from the redshifts of the data. A contaminated
-catalog gives three data catalogs, each with its own randoms:
-
-| `which` | data catalog | `cat.subset(which)` keeps `id_outcome` |
-|---|---|---|
-| `"all"` | galaxies and interlopers | every one |
-| `"galaxies"` | galaxies with a correct redshift | 1 (multi-line), 2 (single-line, correct) |
-| `"interlopers"` | galaxies with a wrong redshift | 3 (single-line, misidentified) |
+**Random catalogs.** A random catalog belongs to one data catalog and depends on nothing else: uniform on the sky
+inside the footprint of the lightcone (and inside the data's cuts on `ra` and `dec`), with redshifts drawn, with
+replacement, from the redshifts of the data. `make_random` takes the data catalog only, so it works for any catalog, a
+whole one or any part of one:
 
 ```python
-randoms = cat.make_random(which="all", n_times=10)             # list of 10 catalogs: ra, dec, redshift_assigned
-galaxies, interlopers = cat.subset("galaxies"), cat.subset("interlopers")      # the data that go with the randoms
-
-cat.make_random(which=["all", "galaxies", "interlopers"], n_times=10, write_to="randoms/halpha.hdf5")
-# -> randoms/halpha_all_00.hdf5 ... halpha_all_09.hdf5, halpha_galaxies_00.hdf5 ..., halpha_interlopers_00.hdf5 ...
-ran = Catalog.read("randoms/halpha_all_03.hdf5")
+ran = cat.make_random(10)                                   # 10 x len(cat) points: ra, dec, redshift_assigned
+ran = cat.subset("OIII_5007_as_Ha").make_random(10)         # the randoms of one kind of interloper
+ran = cat[cat["redshift_assigned"] < 1.1].make_random(10)   # of any selection
+cat.subset("interlopers").make_random(10, write_to="randoms/halpha_interlopers.hdf5")   # one file, written block by block
+ran = Catalog.read("randoms/halpha_interlopers.hdf5")
 ```
 
-Randoms N times as numerous as the data are N catalogs of the size of the data, one file each. Catalog `k`
-depends on `(seed, which, k)` only, so more can be added later (`first=10`) without remaking the others. A
-cut on `ra` or `dec` made with `cuts=` applies to the randoms too. From the command line:
-`romanmock random halpha.hdf5 -n 10 --which all galaxies interlopers -o randoms/halpha.hdf5`.
+`cat.subset(which)` takes the parts of a contaminated catalog, and `cat.components()` lists those present with their
+sizes:
+
+| `which` | the part | rows |
+|---|---|---|
+| `"all"` | the whole catalog | every galaxy |
+| `"multi_line"` | multi-line galaxies | `id_outcome` 1 |
+| `"single_correct"` | single-line galaxies with a correct redshift | `id_outcome` 2 |
+| `"galaxies"` | galaxies with a correct redshift | `id_outcome` 1, 2 |
+| `"interlopers"` | galaxies with a wrong redshift | `id_outcome` 3 (single-line, misidentified) |
+| `"OIII_5007_as_Ha"` | one kind of interloper: [O III] λ5007 single lines taken for Hα | `id_outcome` 3 with `line_true`, `line_assigned` |
+
+The points come in blocks of the size of the data, block `k` from the random stream `(seed, hash of the data's
+redshifts, k)`. The same data and seed therefore always give the same randoms, a larger `n_times` adds points and keeps
+the first ones, and two different data catalogs (two parts of one catalog) get independent randoms with the same seed.
+From the command line: `romanmock random halpha.hdf5 -n 10 [--subset OIII_5007_as_Ha] [-o out.hdf5]`. Notebook
+`notebooks/03_randoms.ipynb` makes them for the whole catalog and for its parts.
 
 The footprint is exact, not estimated from the galaxies. The lightcone is made of sky patches, rectangles in
 the angles theta and phi listed in `lc_cores-decomposition.txt`, and each galaxy carries its patch number
@@ -320,6 +360,11 @@ bit 6 SIII_9069   9071.246  S_III_9069
 bit 7 OIII_4363   4364.294  O_III_4363
 bit 8 SIII_6312   6313.902  S_III_6312
 ```
+
+`roman_transitions_paa` adds Paα as bit 9 (`PaA`, 18756.4 Å, column `Pa_alpha_1p8751um`), bits 0–8 unchanged. The
+mocks carry Paα from `sdss_feniks_hizels_261013` onward, and `configs/production.yaml` uses this preset for them.
+Paα is inside the grism at z < 0.029 only. There it is the only line in the bandpass: [S III] 9532 drops out below
+z = 0.049. A single line at 18 756–19 300 Å can be Paα at z < 0.029 or Hα at z = 1.86–1.94.
 
 `plan_species` reproduces the five-species bitmask of section 2 (Ha, Hb, [O III], [O II],
 [S III]) and `all_transitions` gives every column its own bit. Multi-component features are
@@ -524,6 +569,247 @@ stored in the files (`romanmock.lines.GALACTICUS_LINE_WAVELENGTHS`, `galacticus.
 galacticus-flux-distribution <mock_dir> -o out.npz --dz 0.01 --workers 6` is the command-line form of
 `mock.flux_distribution` (4 minutes for the whole mock on a login node); notebook 07 is notebook 04 for this mock.
 
+## Rescaling the line fluxes
+
+`romanmock.rescaling` changes the line fluxes of the galaxies before any selection, to test how the results depend on
+the line model of the mock. A rescaling multiplies the flux of each feature by a constant and, optionally, by a
+log-normal factor drawn once per galaxy:
+
+`log10 F'_X = log10 F_X + offset_X + sigma_X * eps`, with `eps ~ N(0, 1)` a fixed function of the galaxy's `gal_id` and
+of a seed (`galaxy_normal`): a galaxy gets the same deviate in every slice, rerun and subsample, and all its lines with a
+scatter move together. Fluxes that are zero, negative or NaN, and features without an offset, are left as they are.
+
+Models are chosen by `type`, like the other models (`build_rescaling`, `RESCALING_MODELS`):
+
+* `line_factors` (`LineFactors(log_offsets={...}, scatter={...}, seed=...)`): explicit offsets and scatters per feature.
+* `galacticus_like` (`GalacticusLike()`): the diffsky lines rescaled toward the Galacticus mock of the GRS-PIT, from
+  `Projects/Roman/Fullshape/Catalog/diffsky_line_rescaling.ipynb` (2026-11-09). Hα is the anchor and never changes
+  (diffsky's attenuated Hα is fitted to the HiZELS Hα luminosity functions). Every other feature that Galacticus also has
+  (the names shared with `galacticus_transitions`; in `roman_transitions_paa` all but [O III] λ4363 and [S III] λ6312) gets
+  a dust term, `delta` and `sigma`, with the Calzetti (2000) curve k at the feature's own rest wavelength:
+  * dust. Galacticus attenuates its lines by a median A(Hα) of 0.89 mag (Calzetti curve, an A(Hα)–stellar-mass
+    relation), diffsky by 0.34 mag with its steeper stellar curve. The blue lines (Hβ, [O III], [O II]) get the constant
+    `-0.4 da_ha [k(λ)/k(Hα) - 1]` with `da_ha = 0.5` mag. The lines in `galaxy_dust` (default [S III] λλ9069, 9532 and
+    Paα, whose ratio to Hα has a floor at its dust-free value) get their dust galaxy by galaxy: diffsky's own reddening
+    relative to Hα, A_D (r - 1) with A_D the galaxy's A(Hα) read from its Paα/Hα (`galaxy_a_ha`) and r diffsky's
+    A(X)/A(Hα), is replaced by the Calzetti reddening of the Galacticus A(Hα) at the same quantile of the two dust
+    distributions (`dust_map`, `galacticus_a_ha`: 0.35 → 0.89 mag at the median, the least dusty tenth → no dust).
+    Galaxies without dust keep the dust-free ratio; a constant term would put the floor of [S III]/Hα at 0.40 and
+    leave almost no single-line galaxy below z = 1. `galaxy_dust=()` gives the first version, a constant term for
+    every line;
+  * `delta` (dex) for the nebular model and the AGN: [O II] +0.37 (diffsky's one log U = −2, solar-gas model gives an
+    intrinsic [O II]/Hβ of 1.04, Galacticus 2.09), [O III] +0.19 (Galacticus's AGN and nebular model), Hβ +0.04 and
+    Paα −0.055 (case-B ratios); members of a doublet share it;
+  * `sigma` (dex), the galaxy-to-galaxy scatter that diffsky's fixed U and gas metallicity leave out: [O III] 0.19 and
+    [O II] 0.11 with one deviate for both.
+
+  Factors in `roman_transitions_paa` (`model.typical_offsets`, the per-galaxy lines at diffsky's median dust): Hβ 0.92,
+  [O III] 5007 and 4959 1.32, [O II] 1.65, [S III] 9532 1.19 and 9069 1.17, Paα 1.31 (1.0 and 0.88 for a galaxy without
+  dust). The median line ratios of the detected galaxies match Galacticus within 0.02 dex and Paα/Hα takes its
+  distribution (`Projects/Roman/Fullshape/Catalog/diffsky_line_rescaling.ipynb`; the single-line fractions are in
+  `single_line_fraction_rescaled.ipynb` of the same directory).
+
+In a catalog, `make_catalog(..., rescaling="galacticus_like")` rescales the fluxes of every galaxy before the detection
+(the flux columns of the catalog are then the rescaled ones), and `line_fractions(..., rescaling=...)` builds the
+empirical table from the same fluxes; `make_proposal` uses it by default (below). The YAML pipeline does not apply it.
+At the array level, apply it to the fluxes read from the base catalog, then select; the per-galaxy dust reads the Hα and
+Paα fluxes of each galaxy, so read those columns too (a line set without Paα, such as the earlier mock's, needs
+`GalacticusLike(galaxy_dust=())`).
+
+```python
+from romanmock import BaseCatalog, GalacticusLike
+
+base = BaseCatalog(".../base")
+cat = base.make_catalog(flux_limit=1.5e-16, secondary_flux_limit=6e-17, rescaling="galacticus_like", z_range=(1.0, 1.2))
+model = GalacticusLike()
+print(model.describe(base.line_set))                    # the factor and scatter of every feature
+for data in base.read_slices(["gal_id", "redshift_rsd", *base.flux_columns], z_range=(0.5, 3.0)):
+    data = model.apply_columns(data, base.line_set, suffix=base.flux_suffix)   # every <line>_flux column rescaled
+    ...                                                 # select on the rescaled fluxes
+flux = model.apply(flux, base.line_set, gal_id)         # the same for an (n, n_features) array, Hα and Paα included
+```
+
+`model.max_log_boost(line_set, n_sigma=5)` is the largest brightening in dex: a base catalog complete above F holds
+every galaxy the rescaled selection can reach down to F × 10^boost (1.07 dex for `galacticus_like`, 11.8 times). The
+merged [O III] doublet adds a factor 1 + 1/2.98 = 1.34 (15.8 times together), so a base at 1e-17 is complete for
+primary thresholds from 1.6e-16 up only. `make_catalog` and `make_proposal` warn when the thresholds are closer to the
+base limit than that. That is why the production base is at 1e-18: the S/N route reaches 3.1e-17 for a point source.
+
+## The [O III] doublet: one line or two
+
+[O III] λλ4959, 5007 are 47.94 (1 + z) Å apart (96–185 Å in the bandpass) with a fixed flux ratio 2.98. In the slitless
+grism the image of a line along the dispersion is the galaxy itself, so whether the two lines separate depends on the
+galaxy's size. `romanmock.doublets.DoubletRule` models each line as a face-on exponential disk of the galaxy's
+half-light radius projected on the dispersion (10.85 Å per 0.11" pixel), smoothed by the 2-pixel resolution of a point
+source, and calls the doublet resolved when the profile dips between the lines by at least 20 % of the λ4959 peak: the
+largest resolved half-light radius is 0.35" at z = 1.0, 0.55" at 1.94, 0.74" at 2.85 (`rule.resolved_radius(z)`; a dip
+of 10 % or 30 % moves it by about ±15 %). Derivation: `Projects/Roman/Diffsky_line_rescaling_and_OIII_doublet.md`.
+
+`make_catalog(..., doublets=...)`, `line_fractions` and `make_proposal` apply it to the feature fluxes before the
+detection, in the galaxies whose two lines are both inside the bandpass:
+
+| `doublets` | λ4959 |
+|---|---|
+| `"per_galaxy"` | a line of its own where the doublet is resolved for the galaxy's `r50_disk_2d` (proper kpc at `redshift_true`; must be in `base.columns`), added to λ5007 where it is blended |
+| `"merged"` | added to λ5007 in every galaxy: a doublet never confirms a redshift |
+| `"separated"`, `None` (default of `make_catalog`) | a line of its own in every galaxy |
+
+`{"mode": "per_galaxy", "size": 0.3, "min_dip": 0.3}` sets one size for all and another threshold. A merged doublet is
+detected at λ5007's rest wavelength with the sum of the two fluxes; the column `doublet_merged` says where. At the
+production base the rule resolves the doublet for 29 % of the [O III]-detected galaxies at 1.0 < z < 1.2 and 74–80 %
+above z = 1.94 (with the rescaled lines).
+
+## Two steps to a catalog with interlopers: proposal and catalog
+
+How many galaxies of a catalog rest on a single line, and which single lines elsewhere could pass for its line, depends
+only on the thresholds; how they are identified is a separate choice. The routine therefore has two steps: a proposal,
+which counts, and the catalog, built either *by design* from the interloper fractions you want or from an
+identification model. A proposal without a secondary limit and without an expected interloper fraction is for
+*single-line clean catalogs* instead, with no interlopers (below).
+
+**Step 1, `make_proposal`: range, line, primary threshold, expected interloper fraction.** One pass over the slices of
+the base catalog that matter, with the line rescaling and the doublet rule (by default `"galacticus_like"` and
+`"per_galaxy"`):
+
+```python
+from romanmock import BaseCatalog
+
+base = BaseCatalog("/global/cfs/cdirs/m4943/Simulations/RomanMocks/sdss_feniks_hizels_261013_10_14_2026/base")
+proposal = base.make_proposal((1.0, 1.2), line="Ha", flux_limit=1.5e-16, interloper_fraction=0.01)   # secondary: step 2
+proposal = base.make_proposal((1.0, 1.2), line="Ha", flux_limit=1.5e-16, secondary_flux_limit=6e-17)  # two tiers
+proposal = base.make_proposal((1.0, 1.2), line="Ha", snr=5, size="r50_disk_2d", interloper_fraction=0.03)  # or S/N
+proposal.plot_secondary()     # the most each kind of interloper can make of the catalog, against the secondary limit
+proposal.plot()               # single-line fractions and potential interlopers against redshift
+```
+
+It reports, against true redshift in bins of `dz` (0.01):
+
+* the **single-line galaxies inside the range**: their share of the detected galaxies, in all and per line;
+* the **potential interlopers**: single-line galaxies at other redshifts whose line falls where the target line would be
+  for a redshift inside the range (Hα at 1.0–1.2: 13 130–14 440 Å, so [O III] λ5007 at 1.62–1.88, [S III] λ9532 at
+  0.38–0.52, [O II] at 2.52–2.87, ...): their single-line fraction at their own redshift, how many per deg², and the
+  share of the catalog they would make if every one were taken (the most any identification gives: "at most");
+* **interlopers against the secondary limit**: the same "at most", per kind and in total, for secondary limits from where
+  any interloper becomes possible up to the primary limit. A galaxy's other lines are detected above the secondary
+  limit, so a higher one leaves more galaxies with a single line. With `interloper_fraction` (the total expected in the
+  catalog) it says from which secondary limit that total is possible. Given `interloper_fraction` and no secondary
+  limit, the proposal's own tables are those of a single tier (the secondary limit at the primary one, the ⁴ column),
+  and step 2 chooses the secondary limit.
+
+```
+── Interlopers against the secondary limit ─────────────────────────────────────────────────────────
+  secondary F [1e−17]  2      3      4   4.5     6   7.5     8     10    15⁴
+  ───────────────────  ─  ─────  ─────  ────  ────  ────  ────  ─────  ─────
+  SIII_9532            0      0      0     0  0.36  4.66  5.84   9.75  16.26
+  OIII_5007            0  <0.01  <0.01  0.01  0.19  0.78  1.09   2.90  10.03
+  other lines          0      0      0     0     0     0     0  <0.01   0.02
+  total                0  <0.01  <0.01  0.01  0.55  5.44  6.93  12.65  26.31
+  ⁴ this proposal's secondary flux limit, 1.5e-16 (the tables above); primary F > 1.5e-16
+  below a secondary flux limit of 2.3e-17 every potential interloper keeps a second line: none can be made
+  expected 1.00 % of interlopers in all: possible from a secondary flux limit of 6.1e-17 up; ...
+```
+
+No [S III] λ9532 galaxy is single below 5.8 × 10⁻¹⁷: the mock's λ9532/λ9069 ratio is fixed (2.57), so λ9069 stays above
+any lower secondary limit. Between 6 and 8 × 10⁻¹⁷ the possible interlopers jump from 0.55 % to 6.9 % of the catalog.
+
+The scan costs nothing extra: every sensitivity model puts the secondary limit at a fixed fraction of the primary one
+at each wavelength, so one number per galaxy (its second-brightest line in units of the primary threshold) decides it
+for every secondary limit. Counts are exact on a grid of 0.001 dex and at the proposal's own secondary limit, linear in
+log between. Lines whose single-line galaxies are fewer than `min_count` (100) or below `min_share` (0.1 %) are minor.
+`proposal.save(path)` / `Proposal.load(path)` keep it; the numbers are in `proposal.single_lines_inside()`,
+`interlopers()`, `interloper_scan(secondary)`, `secondary_for(total)`, `single_line_fraction(ratio)`,
+`fraction_inside(line)`, `fraction_interloper(line)`, `contamination_at_most(line)` and `proposal.counts`.
+
+**`line` decides which galaxies the catalog holds** (`make_proposal` prints this as a hint):
+
+| `line` | the catalog | its sample before interlopers |
+|---|---|---|
+| `"Ha"` (default) | the galaxies in which Hα is identified, with the redshift from Hα (observed wavelength / 6564.7 Å − 1) inside the range: Hα detected, alone or with other lines, or a single line taken for Hα (an interloper) | the galaxies with Hα detected inside the range |
+| `"OIII_5007"`, any line | the same for that line; a galaxy with Hα and [O III] belongs to both catalogs | the galaxies with that line detected |
+| `"all"` | every galaxy with a redshift inside the range, whichever line gave it (`make_catalog(lines=None)`) | every detected galaxy inside the range |
+
+With `line="all"` a potential interloper is a pair: a single line that, taken for another line, gets a redshift inside
+the range. Only lines that single-line galaxies inside the range actually show (above the minor-line cut,
+`proposal.assignable`) count as the line it is taken for: by wavelength alone a single Hα line could pass for
+[S III] λ6312, but no identification would assign a line that is never single. `proposal.interlopers()` is then
+`{taken for: {line: ...}}`, and in the figures the colour is the true line and the line style the line it is taken for.
+A single line can fall where two such lines would be (wide ranges), so the summed "at most" is an upper bound.
+
+**Step 2a, a catalog by design: `proposal.make_catalog(fractions=..., out_dir=...)`.**
+
+```python
+table = {"Ha": {"OIII_5007": 0.005, "SIII_9532": 0.005}}      # [O III] and [S III] taken for Hα: 0.5 % of the catalog each
+proposal.design(table, secondary_flux_limit=7.5e-17)          # what it takes (no catalog yet)
+cat = proposal.make_catalog(fractions=table, secondary_flux_limit=7.5e-17, out_dir="/pscratch/.../Ha_design")
+table = proposal.fraction_template(0.01, secondary_flux_limit=8e-17)   # 1 % shared in proportion to the numbers
+```
+
+`fractions` is `{line taken for: {interloper line: fraction}}`, each fraction a share of the catalog (of the Hα sample for
+`line="Ha"`; of every galaxy of the catalog for `line="all"`). With `N` the sample, `n` the potential interlopers of a
+pair at the chosen secondary limit and `F` the sum of the fractions, the catalog holds `N / (1 − F)` galaxies (for
+`line="all"`, interlopers whose true redshift is already inside the range only move: `N / (1 − Σ f n_out / n)`), and a
+single line of the pair, inside the window where it gets a redshift inside the range, is taken for the target with
+`P = f N_cat / n`. Everywhere else, and for the lines not listed, the identification is correct, so no galaxy of the
+sample is lost (`type: windowed`, `romanmock.confusion.WindowedConfusion`). A table that needs more interlopers than
+there are single lines (`P > 1`) is refused with the lowest secondary limit that meets it. `make_catalog` prints the
+design (the potential interlopers and `P` of each pair), the catalog, and the fractions asked and made; the summary file
+keeps both (`design`). The secondary limit (`secondary_flux_limit` for flux limits, `secondary_snr` for S/N) defaults to
+the proposal's (a single tier for a proposal made without one).
+
+**Step 2b, an identification model: `proposal.make_catalog(confusion, out_dir)`.**
+
+```python
+rows = proposal.confusion_template()                      # fill in the probabilities (an assumed scenario)
+rows = {"OIII_5007": {"Ha": 0.05}, "SIII_9532": {"Ha": 0.05}, "Ha": {"OIII_5007": 0.005}}
+cat = proposal.make_catalog(rows, "/pscratch/.../Contaminated", n_randoms=10)
+cat = proposal.make_catalog("empirical", "/pscratch/.../Contaminated_empirical")      # the line mix of the mock
+```
+
+A confusion table does not depend on the wavelength: a line taken for another is taken wherever it is, which can also
+lose galaxies of the sample (for `line="all"`, the template leaves out loss entries toward lines that are not
+assignable for that reason). `"empirical"` builds the line-fraction table at the same thresholds, rescaling and doublet
+rule first.
+
+Both write `<name>.hdf5` (default name `Ha_z1p0_1p2`, `all_z1p0_1p2`), `<name>_summary.json` (settings, outcome counts,
+line report, the proposal's numbers, the design), `<name>_proposal.npz` and, with `n_randoms`, `<name>_random.hdf5`
+(the randoms of the whole catalog; `cat.subset(which).make_random(...)` for a part). `confusion={}` gives the clean
+catalog. Notebooks: `notebooks/01_catalog_z1p0_1p2.ipynb` and `02_catalog_z1p6_2p0.ipynb` (confusion table and line
+mix), `04_catalog_by_design.ipynb` (interloper fractions), `05_single_line_clean_catalogs.ipynb` (below).
+
+**Single-line clean catalogs: no secondary limit, no interlopers.**
+
+```python
+proposal = base.make_proposal((1.0, 1.2), line="Ha", flux_limit=1.5e-16)       # no secondary limit, no interloper_fraction
+cat = proposal.make_catalog(out_dir="/pscratch/.../Ha_single_clean")            # one line per galaxy
+cat = proposal.make_catalog(secondary_flux_limit=7.5e-17, out_dir="/pscratch/.../Ha_single_clean_7p5e-17")
+```
+
+Without a secondary limit and without `interloper_fraction` (`flux_limit` alone, or `snr` alone), the proposal is for
+single-line clean catalogs: the galaxies with the target line above the primary limit (every detected galaxy for
+`line="all"`), each with its true redshift, and no interlopers. The summary gives, against redshift, the share of them
+that are *true* single-line galaxies, with no other line above 0.3, 0.4 and 0.5 times the primary limit
+(`secondary_ratios`; `proposal.single_line_fraction(ratio)`):
+
+```
+── Hα single-line galaxies against redshift ────────────────────────────────────────────────────────
+  z          Hα galaxies¹  4.5e-17  6e-17  7.5e-17
+  ─────────  ────────────  ───────  ─────  ───────
+  1.00–1.01       707,113     0.00   0.12     1.07
+  ...
+  1.19–1.20       553,949     0.26   1.17     3.13
+  all          12,617,496     0.17   0.92     2.55
+```
+
+`make_catalog(out_dir=...)` makes the catalog with one line per galaxy: every galaxy is a single-line galaxy
+(`id_outcome` 2), its line the target line also where another is brighter (with the rescaling and the merged doublet,
+[O III] outshines Hα in 43 % of them at 1.0–1.2); for `line="all"` each galaxy keeps its brightest line.
+`make_catalog(secondary_flux_limit=..., out_dir=...)` (or `secondary_snr`) makes the same galaxies with their other lines
+above that limit (detection `primary_line`: only the galaxies with the target line above the primary limit are
+detected). The single-line galaxies (2) are then those without another line, as many as the proposal counts (321,887,
+2.55 %, at 7.5 × 10⁻¹⁷), and the others are multi-line (1). Neither takes a confusion table or interloper fractions, and
+the interloper methods (`design`, `interloper_scan`, `confusion_template`, ...) refuse a single-line proposal. For
+interlopers, give the proposal `interloper_fraction` or a secondary limit.
+
 ## Resources
 
 Measured on the full lightcone (324 M input galaxies, base limit 1.0e-16, 64.6 M detected):
@@ -552,25 +838,36 @@ no patch decomposition, from the galaxies in the HEALPix index. `cat.info["area_
 
 ## Production data and notebooks
 
-The products for the mock `sdss_feniks_hizels_260710_09_07_2026` are in
-`/global/cfs/cdirs/m4943/Simulations/RomanMocks/sdss_feniks_hizels_260710_09_07_2026/`:
+The products of the current mock are in
+`/global/cfs/cdirs/m4943/Simulations/RomanMocks/sdss_feniks_hizels_261013_10_14_2026/`:
+
+* `base/`: 403.1 M galaxies with a line above 1.0e-18 erg/s/cm² (97.7 % of the mock), lensed fluxes, line set
+  `roman_transitions_paa`, 67 slices, 61 GB. Columns: `gal_id`, `ra`, `dec`, `redshift_true`, `r50_disk_2d`, `ra_obs`,
+  `dec_obs`, `magnification`, `redshift_rsd`, the line fluxes and `line_bitmask_base`. The unlensed flux is
+  flux / `magnification`.
+* `census/`.
+
+Both come from `sbatch scripts/production.sh`. The base was rebuilt at 1.0e-18 on 2026-11-09 (job 61070403, 1 min 52 s
+for the base alone). The 1.0e-17 base before it (344.5 M galaxies, 52.5 GB) is a subset of the new one, every column
+identical but `line_bitmask_base`; it was deleted on 2026-11-09 after that check. The table below describes the products of the
+previous mock, `/global/cfs/cdirs/m4943/Simulations/RomanMocks/sdss_feniks_hizels_260710_09_07_2026/`:
 
 | directory | content | made by |
 |---|---|---|
 | `base/` | base catalog: 222.0 M galaxies with a line above 1.0e-17 erg/s/cm² (74 % of the mock), 66 slices, 25.9 GB | `sbatch scripts/production.sh` |
 | `census/` | `dndz_census_z0p5_3p0.npz`: dN/dz per line (redshift bins of 0.01) for primary limits 1.0e-16, 1.5e-16 and secondary limits none, 8e-17, 6e-17, 4e-17; `flux_distribution.npz`: histograms of log flux (0.02 dex) per line and redshift bin (0.01) of all 324 M galaxies | `sbatch scripts/production.sh` |
-| `catalogs/` | `halpha_z1p0_1p9.hdf5`: Hα sample at 1.0 < z < 1.9 | notebook 02 |
-| `randoms/` | `halpha_z1p0_1p9_<which>_<index>.hdf5`: 10 random catalogs each for all, galaxies and interlopers | notebook 03 |
+| `catalogs/` | `halpha_z1p0_1p9.hdf5`: Hα sample at 1.0 < z < 1.9 | the former notebook 02 (removed 2026-11-09) |
+| `randoms/` | `halpha_z1p0_1p9_<which>_<index>.hdf5`: 10 random catalogs each for all, galaxies and interlopers | the former notebook 03 (removed 2026-11-09) |
 
-`notebooks/` holds six executed examples, all of which run on a login node:
+`notebooks/` holds five executed examples on the current base catalog. They write to `$PSCRATCH/RomanMocks/examples/`.
+Run them on a CPU node (03 also runs on a login node, after 01):
+`sbatch scripts/run_notebook.sh notebooks/01_catalog_z1p0_1p2.ipynb notebooks/02_catalog_z1p6_2p0.ipynb notebooks/03_randoms.ipynb notebooks/04_catalog_by_design.ipynb notebooks/05_single_line_clean_catalogs.ipynb`
 
-1. `01_dndz_flux_limits.ipynb` – dN/dz per line and the single-line fraction for the primary and secondary flux limits.
-2. `02_build_catalog.ipynb` – a catalog from the base catalog: flux limits, confusion matrix, line and redshift selection, the line report, writing and reading.
-3. `03_build_randoms.ipynb` – the random catalogs of that catalog for the contaminated sample, the galaxies and the interlopers.
-4. `04_line_flux_distribution.ipynb` – the line fluxes of every galaxy of the mock (no flux cut): quantiles and fractions above the thresholds versus redshift, the companion lines of a selected galaxy; what explains the counts of notebook 01.
-5. `05_line_flux_vs_wavelength.ipynb` – the single-line galaxies (one in-band line above 1.5e-16, no other above 6e-17), read from the base catalog, against observed wavelength: 0–90 % and 90–99.9 % quantiles of the flux of the single line, and the stacked share of each line among the single-line galaxies above a flux threshold in twelve 775 Å ranges of the bandpass; lines that are the single line of fewer than 1 % of the galaxies in every range are left out of the plots.
-6. `06_line_combinations.ipynb` – stacked composition of the detected galaxies (primary 1.5e-16, secondary 6e-17) against redshift, 0.5 to 3.0: single-line galaxies per line at the bottom, multi-line galaxies per combination of detected lines above.
-7. `07_galacticus_line_flux_distribution.ipynb` – notebook 04 for the Galacticus mock `GP-MCMC-Calibration1_allUNIT_16sqDegMock_XMM-LSS` (dust-attenuated disk + spheroid + AGN luminosities): flux quantiles and fractions above the thresholds versus redshift with the diffsky mock alongside, emitters per square degree against the diffsky mock and the Wang et al. (2022) forecast, the companion lines of a selected galaxy. Its flux distribution is `/global/cfs/cdirs/m4943/Simulations/RomanMocks/GP-MCMC-Calibration1_allUNIT_16sqDegMock_XMM-LSS/census/flux_distribution.npz`.
+1. `01_catalog_z1p0_1p2.ipynb`: the Hα catalog at 1.0 < z < 1.2 in the two steps. The proposal (flux limits 1.5 / 0.6 × 10⁻¹⁶, S/N 5 / 2, `line="all"`), then the catalog with an assumed confusion table and with the line mix of the mock, its components, and the files.
+2. `02_catalog_z1p6_2p0.ipynb`: the same at 1.6 < z < 2.0 for every galaxy (`line="all"`): Hα leaves the grism at z = 1.94, and [O III] λ5007 carries the range to 2.0.
+3. `03_randoms.ipynb`: the random catalog of the catalog of notebook 01 and of each of its parts (`cat.subset(which).make_random(...)`): multi-line galaxies, single-line galaxies with a correct redshift, all interlopers, each kind of interloper. It checks them (inside the footprint, the n(z) of the data) and shows that they are reproducible, extensible and independent between parts.
+4. `04_catalog_by_design.ipynb`: catalogs by their interloper fractions: the proposal with an expected total and its scan of the secondary limit, `design`, a table that cannot be met, `fraction_template`, the S/N scan, and every galaxy at 1.6 < z < 2.0.
+5. `05_single_line_clean_catalogs.ipynb`: single-line clean catalogs, without interlopers: the true single-line share against redshift at 0.3, 0.4 and 0.5 times the primary limit, the catalog with one line per galaxy and with a secondary limit of 7.5 × 10⁻¹⁷ (the same galaxies, single-line as the proposal counts), the S/N proposal.
 
 ## Extending (hooks for the plan's comments)
 

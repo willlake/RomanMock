@@ -57,11 +57,17 @@ def list_catalog_files(catalog_dir) -> list[Path]:
     return files
 
 
+def galaxy_group(f: h5py.File) -> h5py.Group:
+    """The galaxy table of a slice: ``data`` (mocks up to 2026-09) or ``cores/data`` (from 2026-10, where the
+    synthetic cores sit in ``synth_cores/data`` and OpenCosmo loads them only with ``synth_cores=True``)."""
+    return f["data"] if "data" in f else f["cores/data"]
+
+
 def file_info(path) -> FileInfo:
     path = Path(path)
     with h5py.File(path, "r") as f:
         zr = f["header/lightcone"].attrs["z_range"]
-        n = f["data/gal_id"].shape[0]
+        n = galaxy_group(f)["gal_id"].shape[0]
     return FileInfo(path, step_from_filename(path), float(zr[0]), float(zr[1]), int(n))
 
 

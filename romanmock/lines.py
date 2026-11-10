@@ -34,6 +34,12 @@ DIFFSKY_LINE_WAVELENGTHS: dict[str, float] = {
     "S_III_9532": 9533.378,
 }
 
+# Lines added to "roman_grs_pit" in the mocks of 2026-10 (sdss_feniks_hizels_261013 onward), same source.
+# Kept apart from DIFFSKY_LINE_WAVELENGTHS so that ``all_transitions`` still reads the earlier mocks.
+DIFFSKY_ADDED_LINE_WAVELENGTHS: dict[str, float] = {
+    "Pa_alpha_1p8751um": 18756.4,
+}
+
 # Vacuum rest-frame wavelengths (Angstrom) of the 17 Galacticus emission lines of the Roman
 # GRS-PIT mocks (``luminosityEmissionLine<Component>:<name>``). Galacticus stores the air
 # wavelength in the ``wavelength`` attribute of the dust-free datasets; these are those values
@@ -59,7 +65,8 @@ GALACTICUS_LINE_WAVELENGTHS: dict[str, float] = {
 }
 
 #: Rest wavelength of every known component column (diffsky and Galacticus names).
-KNOWN_LINE_WAVELENGTHS: dict[str, float] = {**DIFFSKY_LINE_WAVELENGTHS, **GALACTICUS_LINE_WAVELENGTHS}
+KNOWN_LINE_WAVELENGTHS: dict[str, float] = {**DIFFSKY_LINE_WAVELENGTHS, **DIFFSKY_ADDED_LINE_WAVELENGTHS,
+                                             **GALACTICUS_LINE_WAVELENGTHS}
 
 MAX_FEATURES = 32  # bitmask is stored as uint32
 
@@ -289,6 +296,16 @@ ROMAN_TRANSITIONS = LineSet(
     name="roman_transitions",
 )
 
+#: ``roman_transitions`` plus Paschen-alpha as bit 9 (bits 0-8 unchanged), for the mocks that carry
+#: ``Pa_alpha_1p8751um`` (sdss_feniks_hizels_261013 onward). Paα is inside the grism at z < 0.029 only.
+ROMAN_TRANSITIONS_PAA = LineSet(
+    [
+        *ROMAN_TRANSITIONS,
+        LineFeature("PaA", DIFFSKY_ADDED_LINE_WAVELENGTHS["Pa_alpha_1p8751um"], ("Pa_alpha_1p8751um",), "Paschen-alpha 18756"),
+    ],
+    name="roman_transitions_paa",
+)
+
 #: The five species of the plan's section 2 (bits 0..4 in the order written there).
 #: [O III] and [S III] are *separated* transitions: each component is detected on its own
 #: (own wavelength and bandpass test) and the species bit is set when any component is
@@ -347,6 +364,7 @@ GALACTICUS_TRANSITIONS = LineSet(
 
 LINE_SET_PRESETS: dict[str, LineSet] = {
     "roman_transitions": ROMAN_TRANSITIONS,
+    "roman_transitions_paa": ROMAN_TRANSITIONS_PAA,
     "plan_species": PLAN_SPECIES,
     "all_transitions": ALL_TRANSITIONS,
     "galacticus_transitions": GALACTICUS_TRANSITIONS,

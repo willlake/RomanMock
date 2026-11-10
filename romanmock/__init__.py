@@ -28,19 +28,26 @@ from .sensitivity import (
 )
 from .sizes import SizeSpec
 from .detection import detect_lines, DetectionResult, pack_bitmask, unpack_bitmask, popcount
-from .confusion import ConfusionMatrix, WavelengthBinnedConfusion, LineFractionTable, FAIL
+from .confusion import ConfusionMatrix, WavelengthBinnedConfusion, WindowedConfusion, LineFractionTable, FAIL
 from .redshift import assign_redshifts, IdOutcome, RedshiftAssignment
 from .config import RomanMockConfig
 from .pipeline import RomanMockPipeline
-from .catalog import BaseCatalog, Catalog, make_catalog, make_random
+from .catalog import BaseCatalog, Catalog, make_catalog, make_proposal, make_random
+from .doublets import DoubletRule, build_doublets
+from .proposal import Proposal
 from .footprint import PatchFootprint
+from .rescaling import GalacticusLike, LineFactors, build_rescaling, galaxy_normal
 
 
 __all__ = [
     "BaseCatalog",
     "Catalog",
     "make_catalog",
+    "make_proposal",
     "make_random",
+    "Proposal",
+    "DoubletRule",
+    "build_doublets",
     "PatchFootprint",
     "LineFeature",
     "LineSet",
@@ -64,6 +71,7 @@ __all__ = [
     "popcount",
     "ConfusionMatrix",
     "WavelengthBinnedConfusion",
+    "WindowedConfusion",
     "LineFractionTable",
     "FAIL",
     "assign_redshifts",
@@ -71,4 +79,8 @@ __all__ = [
     "RedshiftAssignment",
     "RomanMockConfig",
     "RomanMockPipeline",
+    "GalacticusLike",
+    "LineFactors",
+    "build_rescaling",
+    "galaxy_normal",
 ]

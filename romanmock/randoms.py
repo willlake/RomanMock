@@ -1,47 +1,35 @@
-"""Random catalogs for the catalogs made by :meth:`romanmock.catalog.BaseCatalog.make_catalog`.
+"""Random catalogs.
 
-A random catalog has the angular distribution of the footprint (uniform inside it) and the
-redshift distribution of its data catalog: the redshifts are drawn, with replacement, from the
-redshifts of the data. Three data catalogs come out of a contaminated catalog, each with its
-own randoms:
+A random catalog belongs to one data catalog and depends on nothing else: its points are uniform inside the footprint
+of the lightcone the data come from (and inside the data's cuts on ra and dec), and its redshifts are drawn, with
+replacement, from the redshifts of the data. The data catalog is any :class:`~romanmock.catalog.Catalog`: a whole
+catalog, or a part of one, which then gets randoms of its own::
 
-``"all"``          every galaxy of the catalog (galaxies and interlopers),
-``"galaxies"``     the galaxies with a correct redshift (multi-line, single-line correct),
-``"interlopers"``  the galaxies with a wrong redshift (single-line, misidentified).
+    cat.make_random(10)                                    # the whole catalog
+    cat.subset("OIII_5007_as_Ha").make_random(10)          # one kind of interloper (Catalog.subset, Catalog.components)
+    cat[cat["redshift_assigned"] < 1.1].make_random(10)    # any selection
 
-Randoms ``n_times`` as numerous as the data are made as ``n_times`` catalogs of the size of the
-data, each with its own random stream ``(seed, RANDOM_STREAM, kind, index)``: any of them can be
-made again, or more added, without touching the others.
+``make_random(data, n_times)`` makes ``n_times`` as many points as the data, in blocks of the size of the data: block
+``k`` comes from the random stream ``(seed, RANDOM_STREAM, key, k)``, ``key`` a hash of the data's redshifts. The same
+data and seed always give the same randoms, more blocks add points and keep the first ones, and two different data
+catalogs (two parts of one catalog) get independent randoms with the same seed.
 """
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
-from typing import Sequence
 
 import numpy as np
 
-from .redshift import IdOutcome
-
 RANDOM_STREAM = 30_000
-#: data catalogs of a contaminated catalog: identification outcomes of each
-KINDS = {
-    "all": None,
-    "galaxies": (int(IdOutcome.MULTI_LINE), int(IdOutcome.SINGLE_CORRECT)),
-    "interlopers": (int(IdOutcome.SINGLE_MISID),),
-}
 ANGULAR_COLUMNS = ("ra", "dec")
 
 
-def kind_mask(catalog, kind: str) -> np.ndarray:
-    """Rows of ``catalog`` that belong to ``kind`` (``"all"``, ``"galaxies"`` or ``"interlopers"``)."""
-    if kind not in KINDS:
-        raise ValueError(f"which must be one of {list(KINDS)}; got {kind!r}")
-    if KINDS[kind] is None:
-        return np.ones(len(catalog), dtype=bool)
-    if "id_outcome" not in catalog:
-        raise KeyError(f"the catalog needs the column id_outcome to tell the {kind} apart")
-    return np.isin(catalog["id_outcome"], KINDS[kind])
+def data_key(z) -> int:
+    """The part of the random stream that comes from the data: a 63-bit hash of its redshifts, in their order."""
+    z = np.ascontiguousarray(np.asarray(z, dtype=np.float64))
+    return int.from_bytes(hashlib.blake2b(z.tobytes(), digest_size=8).digest(), "little") >> 1
 
 
 def angular_cuts(settings: dict) -> dict:
@@ -73,49 +61,56 @@ def sample_sky(footprint, n: int, rng: np.random.Generator, cuts: dict | None = 
     return ra[:n], dec[:n]
 
 
-def random_files(write_to, kind: str, n_times: int, several_kinds: bool) -> list[Path]:
-    """File names of the randoms: ``<stem>[_<kind>]_<index>.hdf5`` next to ``write_to``."""
-    path = Path(write_to)
-    if path.suffix.lower() not in (".hdf5", ".h5"):
-        path = path / "random.hdf5" if path.is_dir() or not path.suffix else path.with_suffix(".hdf5")
-    stem = f"{path.stem}_{kind}" if several_kinds else path.stem
-    width = max(2, len(str(n_times - 1)))
-    return [path.with_name(f"{stem}_{k:0{width}d}{path.suffix}") for k in range(n_times)]
+def make_random(data, footprint, n_times: int = 1, z_column: str | None = None, seed: int = 12345, write_to=None,
+                verbose: bool = True):
+    """The random catalog of ``data``; see :meth:`romanmock.catalog.Catalog.make_random`."""
+    from .catalog import Catalog, catalog_attributes
 
-
-def make_random(catalog, footprint, which: str | Sequence[str] = "all", n_times: int = 1, z_column: str | None = None,
-                seed: int = 12345, write_to=None, first: int = 0, verbose: bool = True):
-    """Random catalogs for ``catalog``; see :meth:`romanmock.catalog.Catalog.make_random`."""
-    from .catalog import Catalog
-
-    kinds = [which] if isinstance(which, str) else list(which)
-    z_column = z_column or catalog.settings.get("z_column") or "redshift_assigned"
-    if z_column not in catalog:
+    z_column = z_column or data.settings.get("z_column") or "redshift_assigned"
+    if z_column not in data:
         raise KeyError(f"the catalog has no column {z_column!r}: make it with columns=[..., {z_column!r}]")
-    cuts = angular_cuts(catalog.settings)
     n_times = int(n_times)
-    out = {}
-    for kind in kinds:
-        z_data = np.asarray(catalog[z_column])[kind_mask(catalog, kind)]
-        z_data = z_data[np.isfinite(z_data)]
-        if verbose:
-            print(f"[romanmock] randoms for {kind!r}: {n_times} x {z_data.size:,} points, uniform inside "
-                  f"{footprint.area_deg2:.1f} deg2{f' and {cuts}' if cuts else ''}, {z_column} drawn from the data", flush=True)
-        files = None if write_to is None else random_files(write_to, kind, first + n_times, len(kinds) > 1)[first:]
-        made = []
-        for k in range(first, first + n_times):
-            rng = np.random.default_rng([int(seed), RANDOM_STREAM, list(KINDS).index(kind), k])
-            ra, dec = sample_sky(footprint, z_data.size, rng, cuts)
-            z = z_data[rng.integers(0, z_data.size, size=z_data.size)] if z_data.size else z_data.copy()
-            settings = {**catalog.settings, "z_column": z_column,
-                        "random": {"which": kind, "index": k, "seed": int(seed), "n_data": int(z_data.size)}}
-            ran = Catalog({"ra": ra, "dec": dec, z_column: z}, settings, {"footprint": footprint.to_dict()},
-                          catalog.line_names, footprint.area_deg2)
-            if files is None:
-                made.append(ran)
-            else:
-                made.append(ran.write(files[k - first]))
-                if verbose:
-                    print(f"[romanmock]   {made[-1]}", flush=True)
-        out[kind] = made
-    return out[kinds[0]] if isinstance(which, str) else out
+    if n_times < 1:
+        raise ValueError("n_times must be at least 1")
+    z_data = np.asarray(data[z_column], dtype=np.float64)
+    z_data = z_data[np.isfinite(z_data)]
+    n = int(z_data.size)
+    if n == 0:
+        raise ValueError(f"the data catalog has no galaxy with a finite {z_column}: there is nothing to make randoms for")
+    key, cuts = data_key(z_data), angular_cuts(data.settings)
+    settings = {**data.settings, "z_column": z_column,
+                "random": {"n_times": n_times, "n_data": n, "seed": int(seed), "data_key": key}}
+    info = {"footprint": footprint.to_dict()}
+    columns = ["ra", "dec", z_column]
+    if verbose:
+        where = f" and inside {cuts}" if cuts else ""
+        print(f"[romanmock] random catalog: {n_times} x {n:,} points, uniform inside {footprint.area_deg2:.1f} deg²{where}, "
+              f"{z_column} drawn from the data", flush=True)
+
+    def block(k: int):
+        rng = np.random.default_rng([int(seed), RANDOM_STREAM, key, k])
+        ra, dec = sample_sky(footprint, n, rng, cuts)
+        return ra, dec, z_data[rng.integers(0, n, size=n)]
+
+    path = None if write_to is None else Path(write_to)
+    if path is not None and path.suffix.lower() not in (".hdf5", ".h5", ".npz", ".fits"):
+        path = path / "random.hdf5"
+    if path is None or path.suffix.lower() not in (".hdf5", ".h5"):
+        parts = [block(k) for k in range(n_times)]
+        cat = Catalog({c: np.concatenate([p[i] for p in parts]) for i, c in enumerate(columns)}, settings, info,
+                      data.line_names, footprint.area_deg2)
+        return cat if path is None else cat.write(path)
+    import h5py
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with h5py.File(path, "w") as f:                    # block by block: the memory of one block only
+        for name, value in catalog_attributes(settings, info, data.line_names, columns, footprint.area_deg2,
+                                              n * n_times).items():
+            f.attrs[name] = value
+        sets = [f.create_dataset(c, shape=(n * n_times,), dtype="f8") for c in columns]
+        for k in range(n_times):
+            for d, values in zip(sets, block(k)):
+                d[k * n:(k + 1) * n] = values
+    if verbose:
+        print(f"[romanmock] wrote {path}", flush=True)
+    return path

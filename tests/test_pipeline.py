@@ -95,3 +95,21 @@ def test_empty_slice_writes_marker(tmp_path):
     assert outputs == []
     assert list(tmp_path.glob("*.empty")) and not list(tmp_path.glob("lc_cores-*.hdf5"))
     assert pipe.run(files=[small], verbose=False) == []   # marker makes the re-run skip the slice
+
+
+def test_file_info_reads_both_mock_layouts(tmp_path):
+    """The galaxy table is ``data`` in the mock of 2026-09 and ``cores/data`` from 2026-10 (synthetic cores apart)."""
+    import h5py
+
+    from romanmock.io import file_info
+
+    for group in ("data", "cores/data"):
+        path = tmp_path / group.replace("/", "_") / "lc_cores-219.diffsky_gals.hdf5"
+        path.parent.mkdir()
+        with h5py.File(path, "w") as f:
+            f.create_group("header/lightcone").attrs["z_range"] = [1.2088, 1.2584]
+            f.create_dataset(f"{group}/gal_id", data=np.arange(5))
+            if group == "cores/data":
+                f.create_dataset("synth_cores/data/gal_id", data=np.arange(7))
+        info = file_info(path)
+        assert (info.step, info.n_gal) == (219, 5) and info.z_min == pytest.approx(1.2088)

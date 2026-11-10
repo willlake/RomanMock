@@ -68,6 +68,20 @@ def popcount(bitmask: np.ndarray) -> np.ndarray:
     return count
 
 
+def one_line_per_galaxy(primary: np.ndarray, snr: np.ndarray, prefer: int | None = None) -> np.ndarray:
+    """One detected line per galaxy, the rule without a secondary limit (every detected galaxy a single-line galaxy):
+    of the lines above the primary limit, line ``prefer`` when it is one of them (the target line of a catalog: every
+    galaxy with it above the primary limit is a single-line galaxy of that line), else the one with the highest S/N."""
+    score = np.where(primary, snr, -np.inf)
+    if prefer is not None:
+        score[:, prefer] = np.where(primary[:, prefer], np.inf, -np.inf)
+    top = np.argmax(score, axis=-1)
+    out = np.zeros(primary.shape, dtype=bool)
+    rows = np.flatnonzero(primary.any(axis=-1))
+    out[rows, top[rows]] = True
+    return out
+
+
 def detect_lines(
     flux: np.ndarray,
     z_rsd: np.ndarray,
@@ -99,6 +113,10 @@ def detect_lines(
         on it (:class:`~romanmock.sensitivity.RomanGrismSensitivity` with a size column;
         ``model.sensitivity.angular_size(data, cosmology)`` computes it). Ignored by the
         other models.
+
+    A detection model with ``single_line`` (True or a line name) keeps one line per galaxy
+    (:func:`one_line_per_galaxy`); one with ``primary_line`` (a line name) detects only the
+    galaxies with that line above the primary limit.
     """
     line_set = get_line_set(line_set)
     flux = np.asarray(flux, dtype=np.float64)
@@ -154,6 +172,13 @@ def detect_lines(
             primary[:, i] = comp_primary[:, sel].any(axis=1)
             flux_measured[:, i] = det.flux_measured[:, sel].sum(axis=1)
             snr[:, i] = det.snr[:, sel].max(axis=1)
+    need = getattr(model, "primary_line", None)
+    if need:                                    # the sample of one line: the galaxies with it above the primary limit
+        has = primary[:, line_set.names.index(need)][:, None]
+        detected, primary = detected & has, primary & has
+    rule = getattr(model, "single_line", False)
+    if rule:                                    # no secondary limit: one line per galaxy
+        detected = one_line_per_galaxy(primary, snr, None if rule is True else line_set.names.index(rule))
     bitmask = pack_bitmask(detected)
     return DetectionResult(
         wave_obs=wave_obs,

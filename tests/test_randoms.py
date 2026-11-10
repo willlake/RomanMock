@@ -4,7 +4,7 @@ import pytest
 
 from romanmock import BaseCatalog, Catalog, PatchFootprint, RomanMockConfig, RomanMockPipeline, make_random
 from romanmock.footprint import read_patch_decomposition
-from romanmock.randoms import random_files, sample_sky
+from romanmock.randoms import data_key, sample_sky
 
 from conftest import CATALOG_DIR, catalog_available
 
@@ -49,46 +49,85 @@ def test_footprint_area_and_sampling(tmp_path):
     assert fp2.area_deg2 == fp.area_deg2 and fp2.n_patches == 6
 
 
-def test_sample_sky_with_cuts_and_file_names(tmp_path):
+def test_sample_sky_with_cuts():
     fp = _footprint()
     ra, dec = sample_sky(fp, 50_000, np.random.default_rng(2), {"dec": (52.0, 58.0), "ra": (None, 250.0)})
     assert ra.size == 50_000 and dec.min() >= 52 and dec.max() <= 58 and ra.max() <= 250 and ra.min() >= 180
     with pytest.raises(ValueError):
         sample_sky(fp, 10, np.random.default_rng(2), {"dec": (80.0, 85.0)})
-    assert [p.name for p in random_files(tmp_path / "ha.hdf5", "all", 2, False)] == ["ha_00.hdf5", "ha_01.hdf5"]
-    assert [p.name for p in random_files(tmp_path / "ha.hdf5", "galaxies", 1, True)] == ["ha_galaxies_00.hdf5"]
-    assert [p.name for p in random_files(tmp_path, "all", 1, False)] == ["random_00.hdf5"]
 
 
-def test_random_catalogs_without_base(tmp_path):
+def _contaminated(n=20_000, seed=5):
+    """A toy contaminated catalog on the toy footprint: multi-line galaxies, single-line ones with a correct redshift,
+    and two kinds of interlopers taken for Ha ([O III] 5007 and Hb), each kind at its own redshifts."""
     fp = _footprint()
-    rng = np.random.default_rng(3)
-    ra, dec = fp.sample(30_000, rng)
-    outcome = rng.choice([1, 2, 3], size=ra.size, p=[0.5, 0.3, 0.2]).astype(np.int8)
-    z = np.where(outcome == 3, rng.uniform(1.0, 1.2, ra.size), rng.uniform(1.0, 1.9, ra.size))
-    cat = Catalog({"ra": ra, "dec": dec, "redshift_assigned": z, "id_outcome": outcome}, {"z_column": "redshift_assigned"})
-    assert len(cat.subset("galaxies")) + len(cat.subset("interlopers")) == len(cat.subset("all")) == len(cat)
-    ran = cat.make_random(which=["all", "galaxies", "interlopers"], n_times=3, footprint=fp, seed=4, verbose=False)
-    for kind, n in (("all", len(cat)), ("galaxies", np.sum(outcome != 3)), ("interlopers", np.sum(outcome == 3))):
-        assert len(ran[kind]) == 3
-        for r in ran[kind]:
-            assert len(r) == n and r.columns == ["ra", "dec", "redshift_assigned"] and fp.contains(r["ra"], r["dec"]).all()
-            assert np.isin(r["redshift_assigned"], cat.subset(kind)["redshift_assigned"]).all()     # drawn from the data
-        assert not np.array_equal(ran[kind][0]["ra"], ran[kind][1]["ra"])
-    assert ran["interlopers"][0]["redshift_assigned"].max() <= 1.2
-    # each catalog can be made again on its own; files hold the same
-    files = cat.make_random(which="galaxies", n_times=2, first=1, footprint=fp, seed=4, write_to=tmp_path / "gal.hdf5", verbose=False)
-    assert [f.name for f in files] == ["gal_01.hdf5", "gal_02.hdf5"]
-    back = Catalog.read(files[0])
-    np.testing.assert_array_equal(back["ra"], ran["galaxies"][1]["ra"])
-    np.testing.assert_array_equal(back["redshift_assigned"], ran["galaxies"][1]["redshift_assigned"])
-    assert back.settings["random"] == {"which": "galaxies", "index": 1, "seed": 4, "n_data": int(np.sum(outcome != 3))}
+    rng = np.random.default_rng(seed)
+    ra, dec = fp.sample(n, rng)
+    kind = rng.choice(4, size=n, p=[0.6, 0.2, 0.15, 0.05])          # multi, single correct, OIII as Ha, Hb as Ha
+    data = {"ra": ra, "dec": dec, "redshift_assigned": np.array([1.0, 1.05, 1.1, 1.15])[kind] + rng.uniform(0, 0.05, n),
+            "id_outcome": np.array([1, 2, 3, 3], dtype=np.int8)[kind], "line_true": np.array([0, 0, 2, 1], dtype=np.int8)[kind],
+            "line_assigned": np.zeros(n, dtype=np.int8)}
+    return Catalog(data, {"z_column": "redshift_assigned"}, {}, ["Ha", "Hb", "OIII_5007"]), kind, fp
+
+
+def test_random_catalog_of_a_data_catalog(tmp_path):
+    """The random catalog depends on the data and the seed only: n_times as many points, uniform inside the footprint,
+    redshifts drawn from the data; the same data give the same randoms, more blocks keep the first ones, other data
+    (another part of the catalog) give independent ones, and the file written block by block holds the same."""
+    cat, kind, fp = _contaminated()
+    n = len(cat)
+    ran = cat.make_random(3, footprint=fp, seed=4, verbose=False)
+    assert len(ran) == 3 * n and ran.columns == ["ra", "dec", "redshift_assigned"] and fp.contains(ran["ra"], ran["dec"]).all()
+    assert np.isin(ran["redshift_assigned"], cat["redshift_assigned"]).all()                 # drawn from the data
+    assert ran.settings["random"] == {"n_times": 3, "n_data": n, "seed": 4, "data_key": data_key(cat["redshift_assigned"])}
+    assert ran.area_deg2 == pytest.approx(fp.area_deg2) and "Random catalog · 3 × 20,000 points" in ran.summary()
+    again = make_random(cat, n_times=5, footprint=fp, seed=4, verbose=False)
+    for c in ran.columns:                                      # the same data: the same randoms, more blocks keep the first
+        np.testing.assert_array_equal(again[c][:3 * n], ran[c], err_msg=c)
+    assert not np.array_equal(cat.make_random(1, footprint=fp, seed=5, verbose=False)["ra"], ran["ra"][:n])
+    path = cat.make_random(3, footprint=fp, seed=4, write_to=tmp_path / "ran.hdf5", verbose=False)
+    back = Catalog.read(path)
+    assert path.name == "ran.hdf5" and back.settings["random"] == ran.settings["random"]
+    for c in ran.columns:
+        np.testing.assert_array_equal(back[c], ran[c], err_msg=c)
+    assert Catalog.read(cat.make_random(1, footprint=fp, seed=4, write_to=tmp_path, verbose=False)).columns == ran.columns
+    # a part of the catalog is a data catalog of its own: its size, its redshifts, its own random points
+    for which, k, lo in (("multi_line", 0, 1.0), ("single_correct", 1, 1.05), ("OIII_5007_as_Ha", 2, 1.1), ("Hb_as_Ha", 3, 1.15)):
+        part = cat.subset(which)
+        r = part.make_random(2, footprint=fp, seed=4, verbose=False)
+        assert len(r) == 2 * np.sum(kind == k) and fp.contains(r["ra"], r["dec"]).all()
+        assert r["redshift_assigned"].min() >= lo and r["redshift_assigned"].max() <= lo + 0.05         # its own n(z)
+        assert not np.array_equal(r["ra"][:100], ran["ra"][:100])        # independent of the whole catalog's randoms
+    inter = cat.subset("interlopers").make_random(1, footprint=fp, seed=4, verbose=False)
+    assert inter["redshift_assigned"].min() >= 1.1 and len(inter) == np.sum(kind >= 2)
+    low = cat[cat["redshift_assigned"] < 1.05].make_random(1, footprint=fp, seed=4, verbose=False)          # any selection
+    assert len(low) == np.sum(cat["redshift_assigned"] < 1.05) and low["redshift_assigned"].max() < 1.05
     with pytest.raises(KeyError):
-        cat[["ra", "dec", "redshift_assigned"]].make_random(which="interlopers", footprint=fp, verbose=False)
-    with pytest.raises(ValueError):
-        cat.make_random(which="stars", footprint=fp, verbose=False)
-    with pytest.raises(ValueError):
+        cat[["ra", "dec"]].make_random(footprint=fp, verbose=False)
+    with pytest.raises(ValueError, match="footprint"):
         cat.make_random(verbose=False)                   # no base catalog and no footprint
+    with pytest.raises(ValueError, match="nothing to make randoms"):
+        cat[cat["redshift_assigned"] > 9].make_random(footprint=fp, verbose=False)
+
+
+def test_parts_of_a_catalog():
+    """The parts of a contaminated catalog, with one entry per kind of interloper."""
+    cat, kind, _ = _contaminated()
+    comp = cat.components()
+    counts = np.bincount(kind, minlength=4)
+    assert list(comp) == ["all", "multi_line", "single_correct", "galaxies", "interlopers", "OIII_5007_as_Ha", "Hb_as_Ha"]
+    assert [comp[k] for k in ("multi_line", "single_correct", "OIII_5007_as_Ha", "Hb_as_Ha")] == counts.tolist()
+    assert comp["galaxies"] == comp["multi_line"] + comp["single_correct"] and comp["all"] == len(cat)
+    assert comp["interlopers"] == comp["OIII_5007_as_Ha"] + comp["Hb_as_Ha"] == len(cat.subset("interlopers"))
+    assert len(cat.subset("Hb_as_Ha")) == counts[3] and (cat.subset("Hb_as_Ha")["line_true"] == 1).all()
+    with pytest.raises(ValueError, match="unknown lines"):
+        cat.subset("SIII_9532_as_Ha")
+    with pytest.raises(ValueError, match="itself"):
+        cat.subset("Ha_as_Ha")
+    with pytest.raises(ValueError, match="which must be"):
+        cat.subset("stars")
+    with pytest.raises(KeyError, match="line_true"):
+        cat[["ra", "dec", "redshift_assigned", "id_outcome"]].subset("Hb_as_Ha")
 
 
 @pytest.mark.skipif(not catalog_available(), reason="diffsky mock not available")
@@ -120,14 +159,14 @@ def test_footprint_and_randoms_of_the_mock(tmp_path):
     cat = base.make_catalog(confusion={"SIII_9532": {"Ha": 0.3}}, n_workers=1, verbose=False)
     assert np.mean(fp.contains(cat["ra"], cat["dec"])) > 0.995                   # satellites spill over the edge
     ran = cat.make_random(n_times=2, verbose=False)
-    assert len(ran) == 2 and len(ran[0]) == len(cat) and fp.contains(ran[0]["ra"], ran[0]["dec"]).all()
-    assert ran[0].area_deg2 == pytest.approx(fp.area_deg2)
+    assert len(ran) == 2 * len(cat) and fp.contains(ran["ra"], ran["dec"]).all()
+    assert ran.area_deg2 == pytest.approx(fp.area_deg2)
     # data and randoms have the same large-scale distribution on the sky
     h = lambda c: np.histogram2d(c["ra"], np.sin(np.radians(c["dec"])), bins=(6, 3), range=((0, 360), (np.sin(np.radians(57.85)), np.sin(np.radians(75.16)))))[0]
-    d, r = h(cat), h(ran[0])
+    d, r = h(cat), h(ran) / 2
     assert np.array_equal(d == 0, r == 0) or np.all(d[r == 0] < 1e-3 * len(cat))
     assert np.abs(d[r > 0] / r[r > 0] - 1).max() < 0.25
-    files = make_random(cat.write(tmp_path / "cat.hdf5"), which=["galaxies", "interlopers"], n_times=1,
-                        write_to=tmp_path / "ran" / "cat_random.hdf5", verbose=False)
-    assert files["interlopers"][0].name == "cat_random_interlopers_00.hdf5"
-    assert len(Catalog.read(files["interlopers"][0])) == len(cat.subset("interlopers")) > 0
+    path = make_random(cat.write(tmp_path / "cat.hdf5"), n_times=1, write_to=tmp_path / "ran" / "cat_random.hdf5", verbose=False)
+    assert path.name == "cat_random.hdf5" and len(Catalog.read(path)) == len(cat)
+    inter = cat.subset("interlopers")
+    assert len(inter.make_random(n_times=1, verbose=False)) == len(inter) > 0

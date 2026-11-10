@@ -42,11 +42,14 @@ import numpy as np
 import opencosmo as oc
 
 from ._version import __version__
-from .confusion import ConfusionMatrix, LineFractionTable, build_confusion, default_confusion
+from .confusion import ConfusionMatrix, LineFractionTable, WindowedConfusion, build_confusion, default_confusion
 from .detection import detect_lines
+from .doublets import build_doublets
 from .io import memory_budget_gb, read_manifest, suggest_n_workers
 from .lines import get_line_set
 from .redshift import IdOutcome, PerfectMultiLine, assign_redshifts, single_lines
+from .report import PREFIX, Progress
+from .rescaling import build_rescaling
 from .roman import DEFAULT_LINE_FLUX_LIMIT, DEFAULT_SECONDARY_LINE_FLUX_LIMIT
 from .samples import THINNING_STREAM
 from .selection import TargetDNDZ, tracer_membership, dndz_from_counts, keep_probability, probability_per_galaxy, sky_area_deg2
@@ -69,7 +72,7 @@ SENSITIVITY_ARGS = ("flux_limit", "secondary_flux_limit", "wave_range", "sensiti
 #: columns of a catalog when ``columns`` is not given
 DEFAULT_COLUMNS = ["ra", "dec", "redshift_true", "redshift_rsd", "redshift_assigned", "id_outcome"]
 #: columns computed in step 2 (the others are read from the base catalog)
-DERIVED_COLUMNS = ["redshift_assigned", "id_outcome", "line_bitmask", "n_det", "line_true", "line_assigned"]
+DERIVED_COLUMNS = ["redshift_assigned", "id_outcome", "line_bitmask", "n_det", "line_true", "line_assigned", "doublet_merged"]
 DEFAULT_OUTCOMES = ("MULTI_LINE", "SINGLE_CORRECT", "SINGLE_MISID")     # every galaxy with a redshift
 CHUNK_ROWS = 1_000_000  #: rows of a slice processed at a time by a worker (bounds its memory)
 RSD_MARGIN = 0.012      #: largest |z_rsd - z_true| / (1 + z) allowed for in the line report
@@ -86,7 +89,91 @@ DESCRIPTIONS = {
     "n_det": "Number of detected features = popcount(line_bitmask)",
     "line_true": "Index of the brightest detected feature",
     "line_assigned": "Feature index assigned by the redshift identification (-1 = failed)",
+    "doublet_merged": "The doublet of the doublet rule ([O III] 4959 + 5007) was one feature for this galaxy (unresolved)",
 }
+#: the identification outcomes as the reports name them
+OUTCOME_LABELS = {"NOT_DETECTED": "not detected", "MULTI_LINE": "multi-line", "SINGLE_CORRECT": "single line, correct redshift",
+                  "SINGLE_MISID": "single line taken for another: interloper", "SINGLE_FAILED": "single line, no redshift"}
+_Z_SHORT = {"redshift_assigned": "z_assigned", "redshift_rsd": "z_rsd", "redshift_true": "z_true"}
+
+
+#: the parts of a contaminated catalog by identification outcome (Catalog.subset); one kind of interloper is
+#: "<true line>_as_<assigned line>"
+COMPONENTS = {
+    "all": None,
+    "multi_line": (int(IdOutcome.MULTI_LINE),),
+    "single_correct": (int(IdOutcome.SINGLE_CORRECT),),
+    "galaxies": (int(IdOutcome.MULTI_LINE), int(IdOutcome.SINGLE_CORRECT)),
+    "interlopers": (int(IdOutcome.SINGLE_MISID),),
+}
+PAIR_SEP = "_as_"
+
+
+def parse_pair(which: str, line_names) -> tuple[int, int] | None:
+    """``(true, assigned)`` line indices of one kind of interloper, ``"<true>_as_<assigned>"``; ``None`` otherwise."""
+    if PAIR_SEP not in which:
+        return None
+    true, assigned = which.split(PAIR_SEP, 1)
+    names = list(line_names or [])
+    unknown = [x for x in (true, assigned) if x not in names]
+    if unknown:
+        raise ValueError(f"unknown lines {unknown} in {which!r}; the lines are {names}")
+    if true == assigned:
+        raise ValueError(f"{which!r}: a line taken for itself is not an interloper")
+    return names.index(true), names.index(assigned)
+
+
+def component_mask(catalog, which: str) -> np.ndarray:
+    """Rows of ``catalog`` in the part ``which``: one of :data:`COMPONENTS` or ``"<true>_as_<assigned>"``."""
+    pair = parse_pair(which, catalog.line_names)
+    if pair is not None:
+        missing = [c for c in ("id_outcome", "line_true", "line_assigned") if c not in catalog]
+        if missing:
+            raise KeyError(f"the catalog needs the columns {missing} to tell the interlopers {which!r} apart: make it with "
+                           "columns=[..., 'id_outcome', 'line_true', 'line_assigned']")
+        return ((np.asarray(catalog["id_outcome"]) == int(IdOutcome.SINGLE_MISID))
+                & (np.asarray(catalog["line_true"]) == pair[0]) & (np.asarray(catalog["line_assigned"]) == pair[1]))
+    if which not in COMPONENTS:
+        raise ValueError(f"which must be one of {list(COMPONENTS)} or '<true line>{PAIR_SEP}<assigned line>' (one kind of "
+                         f"interloper, e.g. 'OIII_5007_as_Ha'); got {which!r}")
+    if COMPONENTS[which] is None:
+        return np.ones(len(catalog), dtype=bool)
+    if "id_outcome" not in catalog:
+        raise KeyError(f"the catalog needs the column id_outcome to tell the {which} apart")
+    return np.isin(catalog["id_outcome"], COMPONENTS[which])
+
+
+def catalog_attributes(settings, info, line_names, columns, area_deg2, n_galaxies) -> dict:
+    """The file attributes of a catalog written to HDF5 (what :meth:`Catalog.read` needs)."""
+    meta = {"settings": settings, "info": info, "line_names": line_names, "columns": list(columns), "area_deg2": area_deg2,
+            "romanmock_version": __version__, "written": _dt.datetime.now().isoformat(timespec="seconds")}
+    return {"romanmock_catalog": json.dumps(meta, default=_json_default), "n_galaxies": int(n_galaxies)}
+
+
+def _describe_identification(cfg, max_entries: int = 6) -> str | None:
+    """The identification of a catalog's single-line galaxies, from its confusion config: the kind of model and, for a
+    confusion matrix, its entries that are not the identity (``OIII_5007 → Ha 0.05``)."""
+    if cfg is None:
+        return None
+    if not isinstance(cfg, Mapping):
+        return str(cfg)
+    kind = cfg.get("type")
+    if kind == "matrix":
+        entries = [f"{t} → {a} {p:g}" for t, row in (cfg.get("rows") or {}).items() for a, p in row.items() if a != t and p > 0]
+        if not entries:
+            return "every single line identified correctly"
+        more = f", … ({len(entries)} entries)" if len(entries) > max_entries else ""
+        return "confusion matrix: " + ", ".join(entries[:max_entries]) + more
+    if kind == "windowed":
+        pairs = cfg.get("pairs") or []
+        asked = (cfg.get("meta") or {}).get("fractions")
+        if asked:
+            p = {(r["line"], r["as"]): r["p"] for r in pairs}
+            entries = [f"{x} → {t} {100 * f:.3g} % (P {p.get((x, t), 0):.3g})" for t, row in asked.items() for x, f in row.items()]
+            return "by design, shares of the catalog: " + ", ".join(entries)
+        return "inside the windows of the range: " + (", ".join(f"{r['line']} → {r['as']} {r['p']:.3g}" for r in pairs) or "none")
+    return {"wavelength_binned": "confusion matrices per wavelength bin", "default": "the default confusion matrix",
+            "empirical": "the line mix of the mock (empirical)"}.get(kind, str(kind))
 
 
 # =====================================================================================
@@ -143,6 +230,8 @@ class Catalog:
         cuts = ", ".join(str(x) for x in [
             f"lines {s['lines']}" if s.get("lines") else None,
             f"{s.get('z_column', 'redshift_assigned')} in {tuple(s['z_range'])}" if s.get("z_range") else None,
+            f"lines rescaled ({s['rescaling']['type']})" if s.get("rescaling") else None,
+            f"doublet {s['doublets']['mode']}" if s.get("doublets") else None,
             f"downsampled to {s['downsample']}" if s.get("downsample") else None] if x)
         return f"<Catalog: {len(self):,} galaxies, {len(self.data)} columns {self.columns}; {lims}{'; ' + cuts if cuts else ''}>"
 
@@ -166,54 +255,111 @@ class Catalog:
         return counts / (np.diff(z_edges) * self.area_deg2)
 
     def summary(self) -> str:
-        lines = [repr(self)]
+        """The catalog as text: what it holds and how it was made (thresholds, line fluxes, identification, sky area,
+        the base galaxies detected), then its galaxies per identification outcome."""
+        from .report import count, fields, label, notes, percent, symbols, table, title, z_cut
+
+        s, info = self.settings, self.info
+        head = "every galaxy" if not s.get("lines") else " + ".join(label(x) for x in s["lines"])
+        if s.get("z_range"):
+            col = s.get("z_column", "redshift_assigned")
+            head += " · " + z_cut(*s["z_range"], column=_Z_SHORT.get(col, col))
+        r = s.get("random")
+        out = [title(f"Random catalog · {r.get('n_times', 1)} × {r.get('n_data', 0):,} points · {head}" if r
+                     else f"Catalog · {head}")]
+        if s.get("sensitivity"):
+            lims = symbols(describe_sensitivity(s["sensitivity"]))
+        elif "flux_limit" in s:
+            lims = f"F > {s['flux_limit']:.2e}" + (f" (other lines > {s['secondary_flux_limit']:.2e})"
+                                                   if s.get("secondary_flux_limit") else "")
+        else:
+            lims = None
+        det = s.get("detection") or {}
+        if lims and det.get("single_line"):
+            lims += "; one line per galaxy: no secondary limit"
+        if lims and det.get("primary_line"):
+            lims += f"; only galaxies with {label(det['primary_line'])} above the primary limit"
+        fluxes = None
+        if "rescaling" in s or "doublets" in s:
+            fluxes = (f"rescaled ({s['rescaling']['type']})" if s.get("rescaling") else "as stored") + (
+                f"; [O III] doublet {s['doublets']['mode']}" if s.get("doublets") else "")
+        how = {"user": "given", "footprint": "estimated from the sky patches of the mock", "healpix": "estimated from the galaxies"}
+        area = None if self.area_deg2 is None else (f"{self.area_deg2:.2f} deg²"
+                                                    + (f" ({how[info['area_source']]})" if info.get("area_source") in how else ""))
+        base = f"{info['n_detected']:,} of its {info['n_base']:,} galaxies detected" if {"n_detected", "n_base"} <= set(info) else None
+        sizes = None
+        if info.get("n_fallback_size"):
+            sizes = (f"{info['n_fallback_size']:,} base galaxies ({100 * info['n_fallback_size'] / max(info['n_base'], 1):.2f} %) "
+                     f"have no valid size and took the fallback of {info.get('size_fallback', float('nan')):g} arcsec")
+        out += fields([("thresholds", lims), ("line fluxes", fluxes), ("identification", _describe_identification(s.get("confusion"))),
+                       ("sky area", area), ("base catalog", base), ("sizes", sizes),
+                       ("cuts", ", ".join(f"{k} in {tuple(v)}" for k, v in (s.get("cuts") or {}).items()) or None),
+                       ("downsampled", str(s["downsample"]) if s.get("downsample") else None),
+                       ("columns", ", ".join(self.columns))])
         if "id_outcome" in self.data and len(self):
-            for name, n in self.outcomes().items():
-                if n:
-                    lines.append(f"  {name:<15s} {n:>12,}  ({100 * n / len(self):6.2f}%)")
-        for name, t in (self.info.get("downsample") or {}).items():
-            lines.append(f"  population {name}: {t['n_before']:,} -> {t['n_after']:,} emitters "
-                         f"(p_keep {min(t['p_keep']):.3f}-{max(t['p_keep']):.3f})")
-        return "\n".join(lines)
+            rows = [[OUTCOME_LABELS.get(name, name), count(n), percent(n / len(self))] for name, n in self.outcomes().items() if n]
+            out += [""] + table([("galaxies", "<"), ("number", ">"), ("share", ">")], rows + [["all", count(len(self)), "100.00 %"]])
+        else:
+            out += fields([("galaxies", count(len(self)))])
+        for name, t in (info.get("downsample") or {}).items():
+            out += notes(f"population {name}: {t['n_before']:,} → {t['n_after']:,} emitters "
+                         f"(p_keep {min(t['p_keep']):.3f}–{max(t['p_keep']):.3f})")
+        return "\n".join(out)
 
     def subset(self, which: str) -> "Catalog":
-        """``"galaxies"``: the galaxies with a correct redshift; ``"interlopers"``: the ones with a wrong
-        redshift (single-line, misidentified); ``"all"``: both. Needs the column ``id_outcome``."""
-        from .randoms import kind_mask
+        """One part of the catalog: ``"all"``; ``"multi_line"``; ``"single_correct"`` (single-line, correct redshift);
+        ``"galaxies"`` (the two, every galaxy with a correct redshift); ``"interlopers"`` (single-line, misidentified:
+        a wrong redshift); ``"<true>_as_<assigned>"``, one kind of interloper, e.g. ``"OIII_5007_as_Ha"``. Needs the
+        column ``id_outcome`` (and ``line_true``, ``line_assigned`` for one kind of interloper). :meth:`components`
+        lists them with their sizes; ``cat.subset(which).make_random(...)`` gives a part its randoms."""
+        return self[component_mask(self, which)]
 
-        return self[kind_mask(self, which)]
+    def components(self) -> dict[str, int]:
+        """``{which: size}`` of the parts of the catalog (see :meth:`subset`): ``all``, ``multi_line``,
+        ``single_correct``, ``galaxies``, ``interlopers`` and one ``"<true>_as_<assigned>"`` per kind of interloper
+        present (needs ``line_true`` and ``line_assigned``), most numerous first."""
+        if "id_outcome" not in self:
+            return {"all": len(self)}
+        out = {k: int(component_mask(self, k).sum()) for k in COMPONENTS}
+        if "line_true" in self and "line_assigned" in self:
+            wrong = np.asarray(self["id_outcome"]) == int(IdOutcome.SINGLE_MISID)
+            n = len(self.line_names)
+            pairs = np.bincount(np.asarray(self["line_true"])[wrong].astype(np.int64) * n
+                                + np.asarray(self["line_assigned"])[wrong].astype(np.int64), minlength=n * n)
+            for k in np.argsort(-pairs, kind="stable"):
+                if pairs[k]:
+                    out[f"{self.line_names[k // n]}{PAIR_SEP}{self.line_names[k % n]}"] = int(pairs[k])
+        return out
 
-    def make_random(self, which="all", n_times: int = 1, z_column: str | None = None, seed: int = 12345, write_to=None,
-                    first: int = 0, footprint=None, verbose: bool = True):
-        """Random catalogs for this catalog: uniform inside the footprint of the lightcone, redshifts
-        drawn from the data.
+    def make_random(self, n_times: int = 1, seed: int = 12345, z_column: str | None = None, write_to=None,
+                    footprint=None, verbose: bool = True):
+        """The random catalog of this catalog: ``n_times`` as many points as it has galaxies with a redshift, uniform
+        inside the footprint of the lightcone (and inside its cuts on ra and dec), with redshifts drawn, with
+        replacement, from its own. A part of a catalog is a catalog too and gets randoms of its own:
+        ``cat.subset("interlopers").make_random(10)``, ``cat.subset("OIII_5007_as_Ha").make_random(10)``,
+        ``cat[mask].make_random(10)`` (:mod:`romanmock.randoms`).
 
         Parameters
         ----------
-        which : "all", "galaxies", "interlopers", or a list of them
-            The data catalog the randoms belong to: the whole (contaminated) catalog, the
-            galaxies with a correct redshift, or the interlopers (see :meth:`subset`).
         n_times : int
-            Number of random catalogs, each of the size of its data catalog.
+            The random catalog holds ``n_times`` times as many points as the data, in blocks of the size of the data.
+        seed : int
+            The randoms depend on the seed and on the data only: the same data give the same randoms, more blocks
+            (a larger ``n_times``) add points and keep the first ones, and two different data catalogs (two parts of
+            one catalog) get independent randoms.
         z_column : str
             Redshift column; default: the one of the redshift cut (``redshift_assigned``).
-        seed : int
-            Random catalog ``k`` of a kind depends on ``(seed, kind, k)`` only.
         write_to : path
-            Write the randoms instead of returning them: ``name.hdf5`` gives ``name_00.hdf5``,
-            ``name_01.hdf5``, ... (``name_<kind>_00.hdf5`` for a list of kinds), a directory
-            gives ``random_00.hdf5``, ... Read one with :meth:`Catalog.read`.
-        first : int
-            Index of the first random catalog, to add more to existing ones.
+            Write the random catalog there and return the path: ``.hdf5`` (written block by block, so that the
+            randoms of a large catalog never sit in memory together), ``.npz`` or ``.fits``; a directory gets
+            ``random.hdf5``. Read it with :meth:`Catalog.read`.
         footprint : PatchFootprint
             Default: the footprint of the lightcone the catalog was made from.
 
         Returns
         -------
-        A list of ``n_times`` catalogs with the columns ra, dec and the redshift, or the list of
-        files when ``write_to`` is given. For a list of kinds: a dict of such lists.
-
-        A cut on ``ra`` or ``dec`` made with ``cuts=`` is applied to the randoms as well.
+        A :class:`Catalog` with the columns ra, dec and the redshift (``settings["random"]`` says how it was made), or
+        the path of the file.
         """
         from .randoms import make_random
 
@@ -221,7 +367,7 @@ class Catalog:
             if not self.settings.get("base"):
                 raise ValueError("the catalog does not know its base catalog: pass footprint=")
             footprint = BaseCatalog(self.settings["base"], self.settings.get("base_tag", "romanmock_base")).footprint
-        return make_random(self, footprint, which, n_times, z_column, seed, write_to, first, verbose)
+        return make_random(self, footprint, n_times, z_column, seed, write_to, verbose)
 
     def line_report(self) -> str:
         """The lines inside the bandpass for the redshift cut of the catalog, and the interlopers.
@@ -250,17 +396,15 @@ class Catalog:
         if path.exists() and not overwrite:
             raise FileExistsError(f"{path} exists")
         path.parent.mkdir(parents=True, exist_ok=True)
-        meta = {"settings": self.settings, "info": self.info, "line_names": self.line_names,
-                "columns": self.columns, "area_deg2": self.area_deg2, "romanmock_version": __version__,
-                "written": _dt.datetime.now().isoformat(timespec="seconds")}
-        blob = json.dumps(meta, default=_json_default)
+        attrs = catalog_attributes(self.settings, self.info, self.line_names, self.columns, self.area_deg2, len(self))
+        blob = attrs["romanmock_catalog"]
         suffix = path.suffix.lower()
         if suffix in (".hdf5", ".h5"):
             import h5py
 
             with h5py.File(path, "w") as f:
-                f.attrs["romanmock_catalog"] = blob
-                f.attrs["n_galaxies"] = len(self)
+                for key, value in attrs.items():
+                    f.attrs[key] = value
                 for name, arr in self.data.items():
                     d = f.create_dataset(name, data=arr)
                     d.attrs["description"] = DESCRIPTIONS.get(name, "")
@@ -501,6 +645,8 @@ class BaseCatalog:
         background: float | None = None,
         sensitivity=None,
         confusion=None,
+        rescaling=None,
+        doublets=None,
         z_range: tuple[float | None, float | None] | None = None,
         z_column: str = "redshift_assigned",
         lines: Sequence[str] | str | None = None,
@@ -556,6 +702,17 @@ class BaseCatalog:
             "galaxies_per_bin": 500, "min_count": 100, "mode": "draw"}``), a table made by
             :meth:`line_fractions` is used as it is, ``{"type": "empirical", "file": ...}``
             loads a saved one. A full config (``{"type": ...}``) or a model object also works.
+        rescaling : str, dict or model
+            Rescale the line fluxes of every galaxy before the detection: ``"galacticus_like"``
+            (:class:`~romanmock.rescaling.GalacticusLike`, the diffsky lines toward the Galacticus
+            mock), any config of :func:`~romanmock.rescaling.build_rescaling`, or a model. The flux
+            columns of the catalog are then the rescaled ones. Default: the stored fluxes.
+        doublets : str, dict or DoubletRule
+            When [O III] λ4959 is a line of its own (:class:`~romanmock.doublets.DoubletRule`):
+            ``"per_galaxy"`` (where the doublet is resolved for the galaxy's size, needs
+            ``r50_disk_2d`` in ``base.columns``; elsewhere λ4959 is added to λ5007), ``"merged"``
+            (added in every galaxy) or ``"separated"``. Default: separated, as without a rule.
+            ``doublet_merged`` (a column) says where it was added.
         z_range : (min, max)
             Keep galaxies with ``z_column`` inside the range (either end may be None).
         z_column : {"redshift_assigned", "redshift_rsd", "redshift_true"}
@@ -606,17 +763,16 @@ class BaseCatalog:
             n_workers = suggest_n_workers(max_workers=32, per_worker_gb=2.5)     # memory-limited: ~12 on a login node
         sens_kw = dict(flux_limit=flux_limit, secondary_flux_limit=secondary_flux_limit, wave_range=wave_range, sensitivity=sensitivity,
                        snr=snr, secondary_snr=secondary_snr, size=size, exposure_time=exposure_time, background=background)
-        confusion = self._resolve_confusion(confusion, sens_kw, detection, seed, n_workers, verbose)
+        confusion = self._resolve_confusion(confusion, sens_kw, detection, seed, n_workers, verbose, rescaling, doublets)
         spec = self._spec(sens_kw, confusion, z_range, z_column, lines, membership, outcomes, n_det_min,
-                          cuts, downsample, columns, detection, sigma_z, seed)
+                          cuts, downsample, columns, detection, sigma_z, seed, rescaling, doublets)
         populations = spec["populations"]
         if area_deg2 is not None:
             self.area_deg2 = area_deg2
         area = self.area_deg2
         tasks = [(spec, str(self.dir / v["output"]), step) for step, v in self.slices.items()]
-        if verbose:
-            print(f"[romanmock] {len(tasks)} slices of {self.dir.name}, {n_workers} worker(s)", flush=True)
-        results = _run(tasks, n_workers)
+        with Progress(f"catalog: scanning {len(tasks)} slices with {n_workers} worker(s)", verbose):
+            results = _run(tasks, n_workers)
 
         data = {c: np.concatenate([r["columns"][c] for r in results]) for c in spec["columns"]}
         info = {"n_base": int(sum(r["n_base"] for r in results)),
@@ -637,22 +793,17 @@ class BaseCatalog:
         info["line_report"] = line_report(self.line_set.names, self.line_set.rest_waves, spec["wave_range"], spec["z_range"],
                                           spec["z_column"], z_cover, spec["line_bits"], confusion_probabilities(spec["confusion"]),
                                           counts, spec["outcome_codes"], spec["membership"],
-                                          probability_kind="expected" if isinstance(spec["confusion"], LineFractionTable) else "matrix")
+                                          probability_kind=_probability_kind(spec["confusion"]))
         settings = {k: spec[k] for k in ("sensitivity", "flux_limit", "secondary_flux_limit", "wave_range", "z_range", "z_column", "lines",
                                          "membership", "outcomes", "n_det_min", "cuts", "sigma_z", "seed", "detection")}
-        settings.update(confusion=spec["confusion_config"], downsample=spec["downsample_label"], base=str(self.dir), base_tag=self.tag)
+        settings.update(confusion=spec["confusion_config"], downsample=spec["downsample_label"], base=str(self.dir), base_tag=self.tag,
+                        rescaling=spec["rescaling"], doublets=spec["doublets"])
         info["area_deg2"], info["area_source"] = area, self.area_source
+        if info["n_fallback_size"]:
+            info["size_fallback"] = float(spec["size"].fallback)
         cat = Catalog(data, settings, info, self.line_set.names, area)
         if verbose:
-            how = {"user": "given", "footprint": "estimated from the sky patches of the mock",
-                   "healpix": "estimated from the galaxies"}[self.area_source]
-            print(f"[romanmock] sky area {area:.2f} deg2 ({how})", flush=True)
-            print(f"[romanmock] {info['n_detected']:,} of {info['n_base']:,} base galaxies detected; "
-                  f"{info['n_galaxies']:,} in the catalog", flush=True)
-            if info["n_fallback_size"]:
-                print(f"[romanmock] {info['n_fallback_size']:,} base galaxies ({100 * info['n_fallback_size'] / max(info['n_base'], 1):.2f} %) "
-                      f"have no valid size and took the fallback of {spec['size'].fallback:g} arcsec", flush=True)
-            print(cat.line_report(), flush=True)
+            print("\n" + cat.summary() + "\n\n" + cat.line_report(), flush=True)
         if cat.nbytes > 0.5e9 * memory_budget_gb():
             warnings.warn(f"the catalog takes {cat.nbytes / 1e9:.1f} GB of memory", stacklevel=2)
         if write_to is not None:
@@ -704,8 +855,9 @@ class BaseCatalog:
                            f"{self.description['columns']}); add them to base.columns and rebuild it, or use size=<arcsec>")
         return sens
 
-    def _resolve_confusion(self, confusion, sens_kw, detection, seed, n_workers, verbose):
-        """Build the line-fraction table when ``confusion`` asks for the empirical model without one."""
+    def _resolve_confusion(self, confusion, sens_kw, detection, seed, n_workers, verbose, rescaling=None, doublets=None):
+        """Build the line-fraction table when ``confusion`` asks for the empirical model without one (with the same
+        thresholds, line rescaling and doublet rule as the catalog)."""
         if isinstance(confusion, str):
             confusion = {"type": confusion}
         if isinstance(confusion, Mapping) and confusion.get("type") == "empirical" and "file" not in confusion \
@@ -715,15 +867,71 @@ class BaseCatalog:
             if unknown:
                 raise KeyError(f"unknown options {unknown} for the empirical confusion model; known: {list(FRACTION_OPTIONS)}, "
                                "or file / table")
-            return self.line_fractions(**sens_kw, detection=detection, seed=seed, n_workers=n_workers, verbose=verbose, **options)
+            return self.line_fractions(**sens_kw, detection=detection, rescaling=rescaling, doublets=doublets, seed=seed,
+                                       n_workers=n_workers, verbose=verbose, **options)
         return confusion
 
+    def _flux_models(self, rescaling, doublets, sens) -> dict:
+        """The line rescaling and the doublet rule of a catalog, checked against the base catalog, as entries of the
+        worker spec: their configs (``None`` when not used), the extra columns they read and the cosmology of the
+        doublet sizes."""
+        model, rule = build_rescaling(rescaling), build_doublets(doublets)
+        stored = self.description["columns"]
+        columns = []
+        if model is not None:
+            if self.line_set.has_separated_components:
+                raise NotImplementedError("the rescaling acts on the feature flux columns; line sets with separated "
+                                          "multi-component features are not supported")
+            missing = [n for n in model.required_features(self.line_set) if n not in self.line_set.names] \
+                if model.galaxy_features(self.line_set) else []
+            if missing:
+                raise KeyError(f"the rescaling reads the fluxes of {missing}, which the base catalog does not have")
+            if model.has_scatter(self.line_set):
+                if "gal_id" not in stored:
+                    raise KeyError(f"the scatter of the rescaling is keyed on gal_id, which the base catalog does not store ({stored})")
+                columns.append("gal_id")
+        cosmology = None
+        if rule is not None:
+            rule.check(self.line_set)
+            missing = [c for c in rule.required_columns if c not in stored]
+            if missing:
+                raise KeyError(f"the doublet rule needs the columns {missing} (the size of each galaxy), which the base catalog "
+                               f"does not store ({stored}); add them to base.columns and rebuild it, or give doublets="
+                               "{'mode': 'per_galaxy', 'size': <arcsec>}")
+            columns += rule.required_columns
+            if rule.required_columns and rule.size.unit == "kpc":
+                cosmology = self.cosmology
+        self._check_rescaling_depth(model, rule, sens)
+        return {"rescaling": None if model is None else model.to_config(), "doublets": None if rule is None else rule.to_config(),
+                "model_columns": list(dict.fromkeys(columns)), "doublet_cosmology": cosmology}
+
+    def _check_rescaling_depth(self, model, rule, sens) -> None:
+        """Warn when the base catalog is not deep enough for the line rescaling and the doublet rule: they brighten a
+        line before the selection (the rescaling by up to a 5-sigma deviate, the merged doublet by 1 + 1 / ratio), and a
+        galaxy whose lines are all below the base limit before, and above the thresholds after, is not in the base."""
+        boost, what = 1.0, []
+        if model is not None:
+            boost *= 10.0 ** model.max_log_boost(self.line_set)
+            what.append("the rescaling (a 5-sigma deviate)")
+        if rule is not None and rule.mode != "separated":
+            boost *= 1.0 + 1.0 / rule.ratio
+            what.append(f"the merged {rule.strong} + {rule.weak} doublet")
+        if not what:
+            return
+        problem, min_ratio = limits_contained(sens, self.sensitivity)
+        if problem is None and min_ratio < boost:
+            warnings.warn(f"the base catalog is {min_ratio:.1f} times deeper than these thresholds, but {' with '.join(what)} "
+                          f"brightens a line by up to {boost:.1f} times: galaxies lifted above the thresholds from below the base "
+                          f"limit are missing. Thresholds at least {boost:.1f} times the base limit are complete; or rebuild the "
+                          "base catalog deeper.", RuntimeWarning, stacklevel=4)
+
     def _spec(self, sens_kw, confusion, z_range, z_column, lines, membership, outcomes, n_det_min, cuts, downsample,
-              columns, detection, sigma_z, seed) -> dict:
+              columns, detection, sigma_z, seed, rescaling=None, doublets=None) -> dict:
         names = self.line_set.names
         sens = self._sensitivity(**sens_kw, detection=detection)
         flux_limit, wave_range = nominal_flux_limit(sens), tuple(sens.wave_range)
         secondary = nominal_secondary_limit(sens)
+        models = self._flux_models(rescaling, doublets, sens)
 
         if confusion is None:
             model = default_confusion(self.line_set)
@@ -737,7 +945,7 @@ class BaseCatalog:
         if list(model.names) != names:
             raise ValueError(f"the confusion model is for the lines {list(model.names)}, not {names}")
         if isinstance(model, LineFractionTable):
-            _check_table(model, flux_limit, secondary, wave_range, sens.to_config())
+            _check_table(model, flux_limit, secondary, wave_range, sens.to_config(), models["rescaling"], models["doublets"])
         confusion_config = model.to_config() if hasattr(model, "to_config") else repr(model)
 
         if z_column not in REDSHIFT_COLUMNS:
@@ -773,7 +981,7 @@ class BaseCatalog:
         return {
             "line_set": self.line_set.to_config(), "flux_columns": self.flux_columns, "flux_suffix": self.flux_suffix,
             "sensitivity": sens.to_config(), "flux_limit": flux_limit, "secondary_flux_limit": secondary,
-            **self._size_spec(sens),
+            **self._size_spec(sens), **models,
             "wave_range": list(wave_range), "detection": dict(detection or {"type": "threshold"}),
             "confusion": model, "confusion_config": confusion_config, "sigma_z": float(sigma_z), "seed": int(seed),
             "z_range": None if z_range is None else list(z_range), "z_column": z_column,
@@ -851,6 +1059,8 @@ class BaseCatalog:
         background: float | None = None,
         sensitivity=None,
         detection: Mapping | None = None,
+        rescaling=None,
+        doublets=None,
         wave_bin: float = 250.0,
         wave_edges=None,
         galaxies_per_bin: int = 500,
@@ -881,7 +1091,8 @@ class BaseCatalog:
         are left out of the identification. Build the table at the thresholds of the catalog it
         is for (``flux_limit``, ``secondary_flux_limit`` and ``wave_range``, or the S/N route
         ``snr``, ``secondary_snr``, ``size``, ``exposure_time``, ``background``, or a
-        ``sensitivity`` model, as in :meth:`make_catalog`); ``make_catalog`` warns when they differ.
+        ``sensitivity`` model, as in :meth:`make_catalog`), and with its ``rescaling`` of the
+        line fluxes and ``doublets`` rule; ``make_catalog`` warns when they differ.
 
         ``mode`` is ``"draw"`` (a galaxy gets each line with the probability of its cell) or
         ``"max"`` (the most common line of its cell); ``p_fail`` a uniform probability of no
@@ -901,30 +1112,211 @@ class BaseCatalog:
         comp_cols = {c: f"{c}{self.flux_suffix}" for feat in self.line_set if not feat.is_blend for c in feat.components} \
             if self.line_set.has_separated_components else {}
         spec = {"line_set": self.line_set.to_config(), "flux_columns": self.flux_columns, "component_columns": comp_cols,
+                "flux_suffix": self.flux_suffix, "wave_range": list(wave_range),
                 "sensitivity": sens.to_config(), "detection": dict(detection or {"type": "threshold"}), "seed": int(seed),
-                **self._size_spec(sens)}
+                **self._size_spec(sens), **self._flux_models(rescaling, doublets, sens)}
         if n_workers is None:
             n_workers = suggest_n_workers(max_workers=32, per_worker_gb=2.5)
         tasks = [(spec, str(self.dir / v["output"]), step) for step, v in self.slices.items()]
-        if verbose:
-            print(f"[romanmock] line fractions: scanning {len(tasks)} slices of {self.dir.name} for single-line galaxies "
-                  f"({sens.describe()}), {n_workers} worker(s)", flush=True)
-        results = _run(tasks, n_workers, _single_lines_slice)
+        with Progress(f"line mix of the single-line galaxies: scanning {len(tasks)} slices with {n_workers} worker(s)", verbose):
+            results = _run(tasks, n_workers, _single_lines_slice)
         wave, flux, line = (np.concatenate([r[k] for r in results]) for k in ("wave", "flux", "line"))
         settings = {"base": str(self.dir), "base_tag": self.tag, "sensitivity": sens.to_config(), "flux_limit": flux_limit,
-                    "secondary_flux_limit": secondary,
+                    "secondary_flux_limit": secondary, "rescaling": spec["rescaling"], "doublets": spec["doublets"],
                     "wave_range": list(wave_range), "detection": spec["detection"], "wave_bin": float(np.median(np.diff(wave_edges))),
                     "n_base": int(sum(r["n"] for r in results)),
                     "built": _dt.datetime.now().isoformat(timespec="seconds")}
         table = LineFractionTable.from_single_lines(self.line_set, wave, flux, line, wave_edges, galaxies_per_bin, n_flux_bins,
                                                     flux_quantiles, min_count, mode, p_fail, settings)
         if verbose:
-            print(table.summary(), flush=True)
+            print("\n" + table.summary() + "\n", flush=True)
         if write_to is not None:
             path = table.save(write_to)
             if verbose:
-                print(f"[romanmock] line fractions written to {path}", flush=True)
+                print(f"[romanmock] wrote {path}", flush=True)
         return table
+
+    # ---- step 1 of a catalog with interlopers: the proposal ----------------------------
+    def make_proposal(
+        self,
+        z_range: tuple[float, float],
+        line: str = "Ha",
+        flux_limit: float | None = None,
+        secondary_flux_limit: float | None | str = "default",
+        snr: float | None = None,
+        secondary_snr: float | None | str = "default",
+        size=None,
+        exposure_time: float | None = None,
+        background: float | None = None,
+        sensitivity=None,
+        wave_range: tuple[float, float] | None = None,
+        rescaling="galacticus_like",
+        doublets="per_galaxy",
+        dz: float = 0.01,
+        min_count: int = 100,
+        min_share: float = 1e-3,
+        interloper_fraction: float | None = None,
+        secondary_ratios: Sequence[float] = (0.3, 0.4, 0.5),
+        detection: Mapping | None = None,
+        seed: int = 12345,
+        n_workers: int | None = None,
+        verbose: bool = True,
+    ):
+        """Step 1 of a catalog with interlopers: the single-line galaxies it would hold at proposed thresholds, before
+        their identification is chosen (:class:`~romanmock.proposal.Proposal`).
+
+        Without a secondary limit and without ``interloper_fraction`` it is a proposal for single-line clean catalogs
+        instead, without interlopers (see ``secondary_flux_limit`` below).
+
+        One pass over the base catalog (the slices that matter) counts, per bin of true redshift: the single-line
+        galaxies inside ``z_range`` and which line is single, and the potential interlopers, single-line galaxies at
+        other redshifts whose line falls where ``line`` would be for a redshift inside ``z_range``. The same pass scans
+        the secondary limit from the primary one down to a hundredth of it: the summary shows, for each potential
+        interloper and in total, the most they can make of the catalog against the secondary limit
+        (``proposal.plot_secondary()`` draws it), and where an expected ``interloper_fraction`` becomes possible.
+        Step 2 is ``proposal.make_catalog(fractions={line: {interloper: share}}, out_dir=...)`` (a catalog designed by
+        its interloper fractions, at a secondary limit of your choice) or ``proposal.make_catalog(confusion, out_dir)``.
+
+        Parameters
+        ----------
+        z_range : (min, max)
+            Redshift range of the catalog (on the assigned redshift).
+        line : str
+            Which galaxies the catalog holds. A line of ``base.line_set.names`` (``"Ha"``, the default, ``"OIII_5007"``,
+            ...): the galaxies in which that line is identified, their redshift from it (observed wavelength / rest
+            wavelength - 1) inside ``z_range``: the line detected, alone or with other lines (a galaxy with Hα and
+            [O III] belongs to the catalog of each), or a single line taken for it (the interlopers). ``"all"``: every
+            galaxy with a redshift inside ``z_range``, whichever line gave it; its sample is every detected galaxy
+            inside the range, and its potential interlopers are the single lines that, taken for a line that is single
+            in a major share of the galaxies inside the range (:attr:`Proposal.assignable`), get a redshift inside it.
+            ``verbose`` prints this as a hint.
+        flux_limit, secondary_flux_limit, snr, secondary_snr, size, exposure_time, background, sensitivity, wave_range
+            The proposed thresholds, as in :meth:`make_catalog`: flux limits, or S/N in the Roman grism, or a
+            sensitivity model. One of them must be given. Without a secondary limit (``secondary_flux_limit`` or
+            ``secondary_snr`` left out, or None) and with ``interloper_fraction``, the proposal is for catalogs by
+            design with a single tier of its own (the secondary limit at the primary one, the right end of the scan),
+            and step 2 chooses the secondary limit. Without a secondary limit and without ``interloper_fraction``, the
+            proposal is for a single-line clean catalog, without interlopers:
+            the galaxies with ``line`` above the primary limit (``line="all"``: every detected galaxy), each with its
+            true redshift. The summary gives, against redshift, the share of them that are true single-line galaxies,
+            without another line above each of the ``secondary_ratios``. ``proposal.make_catalog(out_dir=...)`` makes
+            the catalog with one line per galaxy, every one a single-line galaxy (the target line, even where
+            [O III] is brighter; ``line="all"``: the brightest); ``proposal.make_catalog(secondary_flux_limit=...,
+            out_dir=...)`` the same galaxies with their other lines above that limit, so that only those without
+            another line are single-line galaxies.
+        rescaling : str, dict, model or None
+            Rescaling of the line fluxes; default ``"galacticus_like"`` (the diffsky lines toward Galacticus).
+        doublets : str, dict, DoubletRule or None
+            [O III] λ4959 a line of its own or not; default ``"per_galaxy"`` (where the doublet is resolved for the
+            galaxy's size).
+        dz : float
+            Width of the redshift bins (``z_range`` is cut into equal bins of about ``dz``).
+        min_count, min_share : int, float
+            A line counts when it is the single line of at least ``min_count`` galaxies and ``min_share`` of the
+            detected galaxies inside the range (single lines inside it), respectively of the target sample
+            (potential interlopers); the others are minor and left out of the figures and of the confusion template.
+        interloper_fraction : float
+            The total interloper fraction expected in the catalog (a share of it, e.g. 0.01): the summary and
+            ``plot_secondary()`` say from which secondary limit the potential interlopers can make it, and
+            ``proposal.fraction_template()`` shares it among them. The secondary limit given here only fixes the
+            tables against redshift (and the default of step 2; without one, a single tier); the scan covers every
+            other.
+        secondary_ratios : list of float
+            Secondary limits, as fractions of the primary one, at which a single-line proposal (no secondary limit)
+            reports the true single-line fraction against redshift (0.3, 0.4 and 0.5 times the primary limit).
+        detection, seed, n_workers, verbose : as in :meth:`make_catalog`
+        """
+        from .proposal import (ALL_LINES, PROPOSAL_STREAM, SCAN, Proposal, add_counts, line_hint, new_settings, proposal_grid,
+                               scan_edges, secondary_ratio, target_window, target_windows, window_intervals)
+
+        names = self.line_set.names
+        if line != ALL_LINES and line not in names:
+            raise KeyError(f"unknown line {line!r}; the lines are {names}, or {ALL_LINES!r} for every galaxy")
+        if z_range is None or len(z_range) != 2 or None in tuple(z_range) or not float(z_range[0]) < float(z_range[1]):
+            raise ValueError("z_range is (min, max) with min < max")
+        z_range = (float(z_range[0]), float(z_range[1]))
+        if interloper_fraction is not None and not 0.0 < float(interloper_fraction) < 1.0:
+            raise ValueError(f"interloper_fraction is a share of the catalog, between 0 and 1; got {interloper_fraction}")
+        given = [flux_limit is not None, snr is not None, sensitivity is not None, size is not None,
+                 not (isinstance(secondary_flux_limit, str) and secondary_flux_limit == "default"),
+                 not (isinstance(secondary_snr, str) and secondary_snr == "default")]
+        if not any(given):
+            raise ValueError("propose the thresholds: flux_limit and secondary_flux_limit, or snr, secondary_snr and size "
+                             "(S/N in the Roman grism), or a sensitivity model")
+        ratios = [float(r) for r in secondary_ratios]
+        if not ratios or not all(0.0 < r <= 1.0 for r in ratios):
+            raise ValueError(f"secondary_ratios are secondary limits as fractions of the primary one, in (0, 1]; got {ratios}")
+        unset = lambda v: v is None or (isinstance(v, str) and v == "default")
+        no_secondary = sensitivity is None and unset(secondary_flux_limit) and unset(secondary_snr)
+        single_line = no_secondary and interloper_fraction is None
+        if no_secondary:                                 # a single tier: no secondary limit of its own
+            if any(v is not None for v in (snr, size, exposure_time, background)) or secondary_snr is None:
+                secondary_snr = None
+            else:
+                secondary_flux_limit = None
+        if single_line:                                  # single-line clean catalogs: one line per galaxy
+            detection = {**dict(detection or {"type": "threshold"}), "single_line": True if line == ALL_LINES else line}
+        sens = self._sensitivity(flux_limit, secondary_flux_limit, wave_range, sensitivity, snr, secondary_snr, size,
+                                 exposure_time, background, detection=detection)
+        models = self._flux_models(rescaling, doublets, sens)
+        wave_range = tuple(sens.wave_range)
+        rest = self.line_set.rest_waves
+        if line == ALL_LINES:
+            windows = target_windows(names, rest, z_range, wave_range)
+            if not windows:
+                raise ValueError(f"no line is inside the bandpass {list(wave_range)} at {list(z_range)}")
+        else:
+            windows = {line: target_window(rest, names.index(line), z_range, wave_range)}
+        z_hi = max(v["z_max"] for v in self.slices.values())
+        z_edges = proposal_grid(z_range, dz, z_hi + RSD_MARGIN * (1 + z_hi))
+        # the slices that can hold a galaxy of the range or a potential interloper (with peculiar velocities)
+        intervals = [z_range]
+        for window in windows.values():
+            intervals += [(max(a, wave_range[0] / r - 1), min(b, wave_range[1] / r - 1))
+                          for (a, b), r in zip(window_intervals(names, rest, window).values(), rest)]
+        intervals = [(a, b) for a, b in intervals if b > a]
+
+        def needed(v):
+            margin = RSD_MARGIN * (1 + v["z_max"])
+            return any(v["z_max"] + margin >= a and v["z_min"] - margin <= b for a, b in intervals)
+
+        comp_cols = {c: f"{c}{self.flux_suffix}" for feat in self.line_set if not feat.is_blend for c in feat.components} \
+            if self.line_set.has_separated_components else {}
+        spec = {"line_set": self.line_set.to_config(), "flux_columns": self.flux_columns, "component_columns": comp_cols,
+                "flux_suffix": self.flux_suffix, "wave_range": list(wave_range), "sensitivity": sens.to_config(),
+                "detection": dict(detection or {"type": "threshold"}), "seed": int(seed), **self._size_spec(sens), **models,
+                "targets": list(windows), "windows": [list(w) for w in windows.values()], "z_edges": z_edges,
+                "stream": PROPOSAL_STREAM, "z_range": list(z_range), "q_show": ratios}
+        scan = {**SCAN, "extra": [] if single_line else [secondary_ratio(sens.to_config())]}
+        spec["q_edges"] = scan_edges(**scan)
+        if n_workers is None:
+            n_workers = suggest_n_workers(max_workers=32, per_worker_gb=2.5)
+        tasks = [(spec, str(self.dir / v["output"]), step) for step, v in self.slices.items() if needed(v)]
+        if verbose:
+            print(line_hint(line, names, rest), flush=True)
+            if single_line:
+                print(f"{PREFIX} no secondary limit: a single-line clean catalog, no interlopers; the summary gives the true "
+                      f"single-line share at {', '.join(f'{r:g}' for r in ratios)} times the primary limit", flush=True)
+        with Progress(f"proposal: scanning {len(tasks)} of {len(self.slices)} slices with {n_workers} worker(s)", verbose):
+            results = _run(tasks, n_workers, _proposal_slice)
+        counts = None
+        for r in results:
+            if r["counts"] is not None:
+                counts = add_counts(counts, r["counts"])
+        if counts is None:
+            raise ValueError("no galaxy of the base catalog falls in the redshifts of this proposal")
+        settings = new_settings(line=line, z_range=list(z_range), targets=list(windows),
+                                windows=[list(w) for w in windows.values()], sensitivity=sens.to_config(),
+                                flux_limit=nominal_flux_limit(sens), secondary_flux_limit=nominal_secondary_limit(sens),
+                                wave_range=list(wave_range), rescaling=models["rescaling"], doublets=models["doublets"],
+                                detection=spec["detection"], seed=int(seed), dz=float(dz), min_count=int(min_count),
+                                min_share=float(min_share), base=str(self.dir), base_tag=self.tag,
+                                n_base=int(sum(r["n"] for r in results)), scan=scan, secondary_ratios=ratios,
+                                interloper_fraction=None if interloper_fraction is None else float(interloper_fraction))
+        proposal = Proposal(counts, z_edges, settings, names, rest, self.area_deg2, base=self)
+        if verbose:
+            print("\n" + proposal.summary(), flush=True)
+        return proposal
 
 
 def make_catalog(base_dir, **settings) -> Catalog:
@@ -932,13 +1324,23 @@ def make_catalog(base_dir, **settings) -> Catalog:
     return BaseCatalog(base_dir).make_catalog(**settings)
 
 
-def _check_table(table: LineFractionTable, flux_limit: float, secondary: float | None, wave_range, sensitivity: dict | None = None) -> None:
-    """Warn when a line-fraction table was built at other limits than the catalog uses: its flux-rank
-    bins then describe another population."""
+def make_proposal(base_dir, z_range, **settings):
+    """``BaseCatalog(base_dir).make_proposal(z_range, **settings)``: step 1 of a catalog with interlopers."""
+    return BaseCatalog(base_dir).make_proposal(z_range, **settings)
+
+
+def _check_table(table: LineFractionTable, flux_limit: float, secondary: float | None, wave_range, sensitivity: dict | None = None,
+                 rescaling: dict | None = None, doublets: dict | None = None) -> None:
+    """Warn when a line-fraction table was built at other limits, or with another line rescaling or doublet rule,
+    than the catalog uses: its flux-rank bins then describe another population."""
     s = table.settings
     if "flux_limit" not in s and "sensitivity" not in s:
         return
     mismatch = []
+    same = lambda a, b: json.dumps(a, sort_keys=True, default=_json_default) == json.dumps(b, sort_keys=True, default=_json_default)
+    for key, value in (("rescaling", rescaling), ("doublets", doublets)):
+        if not same(s.get(key), value):
+            mismatch.append(f"{key} {s.get(key)} (table) vs {value} (catalog)")
     if sensitivity is not None and s.get("sensitivity") is not None:
         same = json.dumps(s["sensitivity"], sort_keys=True, default=_json_default) == json.dumps(sensitivity, sort_keys=True, default=_json_default)
         if not same:
@@ -958,7 +1360,8 @@ def _check_table(table: LineFractionTable, flux_limit: float, secondary: float |
 
 
 def make_random(catalog, **settings):
-    """``catalog.make_random(**settings)``; ``catalog`` is a :class:`Catalog` or a file written by one."""
+    """``catalog.make_random(**settings)``: the random catalog of a data catalog, a :class:`Catalog` (a whole catalog or
+    a part of one) or a file written by one."""
     if not isinstance(catalog, Catalog):
         catalog = Catalog.read(catalog)
     return catalog.make_random(**settings)
@@ -980,9 +1383,11 @@ def _catalog_slice(spec: dict, path: str, step: int) -> dict:
     flux_columns = spec["flux_columns"]
     comp_cols = {c: f"{c}{spec['flux_suffix']}" for feat in line_set if not feat.is_blend for c in feat.components} \
         if line_set.has_separated_components else {}
+    rescaling, doublets = build_rescaling(spec.get("rescaling")), build_doublets(spec.get("doublets"))
     derived = set(DERIVED_COLUMNS)
     wanted = [c for c in dict.fromkeys([*spec["columns"], *spec["cuts"], spec["z_column"]]) if c not in derived]
-    read = list(dict.fromkeys([*flux_columns, *comp_cols.values(), "redshift_rsd", *spec["size_columns"], *wanted]))
+    read = list(dict.fromkeys([*flux_columns, *comp_cols.values(), "redshift_rsd", *spec["size_columns"],
+                               *spec.get("model_columns", []), *wanted]))
     rng = np.random.default_rng([spec["seed"], int(step)])              # the pipeline's stream for this slice
     rng_thin = np.random.default_rng([spec["seed"], THINNING_STREAM, int(step)])   # the stream `romanmock select` uses
     model = build_detection(spec["detection"], build_sensitivity(spec["sensitivity"]))
@@ -997,14 +1402,14 @@ def _catalog_slice(spec: dict, path: str, step: int) -> dict:
         for start in range(0, n, CHUNK_ROWS):
             stop = min(start + CHUNK_ROWS, n)
             data = {c: group[c][start:stop] for c in read}
-            z_rsd = np.asarray(data["redshift_rsd"], dtype=np.float64)
-            flux = np.stack([np.asarray(data[c], dtype=np.float64) for c in flux_columns], axis=1)
+            data, z_rsd, flux, merged = _chunk_fluxes(spec, line_set, data, rescaling, doublets)
             comp = {lum: np.asarray(data[name], dtype=np.float64) for lum, name in comp_cols.items()} or None
             det = detect_lines(flux, z_rsd, line_set, model, rng, component_flux=comp, size=_sizes(spec, data))
             za = assign_redshifts(det, z_rsd, line_set, spec["confusion"], rng, multi_line)
             cols = dict(data)
             cols.update(redshift_assigned=za.z_assigned, id_outcome=za.outcome, line_bitmask=det.bitmask, n_det=det.n_det,
-                        line_true=za.line_true, line_assigned=za.line_assigned)
+                        line_true=za.line_true, line_assigned=za.line_assigned,
+                        doublet_merged=np.zeros(stop - start, dtype=bool) if merged is None else merged)
             detected = det.bitmask > 0
             part = {"n": stop - start, "n_detected": int(detected.sum()), "n_fallback_size": _n_fallback_size(spec, data)}
             if pops:
@@ -1061,6 +1466,20 @@ def _catalog_slice(spec: dict, path: str, step: int) -> dict:
     return out
 
 
+def _chunk_fluxes(spec: dict, line_set, data: dict, rescaling, doublets):
+    """The line fluxes of a chunk as the detection sees them: the rescaling applied to the flux columns of ``data``
+    (the returned ``data`` carries the rescaled fluxes), the feature fluxes stacked, the doublet rule applied.
+    Returns ``(data, z_rsd, flux, merged)``; ``merged`` is ``None`` without a doublet rule."""
+    if rescaling is not None:
+        data = rescaling.apply_columns(data, line_set, suffix=spec["flux_suffix"])
+    z_rsd = np.asarray(data["redshift_rsd"], dtype=np.float64)
+    flux = np.stack([np.asarray(data[c], dtype=np.float64) for c in spec["flux_columns"]], axis=1)
+    merged = None
+    if doublets is not None:
+        flux, merged = doublets.apply(flux, z_rsd, line_set, spec["wave_range"], data, spec.get("doublet_cosmology"))
+    return data, z_rsd, flux, merged
+
+
 def _sizes(spec: dict, data: Mapping[str, np.ndarray]):
     """Angular sizes [arcsec] of the galaxies of a chunk for a size-dependent sensitivity, else ``None``."""
     if spec.get("size") is None:
@@ -1097,7 +1516,9 @@ def _single_lines_slice(spec: dict, path: str, step: int) -> dict:
 
     line_set = get_line_set(spec["line_set"])
     flux_columns, comp_cols = spec["flux_columns"], spec["component_columns"]
-    read = list(dict.fromkeys([*flux_columns, *comp_cols.values(), "redshift_rsd", *spec["size_columns"]]))
+    rescaling, doublets = build_rescaling(spec.get("rescaling")), build_doublets(spec.get("doublets"))
+    read = list(dict.fromkeys([*flux_columns, *comp_cols.values(), "redshift_rsd", *spec["size_columns"],
+                               *spec.get("model_columns", [])]))
     rng = np.random.default_rng([spec["seed"], FRACTION_STREAM, int(step)])
     model = build_detection(spec["detection"], build_sensitivity(spec["sensitivity"]))
     waves, fluxes, lines, n = [], [], [], 0
@@ -1107,14 +1528,50 @@ def _single_lines_slice(spec: dict, path: str, step: int) -> dict:
         for start in range(0, n, CHUNK_ROWS):
             stop = min(start + CHUNK_ROWS, n)
             data = {c: group[c][start:stop] for c in read}
-            z_rsd = np.asarray(data["redshift_rsd"], dtype=np.float64)
-            flux = np.stack([np.asarray(data[c], dtype=np.float64) for c in flux_columns], axis=1)
+            data, z_rsd, flux, _ = _chunk_fluxes(spec, line_set, data, rescaling, doublets)
             comp = {lum: np.asarray(data[name], dtype=np.float64) for lum, name in comp_cols.items()} or None
             det = detect_lines(flux, z_rsd, line_set, model, rng, component_flux=comp, size=_sizes(spec, data))
             w, f, i = single_lines(det)
             waves.append(w); fluxes.append(f); lines.append(i.astype(np.int8))
     cat = lambda parts, dtype: np.concatenate(parts) if parts else np.zeros(0, dtype=dtype)
     return {"step": int(step), "n": int(n), "wave": cat(waves, np.float64), "flux": cat(fluxes, np.float64), "line": cat(lines, np.int8)}
+
+
+def _proposal_slice(spec: dict, path: str, step: int) -> dict:
+    """Worker of :meth:`BaseCatalog.make_proposal`: the counts of :func:`~romanmock.proposal.proposal_counts` for one
+    slice, detected as :func:`_catalog_slice` does it."""
+    import h5py
+
+    from .proposal import add_counts, primary_snr, proposal_counts
+
+    line_set = get_line_set(spec["line_set"])
+    flux_columns, comp_cols = spec["flux_columns"], spec["component_columns"]
+    rescaling, doublets = build_rescaling(spec.get("rescaling")), build_doublets(spec.get("doublets"))
+    read = list(dict.fromkeys([*flux_columns, *comp_cols.values(), "redshift_rsd", *spec["size_columns"],
+                               *spec.get("model_columns", [])]))
+    rng = np.random.default_rng([spec["seed"], spec["stream"], int(step)])
+    model = build_detection(spec["detection"], build_sensitivity(spec["sensitivity"]))
+    lo, hi = spec["wave_range"]
+    counts, n = None, 0
+    with h5py.File(path, "r") as h:
+        group = base_data_group(h)
+        n = group["redshift_rsd"].shape[0]
+        for start in range(0, n, CHUNK_ROWS):
+            stop = min(start + CHUNK_ROWS, n)
+            data = {c: group[c][start:stop] for c in read}
+            data, z_rsd, flux, merged = _chunk_fluxes(spec, line_set, data, rescaling, doublets)
+            comp = {lum: np.asarray(data[name], dtype=np.float64) for lum, name in comp_cols.items()} or None
+            det = detect_lines(flux, z_rsd, line_set, model, rng, component_flux=comp, size=_sizes(spec, data))
+            both = None
+            if merged is not None:
+                s, w = doublets.check(line_set)
+                both = np.all([(line_set.rest_waves[k] * (1 + z_rsd) > lo) & (line_set.rest_waves[k] * (1 + z_rsd) < hi)
+                               for k in (s, w)], axis=0)
+            part = proposal_counts(det, z_rsd, line_set, spec["targets"], spec["windows"], spec["z_edges"], merged, both,
+                                   primary_snr=None if spec.get("q_edges") is None else primary_snr(model),
+                                   q_edges=spec.get("q_edges"), z_range=spec.get("z_range"), q_show=spec.get("q_show"))
+            counts = add_counts(counts, part)
+    return {"step": int(step), "n": int(n), "counts": counts}
 
 
 def _run(tasks, n_workers: int, worker=_catalog_slice) -> list[dict]:
@@ -1187,15 +1644,26 @@ def line_counts(line_true, line_assigned, outcome, bitmask, n_lines: int) -> dic
 def confusion_probabilities(model) -> np.ndarray | None:
     """``P[i, j]`` = probability that a single line ``i`` is taken for ``j`` (the largest one over the
     wavelength bins of a binned model; for a :class:`LineFractionTable` the expectation over the
-    single-line galaxies of line ``i``); ``None`` for a model that is none of these."""
+    single-line galaxies of line ``i``; for a :class:`WindowedConfusion` the probability inside the window of the
+    pair); ``None`` for a model that is none of these."""
     if isinstance(model, ConfusionMatrix):
         return model.matrix[:, :-1].copy()
+    if hasattr(model, "pair_probabilities"):
+        return model.pair_probabilities()
     if hasattr(model, "expected_confusion"):
         return model.expected_confusion().matrix[:, :-1].copy()
     matrices = getattr(model, "matrices", None)
     if matrices and all(isinstance(m, ConfusionMatrix) for m in matrices):
         return np.max([m.matrix[:, :-1] for m in matrices], axis=0)
     return None
+
+
+def _probability_kind(model) -> str:
+    """What the probabilities of the line report are: a matrix entry, the expectation of a line-fraction table, or the
+    probability inside the window of a pair."""
+    if isinstance(model, LineFractionTable):
+        return "expected"
+    return "windowed" if isinstance(model, WindowedConfusion) else "matrix"
 
 
 def line_report(names, rest_waves, wave_range, z_range, z_column, z_cover, assigned_bits=None, probabilities=None,
@@ -1258,72 +1726,85 @@ def line_report(names, rest_waves, wave_range, z_range, z_column, z_cover, assig
 
 
 def format_line_report(report: dict | None) -> str:
-    """The text of :func:`line_report`."""
+    """The text of :func:`line_report`: a table of the lines inside the bandpass for the redshift cut, then a table of
+    the interlopers, each with notes on its columns."""
+    from .report import count, fields, keep, notes, section, span, table, z_cut
+
     if not report:
         return "no line report (the catalog was not made by make_catalog)"
     lo, hi = (None, None) if report["z_range"] is None else report["z_range"]
-    cut = f"{report['z_column']} " + ("unrestricted" if lo is None and hi is None else
-                                      f">= {lo:g}" if hi is None else f"<= {hi:g}" if lo is None else f"in {lo:g} - {hi:g}")
-    band = f"{report['wave_range'][0]:.0f} - {report['wave_range'][1]:.0f} A"
+    cut = z_cut(lo, hi, _Z_SHORT.get(report["z_column"], report["z_column"]))
+    band = f"{report['wave_range'][0]:.0f}–{report['wave_range'][1]:.0f} Å"
     counted = bool(report["lines"]) and "n_identified" in report["lines"][0]
+    waves = lambda w: f"{w[0]:.0f}–{w[1]:.0f}"
 
-    def span(v, fmt):
-        return f"{v[0]:{fmt}} - {v[1]:{fmt}}"
-
-    out = [f"[romanmock] lines inside {band} for {cut} (lightcone: z_rsd {span(report['z_cover'], '.2f')})"]
-    out.append(f"  {'line':<11s}{'rest [A]':>9s}  {'redshift':^13s}  {'observed [A]':^15s}"
-               + (f"{'detected':>13s}{'identified':>13s}{'brightest':>13s}{'mistaken':>12s}{'interlopers':>13s}" if counted else ""))
-    for r in report["lines"]:
-        out.append(f"  {r['line']:<11s}{r['rest_wave']:>9.1f}  {span(r['z'], '.3f'):^13s}  {span(r['wave_obs'], '.0f'):^15s}"
-                   + (f"{r['n_detected']:>13,}{r['n_identified']:>13,}{r['n_brightest']:>13,}{r['n_mistaken']:>12,}"
-                      f"{r['n_interlopers']:>13,}" if counted else "")
-                   + ("" if r["selected"] else "   not in `lines`"))
-    if not report["lines"]:
-        out.append("  none")
-    elif counted:
-        out += ["  galaxies of the catalog, a galaxy with several lines counted in each of them:",
-                "    detected     the line is detected",
-                "    identified   ... and identified as this line: the redshift of the galaxy is right (every detected line",
-                "                 of a multi-line galaxy, the line of a correctly identified single-line galaxy)",
-                "    brightest    ... and it is the brightest detected line of the galaxy (`line_assigned`)",
-                "    mistaken     the line is the only one detected and was taken for another line",
-                "    interlopers  galaxies in which another line was taken for this line"]
+    out = [section(f"Lines in the bandpass, {band}, for {cut}")]
+    if report["lines"]:
+        cols = [("line", "<"), ("redshift", "<"), ("λ_obs [Å]", "<")]
+        if counted:
+            cols += [("detected", ">"), ("identified", ">"), ("brightest", ">"), ("mistaken", ">"), ("interlopers", ">")]
+        rows = []
+        for r in report["lines"]:
+            row = [r["line"] + ("" if r["selected"] else " ○"), span(*r["z"]), waves(r["wave_obs"])]
+            if counted:
+                row += [count(r[k]) for k in ("n_detected", "n_identified", "n_brightest", "n_mistaken", "n_interlopers")]
+            rows.append(row)
+        out += table(cols, rows)
+        if counted:
+            out += notes("galaxies of the catalog, a galaxy with several lines counted under each of them:")
+            out += fields([("detected", "the line is detected"),
+                           ("identified", "… and gives the right redshift (every detected line of a multi-line galaxy)"),
+                           ("brightest", "… and is the brightest detected line (line_assigned)"),
+                           ("mistaken", "the only line, taken for another"),
+                           ("interlopers", "another line taken for this one")], indent=4)
+        if not all(r["selected"] for r in report["lines"]):
+            out += notes("○ not in `lines`: inside the bandpass, but its galaxies are not in the catalog")
+        out += notes(f"redshift of the lightcone: {span(*report['z_cover'], 2)} (z_rsd)")
+    else:
+        out += notes("none")
 
     rows = report["interlopers"]
     likely = [r for r in rows if r["probability"] is None or r["probability"] > 0 or r.get("n", 0) > 0]
-    out.append("[romanmock] line interlopers: single-line galaxies given a wrong line and so a wrong redshift")
+    out += ["", section("Interlopers: single lines given a wrong line, and so a wrong redshift")]
     if likely:
-        out.append(f"  {'true line':<11s}{'taken for':<11s}{'true z_rsd':^13s}  {'assigned z':^13s}  {'observed [A]':^15s}{'P':>7s}"
-                   + (f"{'in catalog':>13s}{'contamination':>15s}" if counted else ""))
-    for r in likely:
-        p = "model" if r["probability"] is None else f"{r['probability']:.3f}"
-        text = (f"  {r['line_true']:<11s}{r['line_assigned']:<11s}{span(r['z_true'], '.3f'):^13s}  "
-                f"{span(r['z_assigned'], '.3f'):^13s}  {span(r['wave_obs'], '.0f'):^15s}{p:>7s}")
+        cols = [("true line", "<"), ("taken for", "<"), ("true z", "<"), ("assigned z", "<"), ("λ_obs [Å]", "<"), ("P¹", ">")]
         if counted:
-            share = f"{100 * r['n'] / r['n_line']:.2f}%" if r["n_line"] else "-"
-            text += f"{r['n']:>13,}{share:>15s}"
-        out.append(text)
-    if likely and report.get("probability_kind") == "expected":
-        out.append("  (P: expected over the single-line galaxies of the true line, from the line mix of the mock at their "
-                   "observed wavelength and flux rank)")
+            cols += [("in catalog", ">"), ("share²", ">")]
+        body = []
+        for r in likely:
+            row = [r["line_true"], r["line_assigned"], span(*r["z_true"]), span(*r["z_assigned"]), waves(r["wave_obs"]),
+                   "model" if r["probability"] is None else f"{r['probability']:.3f}"]
+            if counted:
+                row += [count(r["n"]), f"{100 * r['n'] / r['n_line']:.2f} %" if r["n_line"] else "–"]
+            body.append(row)
+        out += table(cols, body)
+        if report.get("probability_kind") == "expected":
+            out += notes("expected over the single-line galaxies of the true line, from the line mix of the mock at their "
+                         "observed wavelength and flux rank", mark="¹ ")
+        elif report.get("probability_kind") == "windowed":
+            out += notes("the probability that a single line of the true line is taken for the other where that puts it "
+                         "inside the range (elsewhere it keeps its line)", mark="¹ ")
+        else:
+            out += notes("the probability that a single line of the true line is taken for the other", mark="¹ ")
+        if counted:
+            own = "identified" if report.get("membership", "detected") == "detected" else "brightest"
+            out += notes(f"of the sample of the line it is taken for: its {own} galaxies plus its interlopers", mark="² ")
     if counted:
         total = sum(r["n"] for r in rows)
-        own = "identified" if report.get("membership", "detected") == "detected" else "brightest"
-        out.append(f"  (contamination: this interloper as a share of the sample of the line of `taken for`, which is its "
-                   f"`{own}` galaxies plus its interlopers)")
-        out.append(f"  actual interlopers in the catalog: {total:,}"
-                   + ("" if report["misidentified_kept"] else " (`outcomes` excludes the misidentified galaxies)"))
+        out += notes(f"{total:,} interlopers in the catalog"
+                     + ("" if report["misidentified_kept"] else " (`outcomes` excludes the misidentified galaxies)"))
     idle = {}
     targets = {r["line_assigned"] for r in likely} | ({r["line"] for r in report["lines"] if r["selected"]}
                                                       if not all(r["selected"] for r in report["lines"]) else set())
     for r in rows:
         if r not in likely and r["line_assigned"] in targets:       # lines nothing is taken for are left out
-            idle.setdefault(r["line_assigned"], []).append(f"{r['line_true']} (z {span(r['z_true'], '.2f')})")
+            idle.setdefault(r["line_assigned"], []).append(keep(f"{r['line_true']} ({span(*r['z_true'], 2)})"))
     if idle:
-        out.append("  possible by wavelength, but with probability 0 in the confusion model:")
-        out += [f"    taken for {name}: " + ", ".join(v) for name, v in idle.items()]
+        out += notes("possible by wavelength, but with P = 0 (true redshifts in brackets):")
+        for name, v in idle.items():
+            out += notes(f"taken for {name}: " + ", ".join(v), indent=4)
     if not rows:
-        out.append("  none possible: no other line falls at these wavelengths")
+        out += notes("none possible: no other line falls at these wavelengths")
     return "\n".join(out)
 
 

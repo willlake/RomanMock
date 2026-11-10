@@ -583,11 +583,20 @@ class ThresholdDetection:
     ``snr`` is the nominal ``snr_at_limit * F / F_lim`` (primary limit); ``snr_at_limit``
     defaults to the value of the sensitivity model (the ``snr`` of
     :class:`RomanGrismSensitivity`, where it makes ``snr`` the estimated S/N of the line)
-    or 6.5."""
+    or 6.5. ``single_line`` (no secondary limit: every detected galaxy a single-line galaxy):
+    ``True`` keeps one line per galaxy, the brightest above the primary limit; a line name keeps
+    that line wherever it is above the primary limit, else the brightest. ``primary_line`` (a line
+    name): only the galaxies with that line above the primary limit are detected (with their other
+    lines above the secondary limit), the sample of a single-line clean catalog given a secondary
+    limit. ``detect_lines``, which knows the line names, applies both
+    (:func:`romanmock.detection.one_line_per_galaxy`)."""
 
-    def __init__(self, sensitivity: SensitivityModel | None = None, snr_at_limit: float | None = None):
+    def __init__(self, sensitivity: SensitivityModel | None = None, snr_at_limit: float | None = None,
+                 single_line: bool | str = False, primary_line: str | None = None):
         self.sensitivity = sensitivity if sensitivity is not None else ConstantFluxLimit()
         self.snr_at_limit = _snr_at_limit(self.sensitivity, snr_at_limit)
+        self.single_line = single_line if isinstance(single_line, str) else bool(single_line)
+        self.primary_line = primary_line or None
 
     def detect(self, flux, wave_obs, rng=None, size=None) -> Detection:
         flux = np.asarray(flux, dtype=np.float64)
@@ -599,7 +608,12 @@ class ThresholdDetection:
         return Detection(detected=detected, flux_measured=flux, snr=snr, primary=primary)
 
     def to_config(self) -> dict:
-        return {"type": "threshold", "snr_at_limit": self.snr_at_limit}
+        cfg = {"type": "threshold", "snr_at_limit": self.snr_at_limit}
+        if self.single_line:
+            cfg["single_line"] = self.single_line
+        if self.primary_line:
+            cfg["primary_line"] = self.primary_line
+        return cfg
 
 
 class GaussianNoiseDetection:
@@ -611,7 +625,8 @@ class GaussianNoiseDetection:
     two-tier sensitivity the other lines of a galaxy with a primary detection need
     ``S/N > snr_threshold * F_lim,secondary / F_lim``; pure noise can then pass the
     lower cut, as it would in real spectra. With :class:`RomanGrismSensitivity`
-    ``sigma`` is the 1-sigma noise of the line (``F_5sigma / 5``).
+    ``sigma`` is the 1-sigma noise of the line (``F_5sigma / 5``). ``single_line`` and
+    ``primary_line`` as for :class:`ThresholdDetection`.
     """
 
     def __init__(
@@ -619,10 +634,14 @@ class GaussianNoiseDetection:
         sensitivity: SensitivityModel | None = None,
         snr_at_limit: float | None = None,
         snr_threshold: float | None = None,
+        single_line: bool | str = False,
+        primary_line: str | None = None,
     ):
         self.sensitivity = sensitivity if sensitivity is not None else ConstantFluxLimit()
         self.snr_at_limit = _snr_at_limit(self.sensitivity, snr_at_limit)
         self.snr_threshold = self.snr_at_limit if snr_threshold is None else float(snr_threshold)
+        self.single_line = single_line if isinstance(single_line, str) else bool(single_line)
+        self.primary_line = primary_line or None
 
     def detect(self, flux, wave_obs, rng: np.random.Generator, size=None) -> Detection:
         flux = np.asarray(flux, dtype=np.float64)
@@ -640,7 +659,12 @@ class GaussianNoiseDetection:
         return Detection(detected=detected, flux_measured=flux_meas, snr=snr, primary=primary)
 
     def to_config(self) -> dict:
-        return {"type": "gaussian_noise", "snr_at_limit": self.snr_at_limit, "snr_threshold": self.snr_threshold}
+        cfg = {"type": "gaussian_noise", "snr_at_limit": self.snr_at_limit, "snr_threshold": self.snr_threshold}
+        if self.single_line:
+            cfg["single_line"] = self.single_line
+        if self.primary_line:
+            cfg["primary_line"] = self.primary_line
+        return cfg
 
 
 DETECTION_MODELS = {"threshold": ThresholdDetection, "gaussian_noise": GaussianNoiseDetection}

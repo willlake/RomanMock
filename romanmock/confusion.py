@@ -9,6 +9,8 @@ S/N, flux, plus any passthrough columns the pipeline is told to forward) so that
 refinements ``C_ij(lambda_obs, S/N, photometry)`` can be added without touching the
 rest of the pipeline. :class:`ConfusionMatrix` ignores the context;
 :class:`WavelengthBinnedConfusion` selects a matrix by observed wavelength;
+:class:`WindowedConfusion` takes a line for another only inside a window of observed
+wavelength (the identification of a catalog designed by its interloper fractions);
 :class:`LineFractionTable` (``type: empirical``) ignores the true line altogether and
 draws the identity from the line mix of the mock's single-line galaxies at the same
 observed wavelength and flux rank.
@@ -201,6 +203,96 @@ class WavelengthBinnedConfusion:
                 "matrices": [m.to_dict() for m in self.matrices]}
 
 
+class WindowedConfusion:
+    """Single lines taken for another line only inside a window of observed wavelength (``type: windowed``).
+
+    ``pairs`` lists ``(true line, assigned line, (min, max) observed wavelength [Å], p)``, or dicts with the keys
+    ``line``, ``as``, ``window``, ``p``: a single line of the true line observed inside the window (ends included) is
+    taken for the assigned line with probability ``p``. Everywhere else, and for the lines not listed, the
+    identification is correct. A single line inside the windows of several pairs is taken for one of them with their
+    probabilities, which must not add up to more than one there. One uniform deviate per single-line galaxy, as
+    :class:`ConfusionMatrix` draws them.
+
+    It is the identification of a catalog designed by its interloper fractions
+    (:meth:`romanmock.proposal.Proposal.design`): the window of a pair is where the true line, taken for the other,
+    gets a redshift inside the range of the catalog, and ``p`` is what makes the interlopers of the pair the share
+    of the catalog asked for. ``meta`` (the fractions asked for, the secondary limit) is kept in the config only.
+    """
+
+    def __init__(self, names: Sequence[str] | LineSet, pairs, meta: Mapping | None = None):
+        self.names = names.names if isinstance(names, LineSet) else list(names)
+        idx = {n: i for i, n in enumerate(self.names)}
+        rows = []
+        for pair in pairs:
+            if isinstance(pair, Mapping):
+                true, assigned, window, p = pair["line"], pair["as"], pair["window"], pair["p"]
+            else:
+                true, assigned, window, p = pair
+            for name in (true, assigned):
+                if name not in idx:
+                    raise KeyError(f"unknown line {name!r} in a windowed confusion pair; the lines are {self.names}")
+            if true == assigned:
+                raise ValueError(f"a pair takes a line for another one, not for itself ({true!r})")
+            w0, w1, p = float(window[0]), float(window[1]), float(p)
+            if not w1 > w0:
+                raise ValueError(f"the window of {true} -> {assigned} must be (min, max) with min < max; got {list(window)}")
+            if not 0.0 <= p <= 1.0:
+                raise ValueError(f"the probability of {true} -> {assigned} must be in [0, 1]; got {p}")
+            rows.append((true, assigned, w0, w1, p))
+        self.pairs = rows
+        self.meta = dict(meta or {})
+        for true in dict.fromkeys(r[0] for r in rows):         # overlapping windows of one line: at most one in all
+            own = [r for r in rows if r[0] == true]
+            cuts = sorted({w for r in own for w in r[2:4]})
+            for w in cuts + [0.5 * (a + b) for a, b in zip(cuts[:-1], cuts[1:])]:
+                total = sum(r[4] for r in own if r[2] <= w <= r[3])
+                if total > 1.0 + 1e-9:
+                    raise ValueError(f"a single {true} line at {w:.0f} Å would be taken for another line with probability "
+                                     f"{total:.3g} > 1 (overlapping windows)")
+
+    @classmethod
+    def from_config(cls, line_set, pairs, meta=None, names=None) -> "WindowedConfusion":
+        line_set = get_line_set(line_set)
+        if names is not None and list(names) != line_set.names:
+            raise ValueError(f"the windowed confusion is for the lines {list(names)}, not {line_set.names}")
+        return cls(line_set, pairs, meta)
+
+    def pair_probabilities(self) -> np.ndarray:
+        """``P[i, j]``: the probability that a single line ``i`` inside the window of the pair is taken for ``j`` (0 for
+        the pairs not listed)."""
+        idx = {n: i for i, n in enumerate(self.names)}
+        out = np.zeros((len(self.names), len(self.names)))
+        for true, assigned, _, _, p in self.pairs:
+            out[idx[true], idx[assigned]] = max(out[idx[true], idx[assigned]], p)
+        return out
+
+    def assign(self, true_index, context, rng: np.random.Generator | None = None) -> np.ndarray:
+        true_index = np.asarray(true_index, dtype=np.int64)
+        if true_index.size == 0:
+            return np.zeros(0, dtype=np.int64)
+        rng = rng if rng is not None else np.random.default_rng()
+        u = rng.random(true_index.size)
+        wave = np.asarray(context["wave_obs"], dtype=np.float64)
+        idx = {n: i for i, n in enumerate(self.names)}
+        out = true_index.copy()
+        low = np.zeros(true_index.size)               # probability already given to earlier pairs of the same galaxy
+        for true, assigned, w0, w1, p in self.pairs:
+            inside = (true_index == idx[true]) & (wave >= w0) & (wave <= w1)
+            out[inside & (u >= low) & (u < low + p)] = idx[assigned]
+            low[inside] += p
+        return out
+
+    def to_config(self) -> dict:
+        cfg = {"type": "windowed", "pairs": [{"line": t, "as": a, "window": [w0, w1], "p": p} for t, a, w0, w1, p in self.pairs]}
+        if self.meta:
+            cfg["meta"] = dict(self.meta)
+        return cfg
+
+    def __repr__(self) -> str:
+        pairs = ", ".join(f"{t}->{a} {p:.3g} at {w0:.0f}-{w1:.0f} A" for t, a, w0, w1, p in self.pairs)
+        return f"WindowedConfusion({pairs or 'no pairs'})"
+
+
 #: Default single-line confusion scenario, P(assigned j | true i), keyed by the feature names
 #: of the ``roman_transitions`` preset. Rows not listed are identity; there are no failures.
 #: E.g. a true Ha line is called [O III] 5007 with probability 0.5 %. This is an assumed
@@ -255,8 +347,9 @@ def build_confusion(cfg, line_set) -> ConfusionModel:
     ``type`` may be ``"default"`` (:data:`DEFAULT_CONFUSION_ROWS` adapted to the line set),
     ``"identity"`` (optional ``p_fail``), ``"matrix"`` (``rows`` nested dict or ``matrix``
     array, or ``file``), ``"wavelength_binned"`` (``edges`` and a list of ``matrices``
-    in either of the ``matrix`` forms), or ``"empirical"`` (a :class:`LineFractionTable`
-    from ``file`` or ``table``, optional ``mode`` and ``p_fail``). Other types come from
+    in either of the ``matrix`` forms), ``"empirical"`` (a :class:`LineFractionTable`
+    from ``file`` or ``table``, optional ``mode`` and ``p_fail``) or ``"windowed"``
+    (:class:`WindowedConfusion`, ``pairs``). Other types come from
     :data:`CONFUSION_MODELS`. A string is taken as a type without options.
     """
     if isinstance(cfg, str):
@@ -576,41 +669,44 @@ class LineFractionTable:
 
     # ---- text -------------------------------------------------------------------------
     def summary(self) -> str:
-        """Per wavelength bin: galaxies, flux bins and galaxies per bin, flux range, and the share of
-        each line in use overall and in the brightest flux-rank bin."""
+        """The table as text: how it was built, then per wavelength bin the single-line galaxies, the flux-rank bins,
+        the share of each line in use (%) and the most common line of the brightest flux-rank bin."""
+        from .report import fields, notes, section, table
+
         s = self.settings
         lim = (f"F > {s['flux_limit']:.2g}" + (f", other lines < {s['secondary_flux_limit']:.2g}" if s.get("secondary_flux_limit") else "")
                ) if "flux_limit" in s else "flux limits not recorded"
         dropped = [f"{nm} ({int(self.counts[..., i].sum()):,})" for i, nm in enumerate(self.names)
                    if not self.used[i] and self.counts[..., i].sum() > 0]
         how = ", ".join(f"{k} {v}" for k, v in s.get("flux_bins", {}).items())
-        out = [f"empirical line fractions: {self.n_single:,} single-line galaxies ({lim}), {self.n_wave_bins} wavelength bins x "
-               f"{self._bins_text()} flux-rank bins" + (f" ({how})" if how else "") + f", mode {self.mode}"
-               + (f", p_fail {self.p_fail}" if self.p_fail else ""),
-               f"  lines used: {', '.join(self.lines_used)}" + (f"; left out, fewer than {s.get('min_count', '?')} galaxies: "
-                                                               + ", ".join(dropped) if dropped else "")]
+        out = [section("Line mix of the single-line galaxies (empirical identification)")]
+        out += fields([("galaxies", f"{self.n_single:,} single-line galaxies ({lim})"),
+                       ("bins", f"{self.n_wave_bins} wavelength bins × {self._bins_text().replace('-', '–')} flux-rank bins"
+                                + (f" ({how})" if how else "")),
+                       ("assignment", f"mode {self.mode}" + (f", p_fail {self.p_fail}" if self.p_fail else "")),
+                       ("lines used", ", ".join(self.lines_used) + (f"; left out, fewer than {s.get('min_count', '?')} galaxies: "
+                                                                    + ", ".join(dropped) if dropped else ""))])
         used = [i for i in range(self.n) if self.used[i]]
-        head = f"  {'wavelength [A]':<16s}{'galaxies':>10s}{'flux bins':>11s}{'per bin':>9s}  {'flux min / max':^20s}  "
-        head += "".join(f"{self.names[i]:>11s}" for i in used) + "   " + "".join(f"{self.names[i]:>11s}" for i in used)
-        out.append(head)
-        out.append(f"  {'':<16s}{'':>10s}{'':>11s}{'':>9s}  {'':^20s}  {'share overall':^{11 * len(used)}s}   "
-                   f"{'brightest flux bin':^{11 * len(used)}s}")
         c = np.where(self.used[None, None, :], self.counts, 0)
         nf = self.n_flux_bins_per_wave
+        rows = []
         for w in range(self.n_wave_bins):
             n_w = int(c[w].sum())
-            e = self.flux_edges[w]
-            row = (f"  {self.wave_edges[w]:6.0f} - {self.wave_edges[w + 1]:5.0f}  {n_w:>10,}{nf[w]:>11d}{n_w // nf[w]:>9,}  "
-                   f"{e[0]:9.2e} {e[-1]:9.2e}  ")
+            row = [f"{self.wave_edges[w]:.0f}–{self.wave_edges[w + 1]:.0f}", f"{n_w:,}", f"{nf[w]:d}"]
             if n_w > 0:
                 share = c[w].sum(axis=0) / n_w
-                row += "".join(f"{share[i]:11.3f}" for i in used) + "   " + "".join(f"{self.fraction[w, nf[w] - 1, i]:11.3f}" for i in used)
+                top = self.fraction[w, nf[w] - 1]
+                k = int(np.argmax(top))
+                row += [f"{100 * share[i]:.1f}" if share[i] > 0 else "·" for i in used] + [f"{self.names[k]} {100 * top[k]:.0f} %"]
             else:
-                row += "   (no single-line galaxies: the mix of the whole table is used)"
-            out.append(row)
+                row += ["·"] * len(used) + ["–"]
+            rows.append(row)
+        out += [""] + table([("λ_obs [Å]", "<"), ("galaxies", ">"), ("flux bins", ">")] + [(self.names[i], ">") for i in used]
+                            + [("brightest bin", "<")], rows)
         per_cell = self.n_per_cell[self.valid_cells]
-        out.append(f"  galaxies per cell: {int(per_cell.min()):,} - {int(per_cell.max()):,} (median {int(np.median(per_cell)):,}); "
-                   f"empty cells: {int((per_cell == 0).sum())} of {per_cell.size}")
+        out += notes(f"line shares in % of the single-line galaxies of the wavelength bin (· none; a bin without any uses the "
+                     f"mix of the whole table); brightest bin: the most common line of the brightest flux-rank bin; {int(per_cell.min()):,}–{int(per_cell.max()):,} galaxies "
+                     f"per cell (median {int(np.median(per_cell)):,}), {int((per_cell == 0).sum())} of {per_cell.size:,} cells empty")
         return "\n".join(out)
 
     # ---- serialisation ------------------------------------------------------------------
@@ -692,3 +788,4 @@ class LineFractionTable:
 
 
 CONFUSION_MODELS["empirical"] = LineFractionTable.from_config
+CONFUSION_MODELS["windowed"] = WindowedConfusion.from_config

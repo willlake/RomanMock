@@ -20,6 +20,10 @@ erg/s, and the luminosity of a line is the sum of the three.
   (default ``galacticus_transitions``), erg/s/cm^2 with ``D_L`` at the cosmological redshift.
 * ``mock.flux_distribution(...)``: the :class:`~romanmock.fluxdist.FluxDistribution` of the whole mock
   (quantiles and fractions above a threshold per redshift bin), one file per worker.
+* ``mock.single_lines(...)``: the single line (observed wavelength, flux, feature) of every single-line
+  galaxy, with any other columns of those galaxies.
+* ``mock.line_fractions(...)``: the :class:`~romanmock.confusion.LineFractionTable` of the single-line
+  galaxies (line mix per bin of observed wavelength and flux rank), as ``BaseCatalog.line_fractions``.
 
 The cosmology is read from the file (``Parameters/cosmologyParameters``: flat LCDM, H0 = 67.74,
 Omega_m = 0.3089, no radiation, as in the mock's Readme; it reproduces the stored comoving positions
@@ -28,6 +32,7 @@ to 2e-5). The sky area is ``angularSize**2`` of ``Parameters/geometryLightcone``
 
 from __future__ import annotations
 
+import datetime as _dt
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,9 +41,15 @@ from typing import Iterable, Iterator, Mapping, Sequence
 import h5py
 import numpy as np
 
+from .confusion import LineFractionTable
+from .detection import detect_lines
 from .fluxdist import DEFAULT_LOGF_EDGES, DEFAULT_Z_EDGES, FluxDistribution, flux_histograms
-from .fluxes import feature_fluxes, flux_column_names
+from .fluxes import component_fluxes, feature_fluxes, flux_column_names
 from .lines import GALACTICUS_LINE_WAVELENGTHS, LineSet, get_line_set
+from .redshift import single_lines
+from .roman import DEFAULT_LINE_FLUX_LIMIT, GRISM_WAVE_RANGE_ANGSTROM
+from .sensitivity import (ConstantFluxLimit, RomanGrismSensitivity, build_detection, build_sensitivity, needs_size,
+                          nominal_flux_limit, nominal_secondary_limit)
 
 CATALOG_SUBDIR = "galaxyCatalogs"
 FILE_GLOB = "*.hdf5"
@@ -63,6 +74,8 @@ COLUMN_ALIASES: dict[str, str] = {
 GALACTICUS_LINES: tuple[str, ...] = tuple(GALACTICUS_LINE_WAVELENGTHS)
 
 _CHUNK_RE = re.compile(r"-d(\d+)_(\d+)")
+
+FRACTION_STREAM = 40000  #: random stream of the line-fraction scan, (seed, FRACTION_STREAM, chunk), as BaseCatalog.line_fractions
 
 
 def air_to_vacuum(wave_air):
@@ -314,7 +327,115 @@ class GalacticusMock:
         result.steps.sort()
         return result
 
+    def single_lines(self, flux_limit: float = DEFAULT_LINE_FLUX_LIMIT, secondary_flux_limit: float | None | str = "default",
+                     wave_range: tuple[float, float] = GRISM_WAVE_RANGE_ANGSTROM, snr: float | None = None,
+                     secondary_snr: float | None | str = "default", size: float | None = None, exposure_time: float | None = None,
+                     background: float | None = None, sensitivity=None, detection: Mapping | None = None,
+                     line_set=DEFAULT_LINE_SET, columns: Sequence[str] = (), seed: int = 12345,
+                     cuts: Mapping[str, tuple] | None = None, files: Sequence[str | Path] | None = None, dust: bool | None = None,
+                     n_workers: int = 1, verbose: bool = True) -> dict[str, np.ndarray]:
+        """The single line of every single-line galaxy of the mock, the input of :meth:`line_fractions`.
+
+        The scan and the detection are those of :meth:`line_fractions` (same arguments). Returns a dict of
+        arrays, one entry per single-line galaxy in file order: ``wave`` (observed wavelength [A]), ``flux``
+        (measured flux [erg/s/cm^2]), ``line`` (index of the feature in ``line_set``) and every column of
+        ``columns`` (any column of :meth:`read`, e.g. ``redshift_rsd`` or a gas metal mass) of those galaxies.
+        """
+        sens = self._sensitivity(flux_limit, secondary_flux_limit, wave_range, snr, secondary_snr, size, exposure_time,
+                                 background, sensitivity)
+        out, _ = self._scan_single_lines(sens, detection, line_set, columns, seed, cuts, files, dust, n_workers, verbose)
+        if verbose:
+            print(f"[galacticus] {out['line'].size:,} single-line galaxies", flush=True)
+        return out
+
+    def line_fractions(self, flux_limit: float = DEFAULT_LINE_FLUX_LIMIT, secondary_flux_limit: float | None | str = "default",
+                       wave_range: tuple[float, float] = GRISM_WAVE_RANGE_ANGSTROM, snr: float | None = None,
+                       secondary_snr: float | None | str = "default", size: float | None = None, exposure_time: float | None = None,
+                       background: float | None = None, sensitivity=None, detection: Mapping | None = None,
+                       line_set=DEFAULT_LINE_SET, wave_bin: float = 250.0, wave_edges=None, galaxies_per_bin: int = 500,
+                       n_flux_bins: int | None = None, flux_quantiles=None, min_count: int = 100, mode: str = "draw",
+                       p_fail: float = 0.0, seed: int = 12345, cuts: Mapping[str, tuple] | None = None,
+                       files: Sequence[str | Path] | None = None, dust: bool | None = None, n_workers: int = 1, write_to=None,
+                       verbose: bool = True) -> LineFractionTable:
+        """The line mix of the single-line galaxies of the mock per bin of observed wavelength and flux
+        rank: the :class:`~romanmock.confusion.LineFractionTable` of
+        :meth:`romanmock.catalog.BaseCatalog.line_fractions`, built from the Galacticus files.
+
+        Every file is scanned once: the fluxes of the features of ``line_set`` (default
+        ``galacticus_transitions``, all 16 features, so [N II], [S II], Hγ, ... count as other lines),
+        the detection at the observed wavelength from ``redshift_rsd`` (the two-tier flux limits
+        ``flux_limit`` / ``secondary_flux_limit`` inside ``wave_range``, the S/N route ``snr``,
+        ``secondary_snr``, ``size`` in arcsec, ``exposure_time``, ``background``, or a ``sensitivity``
+        model), and the single line of every single-line galaxy is kept. The binning (``wave_bin`` or
+        ``wave_edges``; ``galaxies_per_bin``, ``n_flux_bins`` or ``flux_quantiles``), ``min_count``,
+        ``mode`` and ``p_fail`` are those of :meth:`LineFractionTable.from_single_lines`. The mock has no
+        angular sizes in the package's sense, so the S/N route takes a fixed ``size``. ``cuts =
+        {column: (lo, hi)}`` keeps only the galaxies with ``lo <= column <= hi`` (``None`` for an open
+        end; any column of :meth:`read`), as ``make_catalog(cuts=...)``. ``n_workers`` processes read the
+        files (4 to 8 on a login node); ``write_to`` saves the table (``.npz``).
+        """
+        sens = self._sensitivity(flux_limit, secondary_flux_limit, wave_range, snr, secondary_snr, size, exposure_time,
+                                 background, sensitivity)
+        wave_range = tuple(sens.wave_range)
+        if wave_edges is None:
+            n_bins = max(1, int(round((wave_range[1] - wave_range[0]) / float(wave_bin))))
+            wave_edges = np.linspace(wave_range[0], wave_range[1], n_bins + 1)
+        wave_edges = np.asarray(wave_edges, dtype=np.float64)
+        line_set = get_line_set(line_set)
+        single, info = self._scan_single_lines(sens, detection, line_set, (), seed, cuts, files, dust, n_workers, verbose)
+        wave, flux, line = single["wave"], single["flux"], single["line"]
+        settings = {"mock": str(self.path), "dust": self.dust if dust is None else bool(dust), "line_set": line_set.name,
+                    "sensitivity": sens.to_config(), "flux_limit": nominal_flux_limit(sens),
+                    "secondary_flux_limit": nominal_secondary_limit(sens), "wave_range": list(wave_range),
+                    "detection": info["detection"], "wave_bin": float(np.median(np.diff(wave_edges))), "n_base": info["n"],
+                    "cuts": {k: list(v) for k, v in info["cuts"].items()}, "n_cut": info["n_cut"],
+                    "built": _dt.datetime.now().isoformat(timespec="seconds")}
+        table = LineFractionTable.from_single_lines(line_set, wave, flux, line, wave_edges, galaxies_per_bin, n_flux_bins,
+                                                    flux_quantiles, min_count, mode, p_fail, settings)
+        if verbose:
+            print(table.summary(), flush=True)
+        if write_to is not None:
+            path = table.save(write_to)
+            if verbose:
+                print(f"[galacticus] line fractions written to {path}", flush=True)
+        return table
+
     # ---- helpers -------------------------------------------------------------------------
+    @staticmethod
+    def _sensitivity(flux_limit, secondary_flux_limit, wave_range, snr, secondary_snr, size, exposure_time, background,
+                     sensitivity):
+        """The sensitivity model of :meth:`line_fractions` / :meth:`single_lines` (fixed size only)."""
+        snr_given = {k: v for k, v in dict(snr=snr, size=size, exposure_time=exposure_time, background=background).items()
+                     if v is not None}
+        if not (isinstance(secondary_snr, str) and secondary_snr == "default"):
+            snr_given["secondary_snr"] = secondary_snr
+        if sensitivity is not None:
+            sens = build_sensitivity(sensitivity)
+        elif snr_given:
+            sens = RomanGrismSensitivity(wave_range=wave_range, **snr_given)
+        else:
+            sens = ConstantFluxLimit(flux_limit, wave_range, secondary_flux_limit=secondary_flux_limit)
+        if needs_size(sens):
+            raise ValueError("the Galacticus reader gives no angular size per galaxy; use a fixed size=<arcsec>")
+        return sens
+
+    def _scan_single_lines(self, sens, detection, line_set, columns, seed, cuts, files, dust, n_workers, verbose):
+        """Scan the files for single-line galaxies: (dict of arrays, scan info)."""
+        cuts = {str(k): (None if v[0] is None else float(v[0]), None if v[1] is None else float(v[1])) for k, v in (cuts or {}).items()}
+        line_set = get_line_set(line_set)
+        columns = list(dict.fromkeys(columns))
+        paths = self._paths(files)
+        detection = dict(detection or {"type": "threshold"})
+        if verbose:
+            print(f"[galacticus] scanning {len(paths)} files of {self.name} for single-line galaxies "
+                  f"({sens.describe()}), {n_workers} worker(s)", flush=True)
+        args = (self._spec(dust), line_set.to_config(), sens.to_config(), detection, int(seed), cuts, columns)
+        results = self._map(_single_lines_worker, paths, args, n_workers, False, "single-lines")
+        out = {k: np.concatenate([r[k] for r in results]) for k in ("wave", "flux", "line", *columns)}
+        info = {"n": int(sum(r["n"] for r in results)), "n_cut": int(sum(r["n_cut"] for r in results)), "cuts": cuts,
+                "detection": detection}
+        return out, info
+
     def _paths(self, files) -> list[Path]:
         if not files:
             return list(self.files)
@@ -365,6 +486,34 @@ def _flux_worker(path: str, spec: dict, line_cfg, columns, z_range, z_column):
     flux = feature_fluxes(data, line_set, data["redshift_true"], _cosmology(spec))
     out = {c: data[c] for c in columns}
     out.update({name: flux[:, i] for i, name in enumerate(flux_column_names(line_set))})
+    return out
+
+
+def _single_lines_worker(path: str, spec: dict, line_cfg, sens_cfg, detection_cfg, seed, cuts, columns=()):
+    """The single line (observed wavelength, flux, feature index) of every single-line galaxy of one file
+    that passes the cuts, with the requested columns of those galaxies."""
+    line_set = LineSet.from_config(line_cfg)
+    cols = list(dict.fromkeys(["redshift_true", "redshift_rsd", *line_set.required_columns, *cuts, *columns]))
+    data = read_file(path, cols, dust=spec["dust"])
+    n = len(data["redshift_true"])
+    keep = np.ones(n, dtype=bool)
+    for col, (lo, hi) in cuts.items():
+        if lo is not None:
+            keep &= data[col] >= lo
+        if hi is not None:
+            keep &= data[col] <= hi
+    if not keep.all():
+        data = {c: v[keep] for c, v in data.items()}
+    cosmo = _cosmology(spec)
+    flux = feature_fluxes(data, line_set, data["redshift_true"], cosmo)
+    comp = component_fluxes(data, line_set, data["redshift_true"], cosmo) if line_set.has_separated_components else None
+    model = build_detection(detection_cfg, build_sensitivity(sens_cfg))
+    rng = np.random.default_rng([int(seed), FRACTION_STREAM, chunk_index(path)])
+    det = detect_lines(flux, np.asarray(data["redshift_rsd"], dtype=np.float64), line_set, model, rng, component_flux=comp)
+    wave, f, i = single_lines(det)
+    rows = np.flatnonzero(det.n_det == 1)                       # the rows of single_lines
+    out = {"n": n, "n_cut": n - int(keep.sum()), "wave": wave, "flux": f, "line": i.astype(np.int8)}
+    out.update({c: np.asarray(data[c])[rows] for c in columns})
     return out
 
 
