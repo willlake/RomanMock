@@ -28,7 +28,7 @@ from .sensitivity import (
 )
 from .sizes import SizeSpec
 from .detection import detect_lines, DetectionResult, pack_bitmask, unpack_bitmask, popcount
-from .confusion import ConfusionMatrix, WavelengthBinnedConfusion, WindowedConfusion, LineFractionTable, FAIL
+from .confusion import ConfusionMatrix, WavelengthBinnedConfusion, WindowedConfusion, WorstCaseConfusion, LineFractionTable, FAIL
 from .redshift import assign_redshifts, IdOutcome, RedshiftAssignment
 from .config import RomanMockConfig
 from .pipeline import RomanMockPipeline
@@ -72,6 +72,7 @@ __all__ = [
     "ConfusionMatrix",
     "WavelengthBinnedConfusion",
     "WindowedConfusion",
+    "WorstCaseConfusion",
     "LineFractionTable",
     "FAIL",
     "assign_redshifts",

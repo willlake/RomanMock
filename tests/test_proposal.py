@@ -87,7 +87,7 @@ def test_proposal_numbers_template_and_round_trip(tmp_path):
     p = _proposal()
     assert p.n_sample == 2
     inside = p.single_lines_inside()
-    assert inside == {"Ha": {"n": 1, "share": 0.5, "major": True}}
+    assert inside == {"Ha": {"n": 1, "share": 0.5, "share_single": 1.0, "major": True}}
     inter = p.interlopers()
     assert list(inter) == ["OIII_5007"] and inter["OIII_5007"]["n"] == 1
     assert inter["OIII_5007"]["per_deg2"] == 0.5 and inter["OIII_5007"]["share"] == 1.0
@@ -105,8 +105,16 @@ def test_proposal_numbers_template_and_round_trip(tmp_path):
     assert q.settings == p.settings and q.line_names == NAMES
     for key in p.counts:
         np.testing.assert_array_equal(q.counts[key], p.counts[key])
-    # a line below the cut is minor: left out of the template
-    assert _proposal(min_count=2).confusion_template() == {} and _proposal(min_count=2).major_interlopers == []
+    # a line below the cut is minor: left out of the template, but listed and drawn as thin lines marked minor
+    q = _proposal(min_count=2)
+    assert q.confusion_template() == {} and q.major_interlopers == [] and q.minor_pairs == [("OIII_5007", "Ha")]
+    fig = q.plot()
+    thin = [line for ax in fig.axes[1:] for line in ax.get_lines() if line.get_label().endswith("(minor)")]
+    assert len(thin) == 2 and all(line.get_linewidth() < 1 for line in thin)
+    assert "thin lines in proposal.plot()): OIII_5007 (1)" in " ".join(q.summary().split())      # the note is wrapped
+    import matplotlib.pyplot as plt
+
+    plt.close(fig)
     with pytest.raises(ValueError, match="identification"):
         p.make_catalog(None, tmp_path)
 
@@ -156,6 +164,26 @@ def test_proposal_of_every_line(tmp_path):
     assert "Proposal · every galaxy" in text and "taken for" in text and "not taken for" in text and "SIII_6312" in text
     q = Proposal.load(p.save(tmp_path / "all.npz"))
     assert q.settings == p.settings and q.interlopers() == p.interlopers()
+
+
+def test_lines_taken_for_by_their_share_of_the_single_lines():
+    """For line="all", a line is taken for when it is the single line of min_share of the single-line galaxies inside the
+    range, not of every detected galaxy. Here [O III] 5007 is the single line of 1 of the 3 detected galaxies at 1.0-1.2
+    and of 1 of the 2 single-line ones. (In the mock at 1.0-1.2 it is 0.04 % of the detected galaxies but 1.4 % of the
+    single-line ones, and the single Hα lines of 0.53-0.68 that could be taken for it make 5 % of the catalog.)"""
+    p = _every_line()
+    again = lambda **kw: Proposal(p.counts, p.z_edges, {**p.settings, **kw}, NAMES, LS.rest_waves, area_deg2=2.0)
+    inside = p.single_lines_inside()
+    assert inside["OIII_5007"]["share"] == pytest.approx(1 / 3) and inside["OIII_5007"]["share_single"] == 0.5
+    q = again(min_share=0.4)              # below 0.4 of the detected galaxies, but half of the single lines: taken for
+    assert q.assignable == ["Ha", "OIII_5007"] == q.worst_case_lines() and "Ha" in q.interlopers()["OIII_5007"]
+    none = again(min_share=0.6)
+    assert none.assignable == [] == none.worst_case_lines() and none.interlopers() == {}
+    assert none.worst_case_lines(min_count=1) == ["Ha", "OIII_5007"]       # the harsher worst case: any line single inside
+    text = none.summary()
+    assert "none above the minor-line cut" in text and "worst case" not in text and max(map(len, text.splitlines())) <= 100
+    text = p.summary()
+    assert "of single¹" in text and "the worst case, every single line an interloper" in text
 
 
 def test_hint_says_what_line_means():
@@ -282,6 +310,62 @@ def test_windowed_confusion():
     both = WindowedConfusion(NAMES, [("OIII_5007", "Ha", (13000, 14000), 0.5), ("OIII_5007", "Hb", (13500, 14500), 0.5)])
     j = both.assign(np.full(n, O3), {"wave_obs": np.full(n, 13700.0)}, np.random.default_rng(2))
     assert set(np.unique(j)) == {HA, HB} and abs((j == HA).mean() - 0.5) < 0.02
+
+
+def _every_line_over(z_range):
+    """The galaxies of :func:`_every_line` proposed for another range."""
+    z, det = _galaxies(more=True)
+    windows = target_windows(NAMES, LS.rest_waves, z_range, BAND)
+    edges = proposal_grid(z_range, 0.01, 3.0)
+    counts = proposal_counts(det, z, LS, list(windows), list(windows.values()), edges)
+    settings = {"line": "all", "z_range": list(z_range), "targets": list(windows), "windows": [list(w) for w in windows.values()],
+                "min_count": 1, "min_share": 1e-3, "rescaling": None, "doublets": None, "base": "/nowhere",
+                "sensitivity": {"type": "constant", "flux_limit": 1.5e-16, "secondary_flux_limit": 6e-17, "wave_range": list(BAND)}}
+    return Proposal(counts, edges, settings, NAMES, LS.rest_waves, area_deg2=2.0), z, det
+
+
+def test_worst_case():
+    """The worst case takes every single line for another line, one that puts it inside the range wherever there is one.
+    At 1.0-1.2: the single [O III] line of z 1.75 and the [S III] 9532 line of z 0.45 are taken for Hα, the single Hα line
+    of z 0.6 for [O III], and the single Hα (z 1.1) and [O III] (z 1.15) lines of the range leave it. Over 1.0-1.94 the
+    windows of Hα and [O III] overlap: the
+    single Hα line of z 1.1 taken for [O III], and the [O III] line of z 1.75 taken for Hα, stay inside with a wrong
+    redshift, and the [S III] line inside both windows goes to the first line, Hα (the counts then hold it twice)."""
+    from romanmock.confusion import WorstCaseConfusion
+    from romanmock.redshift import IdOutcome, assign_redshifts
+
+    p, z, det = _every_line_over((1.0, 1.2))
+    assert p.worst_case_lines() == ["Ha", "OIII_5007"] == p.assignable
+    w = p.worst_case()
+    assert {(r["line"], r["as"]): r["n"] for r in w["pairs"]} == {("OIII_5007", "Ha"): 1, ("SIII_9532", "Ha"): 1, ("Ha", "OIII_5007"): 1}
+    assert (w["n_multi"], w["n_interlopers"], w["n_catalog"]) == (1, 3, 4) and w["share"] == 0.75
+    assert w["lost"] == {"Ha": 1, "OIII_5007": 1} and w["moved"] == {} and w["overlaps"] == []
+    model = build_confusion({"type": "worst_case", "z_range": [1.0, 1.2], "taken_for": w["taken_for"]}, LS)
+    assert isinstance(model, WorstCaseConfusion) and model.to_config()["taken_for"] == ["Ha", "OIII_5007"]
+    za = assign_redshifts(det, z, LS, model)
+    kept = (det.n_det > 0) & (za.z_assigned >= 1.0) & (za.z_assigned <= 1.2)
+    assert kept.sum() == w["n_catalog"] and (kept & (za.outcome == IdOutcome.SINGLE_MISID)).sum() == w["n_interlopers"]
+    assert not np.any(za.outcome == IdOutcome.SINGLE_CORRECT)        # no single line keeps its line
+    assert za.line_assigned[5] == O3 and za.z_assigned[5] == pytest.approx(LS.rest_waves[HA] * 1.603 / LS.rest_waves[O3] - 1)
+    assert za.line_assigned[0] == O3 and za.z_assigned[0] > 1.2       # the Hα line of the range leaves it, taken for [O III]
+    text = p.worst_case_summary()
+    assert "Worst case · every galaxy" in text and "Left out" in text and "SIII_6312" in text and max(map(len, text.splitlines())) <= 100
+    # one line only: a single line of that line has nothing else to be taken for, and gets no redshift
+    lone = WorstCaseConfusion(LS, (1.0, 1.2), ["Ha"])
+    assert lone.assign(np.array([HA, O3]), {"wave_obs": np.array([13800.0, 13800.0])}).tolist() == [-1, HA]
+    assert lone.pair_probabilities()[O3, HA] == 1 and lone.pair_probabilities()[HA, HA] == 0
+    with pytest.raises(KeyError, match="unknown"):
+        WorstCaseConfusion(LS, (1.0, 1.2), ["Hz"])
+    # over 1.0-1.94: single lines of the range stay inside with a wrong redshift
+    wide, z, det = _every_line_over((1.0, 1.94))
+    w = wide.worst_case(["Ha", "OIII_5007"])
+    assert w["overlaps"] == [("Ha", "OIII_5007")] and w["moved"] == {"Ha": 1, "OIII_5007": 1} and w["lost"] == {"OIII_5007": 1}
+    za = assign_redshifts(det, z, LS, WorstCaseConfusion(LS, (1.0, 1.94), ["Ha", "OIII_5007"]))
+    kept = (det.n_det > 0) & (za.z_assigned >= 1.0) & (za.z_assigned <= 1.94)
+    assert kept[[0, 2]].all() and (za.outcome[[0, 2]] == IdOutcome.SINGLE_MISID).all()    # inside, with a wrong redshift
+    assert za.line_assigned[7] == HA and kept.sum() == 6 < w["n_catalog"] == 7      # [S III]: counted in both windows
+    rows = {(r["line"], r["as"]): r for r in wide.misidentifications()}
+    assert rows[("Ha", "OIII_5007")]["n_inside"] == 1 and rows[("Ha", "OIII_5007")]["worst_case"]
 
 
 def test_single_line_mode():

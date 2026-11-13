@@ -139,7 +139,9 @@ footnote marks, at most 100 characters wide.
 | interlopers | another line was taken for this line |
 
 detected = identified + mistaken. The sample of a line is its identified galaxies plus its interlopers, and
-`share` is the share of one interloper in it. For the Hα catalog at 1.0–1.2 of `notebooks/01_catalog_z1p0_1p2.ipynb`:
+`share` is the share of one interloper in it. For the Hα catalog at 1.0–1.2 made as in
+`notebooks/01_catalog_z1p0_1p2.ipynb`, here with the default `"galacticus_like"` rescaling (the notebook passes
+another one, so its numbers differ):
 
 ```text
 ━━ Catalog · Hα · 1.0 ≤ z_assigned ≤ 1.2 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -715,7 +717,11 @@ any lower secondary limit. Between 6 and 8 × 10⁻¹⁷ the possible interloper
 The scan costs nothing extra: every sensitivity model puts the secondary limit at a fixed fraction of the primary one
 at each wavelength, so one number per galaxy (its second-brightest line in units of the primary threshold) decides it
 for every secondary limit. Counts are exact on a grid of 0.001 dex and at the proposal's own secondary limit, linear in
-log between. Lines whose single-line galaxies are fewer than `min_count` (100) or below `min_share` (0.1 %) are minor.
+log between. A line single inside the range is minor when it is the single line of fewer than `min_count` (100)
+galaxies or of less than `min_share` (0.1 %) of the single-line galaxies there; a potential interloper, when it has
+fewer than 100 galaxies or less than 0.1 % of the sample. Minor potential interlopers stay out of the summary's table
+and of the confusion template, but are listed under it and drawn as thin lines by `proposal.plot()`, so that the
+figure shows every pair the worst case can make. The summary also gives the worst case (Step 2c below).
 `proposal.save(path)` / `Proposal.load(path)` keep it; the numbers are in `proposal.single_lines_inside()`,
 `interlopers()`, `interloper_scan(secondary)`, `secondary_for(total)`, `single_line_fraction(ratio)`,
 `fraction_inside(line)`, `fraction_interloper(line)`, `contamination_at_most(line)` and `proposal.counts`.
@@ -731,8 +737,13 @@ log between. Lines whose single-line galaxies are fewer than `min_count` (100) o
 With `line="all"` a potential interloper is a pair: a single line that, taken for another line, gets a redshift inside
 the range. Only lines that single-line galaxies inside the range actually show (above the minor-line cut,
 `proposal.assignable`) count as the line it is taken for: by wavelength alone a single Hα line could pass for
-[S III] λ6312, but no identification would assign a line that is never single. `proposal.interlopers()` is then
-`{taken for: {line: ...}}`, and in the figures the colour is the true line and the line style the line it is taken for.
+[S III] λ6312, but no identification would assign a line that is never single. The cut is on the share of the
+*single-line* galaxies, not of every detected galaxy. At 1.0 < z < 1.2 (flux limits 1.5 / 0.6 × 10⁻¹⁶, the rescaling
+of the notebooks) [O III] λ5007 is the single line of 0.04 % of the detected galaxies but 1.4 % of the single-line
+ones, and the single Hα lines of 0.53 < z < 0.68 that could be taken for it are 721,584, at most 5.0 % of the catalog
+(6.0 % in all with the [S III] λ9532 pairs). Until 2026-11-13 the share was of every detected galaxy, which left these
+pairs out and gave at most 0.23 %. `proposal.interlopers()` is then `{taken for: {line: ...}}`, and in the figures the
+colour is the true line and the line style the line it is taken for.
 A single line can fall where two such lines would be (wide ranges), so the summed "at most" is an upper bound.
 
 **Step 2a, a catalog by design: `proposal.make_catalog(fractions=..., out_dir=...)`.**
@@ -774,7 +785,38 @@ Both write `<name>.hdf5` (default name `Ha_z1p0_1p2`, `all_z1p0_1p2`), `<name>_s
 line report, the proposal's numbers, the design), `<name>_proposal.npz` and, with `n_randoms`, `<name>_random.hdf5`
 (the randoms of the whole catalog; `cat.subset(which).make_random(...)` for a part). `confusion={}` gives the clean
 catalog. Notebooks: `notebooks/01_catalog_z1p0_1p2.ipynb` and `02_catalog_z1p6_2p0.ipynb` (confusion table and line
-mix), `04_catalog_by_design.ipynb` (interloper fractions), `05_single_line_clean_catalogs.ipynb` (below).
+mix), `04_catalog_by_design.ipynb` (interloper fractions), `05_single_line_clean_catalogs.ipynb` (below),
+`06_worst_case.ipynb` (the worst case, below).
+
+**Step 2c, the worst case: `proposal.make_catalog("worst_case", out_dir)`.** Every single line is an interloper: it is
+taken for another line, for one that gives it a redshift inside the range wherever there is one (`type: worst_case`,
+`romanmock.confusion.WorstCaseConfusion`, no random numbers). No single-line galaxy keeps its redshift: those of the
+range leave it (taken for a line that puts them outside), and those of other redshifts whose line falls where a
+taken-for line would be inside the range come in.
+
+```python
+proposal = base.make_proposal((1.0, 1.2), line="all", flux_limit=1.5e-16, secondary_flux_limit=6e-17, rescaling=RESCALING)
+print(proposal.worst_case_summary())      # the catalog it makes, from the counts, and every case it leaves out
+cat = proposal.make_catalog("worst_case", "/pscratch/.../all_z1p0_1p2_worst", n_randoms=20)
+```
+
+The lines a single line can be taken for are `proposal.worst_case_lines()`, the lines of the potential interlopers
+(`proposal.assignable`): the single line of at least `min_count` galaxies inside the range and of `min_share` of its
+single-line galaxies, the most common first. At 1.0 < z < 1.2 with that rescaling these are Hα and [O III] λ5007, and
+the single Hα lines of 0.53 < z < 0.68 taken for [O III] make 5.1 % of the worst-case catalog (721,584 of 872,310
+interlopers, 6.19 %; the potential interlopers make at most 6.03 % of a catalog that keeps its sample). A line that is
+never, or hardly ever, the single line of a galaxy of the range (Hβ, [O III] λ4959, [S III] λ6312, ...) is not taken
+for. `worst_case_lines(min_count=100)` drops the share cut (a harsher worst case: with a single tier at 1.6 < z < 2.0 it
+adds Hβ and [O II], the single line of 207 and 136 of 5.5 M single-line galaxies), and `{"type": "worst_case",
+"taken_for": [...]}` chooses the lines. `proposal.worst_case()` gives the numbers (interlopers per pair, those
+from inside the range, the single lines that leave it, the catalog size and share), `make_catalog` prints them with the
+numbers made (equal, the selection being deterministic) and keeps both in the summary file (`worst_case`).
+`proposal.misidentifications()` lists every way a single line can get a redshift inside the range, including the single
+lines *of* the range that stay inside it with a wrong redshift. That needs two lines closer in wavelength than the
+range is wide in 1 + z (1.10 at 1.0–1.2, 1.15 at 1.6–2.0), e.g. Hα taken for [S III] λ6312 (ratio 1.040) or [O III]
+λ5007 for λ4959 (1.010) or Hβ (1.030); Hα and [O III] (1.311) never do it in these bins, and the lines that do are never
+single, so the worst case has no such galaxies there. In a wider range it has them (`WorstCaseConfusion` gives them their
+wrong redshift inside the range), and where the windows of two taken-for lines overlap a single line goes to the first.
 
 **Single-line clean catalogs: no secondary limit, no interlopers.**
 
@@ -859,15 +901,21 @@ previous mock, `/global/cfs/cdirs/m4943/Simulations/RomanMocks/sdss_feniks_hizel
 | `catalogs/` | `halpha_z1p0_1p9.hdf5`: Hα sample at 1.0 < z < 1.9 | the former notebook 02 (removed 2026-11-09) |
 | `randoms/` | `halpha_z1p0_1p9_<which>_<index>.hdf5`: 10 random catalogs each for all, galaxies and interlopers | the former notebook 03 (removed 2026-11-09) |
 
-`notebooks/` holds five executed examples on the current base catalog. They write to `$PSCRATCH/RomanMocks/examples/`.
+`notebooks/` holds six executed examples on the current base catalog. They write to `$PSCRATCH/RomanMocks/examples/`.
+Since 2026-11-12 they pass their own rescaling to `make_proposal` instead of the default `"galacticus_like"`:
+`LineFactors(log_offsets={"OII_3727": 0.25}, scatter={"OIII_5007": 0.19, "OIII_4959": 0.19, "OII_3727": 0.11})`, which
+gives [O III] a scatter of 0.19 dex, brightens [O II] by 0.25 dex with a scatter of 0.11 dex, and leaves the other
+lines raw (the introduction of notebook 01 says why). The proposal and catalog numbers quoted in this README are for
+the default rescaling.
 Run them on a CPU node (03 also runs on a login node, after 01):
-`sbatch scripts/run_notebook.sh notebooks/01_catalog_z1p0_1p2.ipynb notebooks/02_catalog_z1p6_2p0.ipynb notebooks/03_randoms.ipynb notebooks/04_catalog_by_design.ipynb notebooks/05_single_line_clean_catalogs.ipynb`
+`sbatch scripts/run_notebook.sh notebooks/01_catalog_z1p0_1p2.ipynb notebooks/02_catalog_z1p6_2p0.ipynb notebooks/03_randoms.ipynb notebooks/04_catalog_by_design.ipynb notebooks/05_single_line_clean_catalogs.ipynb notebooks/06_worst_case.ipynb`
 
 1. `01_catalog_z1p0_1p2.ipynb`: the Hα catalog at 1.0 < z < 1.2 in the two steps. The proposal (flux limits 1.5 / 0.6 × 10⁻¹⁶, S/N 5 / 2, `line="all"`), then the catalog with an assumed confusion table and with the line mix of the mock, its components, and the files.
 2. `02_catalog_z1p6_2p0.ipynb`: the same at 1.6 < z < 2.0 for every galaxy (`line="all"`): Hα leaves the grism at z = 1.94, and [O III] λ5007 carries the range to 2.0.
 3. `03_randoms.ipynb`: the random catalog of the catalog of notebook 01 and of each of its parts (`cat.subset(which).make_random(...)`): multi-line galaxies, single-line galaxies with a correct redshift, all interlopers, each kind of interloper. It checks them (inside the footprint, the n(z) of the data) and shows that they are reproducible, extensible and independent between parts.
 4. `04_catalog_by_design.ipynb`: catalogs by their interloper fractions: the proposal with an expected total and its scan of the secondary limit, `design`, a table that cannot be met, `fraction_template`, the S/N scan, and every galaxy at 1.6 < z < 2.0.
 5. `05_single_line_clean_catalogs.ipynb`: single-line clean catalogs, without interlopers: the true single-line share against redshift at 0.3, 0.4 and 0.5 times the primary limit, the catalog with one line per galaxy and with a secondary limit of 7.5 × 10⁻¹⁷ (the same galaxies, single-line as the proposal counts), the S/N proposal.
+6. `06_worst_case.ipynb`: the worst case, every single line an interloper, for every galaxy at 1.0 < z < 1.2 and 1.6 < z < 2.0 (flux limits 1.5 / 0.6 × 10⁻¹⁶): `worst_case_summary()`, `misidentifications()` (every way a single line can land in the range, and why none of the range stays inside it with a wrong redshift), the catalogs (made = expected), their components and the true redshifts of their interlopers, and other lines to take the single lines for.
 
 ## Extending (hooks for the plan's comments)
 

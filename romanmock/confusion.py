@@ -11,6 +11,8 @@ rest of the pipeline. :class:`ConfusionMatrix` ignores the context;
 :class:`WavelengthBinnedConfusion` selects a matrix by observed wavelength;
 :class:`WindowedConfusion` takes a line for another only inside a window of observed
 wavelength (the identification of a catalog designed by its interloper fractions);
+:class:`WorstCaseConfusion` takes every single line for another line, one that puts it
+inside the redshift range of the catalog wherever there is one (the worst case);
 :class:`LineFractionTable` (``type: empirical``) ignores the true line altogether and
 draws the identity from the line mix of the mock's single-line galaxies at the same
 observed wavelength and flux rank.
@@ -293,6 +295,95 @@ class WindowedConfusion:
         return f"WindowedConfusion({pairs or 'no pairs'})"
 
 
+class WorstCaseConfusion:
+    """Every single line taken for another line (``type: worst_case``): the most interlopers an identification can
+    put in a catalog of a redshift range, and none of its single-line galaxies with their true redshift.
+
+    ``taken_for`` lists, in order of preference, the lines a single line can be taken for; a proposal gives the lines
+    that single-line galaxies inside the range show (:meth:`romanmock.proposal.Proposal.worst_case_lines`). A single line
+    observed at λ is taken for the first of them, other than its own line, that gives it a redshift λ / λ_rest − 1
+    inside ``z_range`` (ends included): it is an interloper of the catalog, whether its true redshift is outside the
+    range or inside it (taken for a line close in wavelength, e.g. [O III] λ5007 for Hβ, a galaxy can stay inside the
+    range with a wrong redshift). A single line that no such line puts inside the range is taken for the first line of
+    ``taken_for`` other than its own, which puts it outside: it leaves the catalog. Where ``taken_for`` holds no other
+    line it gets no redshift (``fail``). No random number is drawn: the same galaxies always give the same catalog.
+    """
+
+    def __init__(self, names: Sequence[str] | LineSet, z_range, taken_for: Sequence[str], rest_waves=None,
+                 meta: Mapping | None = None):
+        if isinstance(names, LineSet):
+            rest_waves = names.rest_waves if rest_waves is None else rest_waves
+            names = names.names
+        self.names = list(names)
+        if rest_waves is None:
+            raise ValueError("give the rest wavelengths of the lines (or a LineSet)")
+        self.rest_waves = np.asarray(rest_waves, dtype=np.float64)
+        if self.rest_waves.shape != (len(self.names),):
+            raise ValueError(f"{len(self.names)} lines but {self.rest_waves.size} rest wavelengths")
+        if z_range is None or len(z_range) != 2 or not float(z_range[0]) < float(z_range[1]):
+            raise ValueError(f"z_range is (min, max) with min < max; got {z_range}")
+        self.z_range = (float(z_range[0]), float(z_range[1]))
+        taken_for = [taken_for] if isinstance(taken_for, str) else list(taken_for)
+        unknown = [t for t in taken_for if t not in self.names]
+        if unknown:
+            raise KeyError(f"unknown lines {unknown} in taken_for; the lines are {self.names}")
+        if not taken_for or len(set(taken_for)) != len(taken_for):
+            raise ValueError(f"taken_for lists the lines a single line can be taken for, each once; got {taken_for}")
+        self.taken_for = taken_for
+        self._taken = [self.names.index(t) for t in taken_for]
+        self.meta = dict(meta or {})
+
+    @classmethod
+    def from_config(cls, line_set, z_range, taken_for, meta=None, names=None) -> "WorstCaseConfusion":
+        line_set = get_line_set(line_set)
+        if names is not None and list(names) != line_set.names:
+            raise ValueError(f"the worst-case confusion is for the lines {list(names)}, not {line_set.names}")
+        return cls(line_set, z_range, taken_for, meta=meta)
+
+    def windows(self) -> dict[str, tuple[float, float]]:
+        """``{taken for: (min, max)}``: the observed wavelengths [Å] at which a single line taken for that line gets a
+        redshift inside the range (before the bandpass)."""
+        lo, hi = self.z_range
+        return {t: (float(self.rest_waves[k] * (1 + lo)), float(self.rest_waves[k] * (1 + hi)))
+                for t, k in zip(self.taken_for, self._taken)}
+
+    def pair_probabilities(self) -> np.ndarray:
+        """``P[i, j]``: 1 for every line ``i`` and every line ``j`` of ``taken_for`` other than ``i``: inside the window
+        of ``j`` a single line ``i`` is always taken for it (for the first such line where windows overlap)."""
+        out = np.zeros((len(self.names), len(self.names)))
+        for j in self._taken:
+            out[:, j] = 1.0
+            out[j, j] = 0.0
+        return out
+
+    def assign(self, true_index, context, rng: np.random.Generator | None = None) -> np.ndarray:
+        true_index = np.asarray(true_index, dtype=np.int64)
+        out = np.full(true_index.size, FAIL, dtype=np.int64)
+        if true_index.size == 0:
+            return out
+        wave = np.asarray(context["wave_obs"], dtype=np.float64)
+        lo, hi = self.z_range
+        done = np.zeros(true_index.size, dtype=bool)
+        for j in self._taken:                          # inside the range: the first line that puts it there
+            z = wave / self.rest_waves[j] - 1.0
+            m = ~done & (true_index != j) & (z >= lo) & (z <= hi)
+            out[m], done[m] = j, True
+        for j in self._taken:                          # nowhere inside: the first other line, which puts it outside
+            m = ~done & (true_index != j)
+            out[m], done[m] = j, True
+        return out
+
+    def to_config(self) -> dict:
+        cfg = {"type": "worst_case", "z_range": list(self.z_range), "taken_for": list(self.taken_for)}
+        if self.meta:
+            cfg["meta"] = dict(self.meta)
+        return cfg
+
+    def __repr__(self) -> str:
+        lo, hi = self.z_range
+        return f"WorstCaseConfusion(taken for {', '.join(self.taken_for)}; inside {lo:g}-{hi:g} wherever possible)"
+
+
 #: Default single-line confusion scenario, P(assigned j | true i), keyed by the feature names
 #: of the ``roman_transitions`` preset. Rows not listed are identity; there are no failures.
 #: E.g. a true Ha line is called [O III] 5007 with probability 0.5 %. This is an assumed
@@ -348,8 +439,9 @@ def build_confusion(cfg, line_set) -> ConfusionModel:
     ``"identity"`` (optional ``p_fail``), ``"matrix"`` (``rows`` nested dict or ``matrix``
     array, or ``file``), ``"wavelength_binned"`` (``edges`` and a list of ``matrices``
     in either of the ``matrix`` forms), ``"empirical"`` (a :class:`LineFractionTable`
-    from ``file`` or ``table``, optional ``mode`` and ``p_fail``) or ``"windowed"``
-    (:class:`WindowedConfusion`, ``pairs``). Other types come from
+    from ``file`` or ``table``, optional ``mode`` and ``p_fail``), ``"windowed"``
+    (:class:`WindowedConfusion`, ``pairs``) or ``"worst_case"`` (:class:`WorstCaseConfusion`,
+    ``z_range`` and ``taken_for``). Other types come from
     :data:`CONFUSION_MODELS`. A string is taken as a type without options.
     """
     if isinstance(cfg, str):
@@ -789,3 +881,4 @@ class LineFractionTable:
 
 CONFUSION_MODELS["empirical"] = LineFractionTable.from_config
 CONFUSION_MODELS["windowed"] = WindowedConfusion.from_config
+CONFUSION_MODELS["worst_case"] = WorstCaseConfusion.from_config

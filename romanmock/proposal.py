@@ -11,15 +11,16 @@ in one pass over the base catalog
   catalog. Their single-line fraction against their own (true) redshift, and how many of them would land at each
   assigned redshift.
 
-Lines with few single-line galaxies (fewer than ``min_count``, or below ``min_share`` of the detected galaxies,
-respectively of the target sample) are left out as minor. The proposal fixes everything but the identification:
-:meth:`Proposal.make_catalog` takes the confusion table (or ``"empirical"``) and an output directory and writes
-the catalog, with the same thresholds, line rescaling and doublet rule.
+Lines with few single-line galaxies (fewer than ``min_count``, or below ``min_share`` of the single-line galaxies
+inside the range; for the potential interlopers, of the target sample) are left out as minor. The proposal fixes
+everything but the identification: :meth:`Proposal.make_catalog` takes the confusion table (or ``"empirical"``) and
+an output directory and writes the catalog, with the same thresholds, line rescaling and doublet rule.
 
 ``line="all"`` proposes a catalog of every galaxy with a redshift in the range, whichever line gave it. Its sample
 is every detected galaxy inside the range, and its potential interlopers are pairs: a single line that, taken for
 another line, gets a redshift inside the range. That other line must be one that single-line galaxies inside the
-range actually show (:attr:`Proposal.assignable`); the counts keep every line in the bandpass.
+range actually show, in at least ``min_share`` of them (:attr:`Proposal.assignable`); the counts keep every line in
+the bandpass.
 
 The proposal also scans the secondary limit, the threshold of the other lines of a galaxy, which decides how many
 galaxies keep a single line: for every secondary limit from the primary one down to a hundredth of it, how many
@@ -29,6 +30,13 @@ instead of a confusion table: ``proposal.make_catalog(fractions={"Ha": {"OIII_50
 secondary_flux_limit=1e-16, out_dir=...)`` takes, inside the window of each pair, the probability that makes the
 interlopers of the pair that share of the catalog (:meth:`Proposal.design`; the identification is a
 :class:`~romanmock.confusion.WindowedConfusion`).
+
+The **worst case** makes every single line an interloper: ``proposal.make_catalog("worst_case", out_dir)`` takes each
+single line for another line, one that puts it inside the range wherever there is one, among the lines single-line
+galaxies inside the range show (:meth:`Proposal.worst_case_lines`, the :attr:`Proposal.assignable` lines).
+:meth:`Proposal.worst_case` gives the catalog this makes from the counts, and :meth:`Proposal.misidentifications` every
+other way a single line could get a redshift inside the range, including the single lines of the range that stay
+inside it with a wrong redshift.
 
 Without a secondary limit and without an expected interloper fraction, a proposal is for a **single-line clean
 catalog**: the galaxies with the target line above the primary limit (every detected galaxy for ``line="all"``), each
@@ -395,9 +403,16 @@ class Proposal:
     @property
     def assignable(self) -> list[str]:
         """The lines a single line can be taken for in this catalog: the target line or, for ``line="all"``, the lines
-        in the bandpass that are single lines of a major share of the galaxies inside the range. A single line falling
-        where another line would be is taken for it only if single-line galaxies show that line; lines that are almost
-        never single there ([S III] λ6312, a faint doublet member, ...) are not taken for."""
+        in the bandpass that are the single line of at least ``min_count`` galaxies inside the range and of
+        ``min_share`` of its single-line galaxies (:meth:`single_lines_inside`). A single line falling where another
+        line would be is taken for it only if single-line galaxies show that line; lines that are almost never single
+        there ([S III] λ6312, a faint doublet member, ...) are not taken for.
+
+        The share is of the single-line galaxies, not of every detected galaxy: a line can be single in few galaxies
+        next to the multi-line ones and still be a real part of the single lines, and the single lines of other
+        redshifts that could be taken for it can be many. At 1.0 < z < 1.2 (flux limits 1.5 / 0.6 × 10⁻¹⁶)
+        [O III] λ5007 is the single line of 0.04 % of the detected galaxies but of 1.4 % of the single-line ones, and
+        the single Hα lines of 0.53 < z < 0.68 that would be taken for it make 5 % of the catalog."""
         if not self.all_lines:
             return [self.line]
         major = set(self.major_inside)
@@ -417,23 +432,27 @@ class Proposal:
 
     def single_lines_inside(self) -> dict[str, dict]:
         """Per line: the single-line galaxies inside the range whose line it is (``n``), their share of the detected
-        galaxies inside the range (``share``), and whether they count (``major``)."""
+        galaxies inside the range (``share``) and of its single-line galaxies (``share_single``), and whether the line
+        counts (``major``: at least ``min_count`` galaxies and ``min_share`` of the single-line ones)."""
         inside = self.inside
         n_det = int(self.counts["n_det"][inside].sum())
+        per_line = self.counts["n_single"][inside].sum(axis=0)
+        n_single = max(int(per_line.sum()), 1)
         out = {}
         for i, name in enumerate(self.line_names):
-            n = int(self.counts["n_single"][inside, i].sum())
+            n = int(per_line[i])
             if n:
-                share = n / max(n_det, 1)
-                out[name] = {"n": n, "share": share, "major": self._major(n, share)}
+                out[name] = {"n": n, "share": n / max(n_det, 1), "share_single": n / n_single,
+                             "major": self._major(n, n / n_single)}
         return out
 
     def interlopers(self, target: str | None = None) -> dict:
         """Per line other than ``target``: the potential interlopers, single-line galaxies whose line falls where
         ``target`` would be inside the range. ``n``: how many; ``per_deg2``; ``z_true``: their redshifts; ``share``:
         their share of the detected galaxies at those redshifts; ``at_most``: their share of the catalog if every
-        potential interloper were taken (the catalog then holds the sample plus all of them), the most any
-        identification gives; ``major``.
+        potential interloper were taken (the catalog then holds the sample plus all of them), the most interlopers an
+        identification that keeps the sample can bring (the worst case, :meth:`worst_case`, also loses the single
+        lines of the range, and its share is a little higher); ``major``.
 
         ``target`` defaults to the target line. For ``line="all"`` it can be any line of :attr:`targets`, and without
         it the result is ``{target: {line: ...}}`` over the :attr:`assignable` lines (only those pairs can be major)."""
@@ -483,6 +502,14 @@ class Proposal:
         return [(x, t) for t in self.assignable for x, v in self.interlopers(t).items() if v["major"]]
 
     @property
+    def minor_pairs(self) -> list[tuple[str, str]]:
+        """The potential interlopers below the minor-line cut (fewer than ``min_count`` galaxies or ``min_share`` of the
+        sample), as ``(line, the line it would be taken for)``, the most numerous first: listed in the summary and drawn
+        as thin lines by :meth:`plot`."""
+        rows = [(x, t, v["n"]) for t in self.assignable for x, v in self.interlopers(t).items() if not v["major"]]
+        return [(x, t) for x, t, _ in sorted(rows, key=lambda r: -r[2])]
+
+    @property
     def major_interlopers(self) -> list[str]:
         """The lines whose single lines are potential interlopers that count (in any pair, for ``line="all"``)."""
         return list(dict.fromkeys(x for x, _ in self.major_pairs))
@@ -517,7 +544,8 @@ class Proposal:
     def contamination_at_most(self, line: str | None = None, target: str | None = None) -> tuple[np.ndarray, np.ndarray]:
         """Against the assigned redshift inside the range: the potential interlopers of ``line`` (all lines for
         ``None``) taken for ``target`` as a share of the catalog at that redshift if every potential interloper were
-        taken (the sample plus all of them), the most any identification gives. ``target`` defaults to the target
+        taken (the sample plus all of them), the most an identification that keeps the sample gives (the worst case
+        also loses the single lines of the range, :meth:`worst_case`). ``target`` defaults to the target
         line; for ``line="all"``, to every :attr:`assignable` line, where a single line that could be taken for two of
         them is counted for each (an upper bound)."""
         inside = self.inside
@@ -941,8 +969,8 @@ class Proposal:
         what = "that line" if self.all_lines else label(self.line)
         out = [section("Interlopers against the secondary limit")]
         out += notes(f"if every potential interloper were taken for {what}: the share of the catalog each would make, in %, "
-                     "the most any identification gives. Other lines are detected above the secondary limit, so a higher "
-                     "one leaves more galaxies with a single line.")
+                     "the most an identification that keeps the sample gives. Other lines are detected above the secondary "
+                     "limit, so a higher one leaves more galaxies with a single line.")
         if self.thresholds == "flux":
             unit = 10.0 ** np.floor(np.log10(min(values)))
             head = f"secondary F [{unit:.0e}]".replace("e-", "e−")
@@ -1204,6 +1232,165 @@ class Proposal:
             rows.setdefault(x, {})[t] = float(p_interloper)
         return rows
 
+    # ---- the worst case: every single line an interloper ----------------------------
+    def worst_case_lines(self, min_count: int | None = None) -> list[str]:
+        """The lines a single line is taken for in the worst case (:meth:`worst_case`), the most common first: the
+        :attr:`assignable` lines, those of the potential interlopers. For ``line="all"`` these are the lines that are
+        the single line of at least ``min_count`` galaxies inside the range and of ``min_share`` of its single-line
+        galaxies: at 1.0 < z < 1.2 with flux limits 1.5 / 0.6 × 10⁻¹⁶, Hα and [O III] λ5007 (the single line of 0.04 %
+        of the galaxies, 1.4 % of the single-line ones; the single Hα lines of 0.53 < z < 0.68 taken for it make 5 % of
+        the catalog). A line that is never or hardly ever the single line of a galaxy inside the range (Hβ,
+        [O III] λ4959, [S III] λ6312 at these flux limits) is not taken for.
+
+        ``min_count`` given: every line that is the single line of at least that many galaxies inside the range,
+        whatever its share, a harsher worst case (e.g. with a single tier at 1.6 < z < 2.0, Hβ and [O II], the single
+        line of 207 and 136 of 5.5 M single-line galaxies, so that Hα of z ≈ 1 is taken for Hβ). For a target line,
+        the target line."""
+        if not self.all_lines:
+            return [self.line]
+        inside = sorted(self.single_lines_inside().items(), key=lambda kv: -kv[1]["n"])
+        if min_count is None:
+            lines = set(self.assignable)
+            return [x for x, _ in inside if x in lines]
+        return [x for x, v in inside if v["n"] >= max(int(min_count), 1) and x in self.targets]
+
+    def worst_case(self, taken_for: Sequence[str] | str | None = None) -> dict:
+        """The catalog of the worst case, from the counts of the proposal (at its secondary limit): every single line is
+        taken for another line, one of ``taken_for`` (default :meth:`worst_case_lines`), and for one that gives it a
+        redshift inside the range wherever there is one (``confusion="worst_case"`` of :meth:`make_catalog`,
+        :class:`~romanmock.confusion.WorstCaseConfusion`). No single-line galaxy keeps its redshift: the catalog holds
+        the multi-line galaxies of the range and every single line that some line of ``taken_for`` puts inside it, from
+        outside the range or from inside (those only move: a wrong redshift inside the range).
+
+        Returns ``{"taken_for", "n_sample", "n_multi", "pairs": [{"line", "as", "n", "n_inside", "z_true", "window",
+        "share"}], "moved": {line: n}, "lost": {line: n}, "n_interlopers", "n_catalog", "share", "overlaps"}``:
+        ``n`` the interlopers of a pair, ``n_inside`` those of them whose true redshift is inside the range, ``moved``
+        and ``lost`` the single lines of the range that stay with a wrong redshift and that leave it. ``overlaps``
+        lists the lines of ``taken_for`` whose windows overlap (a single line there is taken for the first; the counts
+        then hold it once per window and are an upper bound)."""
+        self._require_interlopers()
+        if taken_for is None:
+            taken_for = self.worst_case_lines()
+        taken_for = [taken_for] if isinstance(taken_for, str) else list(taken_for)
+        if not taken_for:
+            raise ValueError("no line is single inside the range: there is nothing to take the single lines for")
+        if not self.all_lines and taken_for != [self.line]:
+            raise ValueError(f"a catalog of {self.line} takes single lines for {self.line} only")
+        missing = [t for t in taken_for if t not in self.targets]
+        if missing:
+            raise KeyError(f"{missing} are not inside the bandpass for this range; the lines are {self.targets}")
+        inside, names = self.inside, self.line_names
+        windows = {t: tuple(self.windows[t]) for t in taken_for}
+        overlaps = [(a, b) for ia, a in enumerate(taken_for) for b in taken_for[ia + 1:]
+                    if min(windows[a][1], windows[b][1]) > max(windows[a][0], windows[b][0])]
+        pairs, moved = [], {}
+        for t in taken_for:
+            k, own = self._k(t), names.index(t)
+            intervals = window_intervals(names, self.rest_waves, windows[t])
+            for i, x in enumerate(names):
+                n = int(self.counts["n_assigned"][inside, i, k].sum()) if i != own else 0
+                if not n:
+                    continue
+                n_in = int(self.counts["n_window_single"][inside, i, k].sum())
+                pairs.append({"line": x, "as": t, "n": n, "n_inside": n_in, "z_true": intervals[x], "window": list(windows[t])})
+                if n_in:
+                    moved[x] = moved.get(x, 0) + n_in
+        pairs.sort(key=lambda r: -r["n"])
+        single = {x: v["n"] for x, v in self.single_lines_inside().items()}
+        if self.all_lines:
+            n_multi = int(self.counts["n_det"][inside].sum()) - sum(single.values())
+            lost = {x: n - moved.get(x, 0) for x, n in single.items() if n > moved.get(x, 0)}
+        else:                                 # the target's single lines leave; other single lines were never in it
+            n_multi = int(self.counts["n_line_det"][inside, self.target_index].sum()) - single.get(self.line, 0)
+            lost = {self.line: single[self.line]} if single.get(self.line) else {}
+        n_int = sum(r["n"] for r in pairs)
+        n_cat = n_multi + n_int
+        for r in pairs:
+            r["share"] = r["n"] / n_cat if n_cat else 0.0
+        return {"taken_for": taken_for, "n_sample": self.n_sample, "n_multi": n_multi, "pairs": pairs, "moved": moved,
+                "lost": lost, "n_interlopers": n_int, "n_catalog": n_cat, "share": n_int / n_cat if n_cat else 0.0,
+                "overlaps": overlaps}
+
+    def misidentifications(self, taken_for: Sequence[str] | None = None) -> list[dict]:
+        """Every way a single line can get a redshift inside the range by being taken for another line: one row per pair
+        (true line, taken for) with single lines inside the window of the line it is taken for, for every line in the
+        bandpass (:attr:`targets`; for a target line, that line only), not only those of the worst case. ``n``: the
+        single lines; ``n_inside``: those whose true redshift is inside the range, which taken for that line stay inside
+        with a wrong redshift (the two lines are close in wavelength: their ratio is below (1 + z_max) / (1 + z_min));
+        ``z_true``; ``single_inside``: galaxies inside the range whose only line is the taken-for line; ``worst_case``:
+        taken in :meth:`worst_case` (with ``taken_for``, default :meth:`worst_case_lines`); ``assignable``: counted
+        among the potential interlopers (:attr:`assignable`, above the minor-line cut), most numerous first."""
+        self._require_interlopers()
+        worst = set(self.worst_case_lines() if taken_for is None else taken_for)
+        single = {x: v["n"] for x, v in self.single_lines_inside().items()}
+        assignable = set(self.assignable)
+        names, inside = self.line_names, self.inside
+        rows = []
+        for t in self.targets:
+            k, own = self._k(t), names.index(t)
+            intervals = window_intervals(names, self.rest_waves, self.windows[t])
+            for i, x in enumerate(names):
+                if i == own:
+                    continue
+                n = int(self.counts["n_window_single"][:, i, k].sum())
+                if n:
+                    rows.append({"line": x, "as": t, "n": n, "n_inside": int(self.counts["n_window_single"][inside, i, k].sum()),
+                                 "z_true": intervals[x], "single_inside": single.get(t, 0), "worst_case": t in worst,
+                                 "assignable": t in assignable})
+        return sorted(rows, key=lambda r: -r["n"])
+
+    def worst_case_summary(self, taken_for: Sequence[str] | None = None) -> str:
+        """The worst case as text (:meth:`worst_case`): the expected catalog and its interlopers per pair, then every
+        other way a single line could get a redshift inside the range (:meth:`misidentifications`) and why the worst
+        case leaves it out."""
+        return self._worst_case_text(self.worst_case(taken_for), taken_for)
+
+    def _worst_case_text(self, w: dict, taken_for=None) -> str:
+        from .report import count, fields, keep, label, notes, percent, section, span, table, title, zfmt
+
+        lo, hi = self.z_range
+        what = "every galaxy" if self.all_lines else label(self.line)
+        out = [title(f"Worst case · {what} at {zfmt(lo)} ≤ z ≤ {zfmt(hi)}: every single line an interloper")]
+        single = sum(v["n"] for v in self.single_lines_inside().values()) if self.all_lines else \
+            self.single_lines_inside().get(self.line, {}).get("n", 0)
+        sample = "detected galaxies" if self.all_lines else f"galaxies with {label(self.line)} detected"
+        out += fields([("identification", f"every single line taken for another line, for one of "
+                                          f"{', '.join(w['taken_for'])} that puts it inside the range wherever there is one"),
+                       ("sample", f"{count(w['n_sample'])} {sample} inside the range, {count(single)} of them single-line"),
+                       ("catalog", f"{count(w['n_catalog'])} galaxies expected: {count(w['n_multi'])} multi-line + "
+                                   f"{count(w['n_interlopers'])} interlopers {keep('(' + percent(w['share']) + ')')}")])
+        if w["pairs"]:
+            cols = [("line", "<"), ("taken for", "<"), ("true z", "<"), ("interlopers", ">"), ("from inside¹", ">"), ("share²", ">")]
+            out += [""] + table(cols, [[r["line"], r["as"], span(*_z0(r["z_true"])), count(r["n"]), count(r["n_inside"]),
+                                        percent(r["share"])] for r in w["pairs"]])
+            out += notes("true redshift inside the range: taken for that line they stay inside, with a wrong redshift", mark="¹ ")
+            out += notes("of the catalog", mark="² ")
+        if w["lost"]:
+            out += notes("leave the range (single lines inside it taken for a line that puts them outside): "
+                         + ", ".join(keep(f"{x} {n:,}") for x, n in w["lost"].items()))
+        if w["overlaps"]:
+            out += notes("windows overlap for " + ", ".join(f"{a} and {b}" for a, b in w["overlaps"]) + ": a single line there "
+                         "is taken for the first, and the counts above hold it once per window (an upper bound)")
+        others = [r for r in self.misidentifications(w["taken_for"]) if not r["worst_case"]]
+        if others:
+            s = self.settings
+            out += ["", section("Left out: taken for a line that is never, or hardly ever, single inside the range")]
+            out += table([("line", "<"), ("taken for", "<"), ("true z", "<"), ("single lines", ">"), ("from inside¹", ">"),
+                          ("its own²", ">")],
+                         [[r["line"], r["as"], span(*_z0(r["z_true"])), count(r["n"]), count(r["n_inside"]),
+                           count(r["single_inside"])] for r in others])
+            out += notes("true redshift inside the range: taken for that line they would stay inside with a wrong redshift",
+                         mark="¹ ")
+            out += notes(f"galaxies inside the range whose single line is the taken-for line: fewer than {s['min_count']} or "
+                         f"{100 * s['min_share']:g} % of the single-line ones (worst_case_lines(min_count=…) takes such lines too)",
+                         mark="² ")
+        moving = [r for r in self.misidentifications(w["taken_for"]) if r["n_inside"] and r["worst_case"]]
+        if not moving:
+            out += notes("no single line of the range can stay inside it with a wrong redshift by being taken for a "
+                         f"worst-case line: their wavelength ratios are all above (1 + {zfmt(hi)}) / (1 + {zfmt(lo)}) = "
+                         f"{(1 + hi) / (1 + lo):.3f}")
+        return "\n".join(out)
+
     def default_name(self) -> str:
         lo, hi = self.z_range
         fmt = lambda v: f"{v:g}".replace(".", "p") if "." in f"{v:g}" else f"{v:g}p0"
@@ -1222,7 +1409,10 @@ class Proposal:
             How the single-line galaxies are identified: a confusion table ``{true line: {assigned line: p}}``
             (:meth:`confusion_template` lists the entries that matter; lines not listed are identified correctly;
             ``{}`` = all correctly, a clean catalog), ``"empirical"`` (the line mix of the mock at the same thresholds,
-            rescaling and doublet rule; one more pass), a :class:`~romanmock.confusion.LineFractionTable` or any
+            rescaling and doublet rule; one more pass), ``"worst_case"`` (every single line taken for another line, one
+            that puts it inside the range wherever there is one, :meth:`worst_case`; ``{"type": "worst_case",
+            "taken_for": [...]}`` chooses the lines it can be taken for; the expected numbers are printed and kept in the
+            summary file with those made), a :class:`~romanmock.confusion.LineFractionTable` or any
             confusion config of :meth:`BaseCatalog.make_catalog`. Give this or ``fractions``; a proposal without a
             secondary limit (:attr:`single_line`) takes neither: its catalogs are clean.
         fractions : dict
@@ -1282,13 +1472,24 @@ class Proposal:
         changed = secondary_flux_limit is not None or secondary_snr is not None
         sensitivity = self._sensitivity_at(value) if changed else s["sensitivity"]
         detection = self._detection_at(q) if changed else s["detection"]
-        design = None
+        design = worst = None
         if fractions is not None:
             design = self._design(fractions, q, value)
             confusion = {"type": "windowed", "pairs": [{k: r[k] for k in ("line", "as", "window", "p")} for r in design["pairs"]],
                          "meta": {"fractions": design["fractions"], SECONDARY_KEYS[self.thresholds]: design["secondary"]}}
             if verbose:
                 print(self._design_text(design) + "\n", flush=True)
+        elif _asks_worst_case(confusion):
+            given = confusion.get("taken_for") if isinstance(confusion, Mapping) else None
+            taken_for = self.worst_case_lines() if given is None else ([given] if isinstance(given, str) else list(given))
+            if not changed:            # the counts of the proposal are those of its own secondary limit
+                worst = self.worst_case(taken_for)
+                if verbose:
+                    print(self._worst_case_text(worst, taken_for) + "\n", flush=True)
+            elif verbose:
+                print(f"[romanmock] worst case at another secondary limit than the proposal's: the lines taken for are "
+                      f"{', '.join(taken_for)}; no expected numbers", flush=True)
+            confusion = {"type": "worst_case", "z_range": list(s["z_range"]), "taken_for": taken_for}
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         name = name or self.default_name()
@@ -1310,6 +1511,11 @@ class Proposal:
             summary["design"] = {**design, "made": made}
             if verbose:
                 print("\n" + self._made_text(design, made, len(cat)), flush=True)
+        if worst is not None:
+            made = _worst_made(cat, worst)
+            summary["worst_case"] = {**worst, "made": made}
+            if verbose:
+                print("\n" + _worst_made_text(worst, made), flush=True)
         (out_dir / f"{name}_summary.json").write_text(json.dumps(summary, indent=1, default=_json_default))
         if n_randoms:
             cat.make_random(n_times=int(n_randoms), seed=s["seed"] if seed is None else seed,
@@ -1354,15 +1560,17 @@ class Proposal:
         inside = self.single_lines_inside()
         n_det = int(self.counts["n_det"][self.inside].sum())
         n_single = sum(v["n"] for v in inside.values())
-        rows = [["all", count(n_single), percent(n_single / max(n_det, 1))]]
-        rows += [[k, count(v["n"]), percent(v["share"])] for k, v in sorted(inside.items(), key=lambda kv: -kv[1]["n"])
-                 if v["major"]]
+        rows = [["all", count(n_single), percent(n_single / max(n_det, 1)), ""]]
+        rows += [[k, count(v["n"]), percent(v["share"]), percent(v["share_single"])]
+                 for k, v in sorted(inside.items(), key=lambda kv: -kv[1]["n"]) if v["major"]]
         out += ["", section("Single-line galaxies inside the range")]
-        out += table([("line", "<"), ("galaxies", ">"), ("share¹", ">")], rows)
-        out += notes(f"of the {count(n_det)} galaxies detected at {zl} ≤ z < {zh} (true redshift)", mark="¹ ")
+        out += table([("line", "<"), ("galaxies", ">"), ("of all¹", ">"), ("of single¹", ">")], rows)
+        out += notes(f"of the {count(n_det)} galaxies detected at {zl} ≤ z < {zh} (true redshift), and of the "
+                     f"{count(n_single)} single-line ones among them", mark="¹ ")
         minor = [keep(f"{k} ({v['n']:,})") for k, v in inside.items() if not v["major"]]
         if minor:
-            out += notes("minor, left out: " + ", ".join(minor))
+            out += notes(f"minor (fewer than {s['min_count']} galaxies or {100 * s['min_share']:g} % of the single-line ones), "
+                         "left out: " + ", ".join(minor))
 
         assignable = self.assignable
         out += ["", section("Potential interlopers")]
@@ -1383,17 +1591,23 @@ class Proposal:
             out += table(cols, body)
             out += notes("of the detected galaxies at that true redshift, the share whose only line is this one", mark="² ")
             out += notes("their share of the catalog if every potential interloper were taken (the sample plus all of "
-                         "them): the most any identification gives", mark="³ ")
+                         "them): the most an identification that keeps the sample gives", mark="³ ")
         else:
             out += notes("none above the minor-line cut")
+        if self.worst_case_lines():
+            w = self.worst_case()
+            out += notes(f"the worst case, every single line an interloper and those of the range lost "
+                         f"(proposal.worst_case_summary()): {count(w['n_interlopers'])} interlopers, "
+                         f"{percent(w['share'])} of a catalog of {count(w['n_catalog'])}")
         minor = [keep(f"{x}{' as ' + t if self.all_lines else ''} ({v['n']:,})") for x, t, v in rows if not v["major"]]
         if minor:
-            out += notes(f"minor, left out (fewer than {s['min_count']} galaxies or {100 * s['min_share']:g} % of the sample): "
-                         + ", ".join(minor))
+            out += notes(f"minor (fewer than {s['min_count']} galaxies or {100 * s['min_share']:g} % of the sample; not in the "
+                         "table, thin lines in proposal.plot()): " + ", ".join(minor))
         if self.all_lines:
             rare = [t for t in self.targets if t not in assignable]
             if rare:
-                out += notes("not taken for (in the bandpass, but rarely a single line inside the range): " + ", ".join(rare))
+                out += notes("not taken for (in the bandpass, but never or hardly ever a single line inside the range): "
+                             + ", ".join(rare))
         if self.has_scan:
             out += [""] + self._scan_section()
         return "\n".join(out)
@@ -1411,10 +1625,11 @@ class Proposal:
     def plot(self, fig=None):
         """Three panels: (a) the single-line fraction inside the range against true redshift, all lines and per line;
         (b) the single-line fraction of each potential interloper against its own redshift; (c) the potential
-        interlopers against the redshift they would get, as a share of the catalog there if every one were taken. Only
-        the lines that are not minor are drawn. For ``line="all"`` an interloper is a pair, its colour the true line and
-        its line style the line it would be taken for. Panel (b) gets a log axis when its curves differ by more than 20
-        times in height. :meth:`plot_secondary` draws the most the interlopers can make against the secondary limit.
+        interlopers against the redshift they would get, as a share of the catalog there if every one were taken. Panel
+        (a) draws the lines that are not minor; panels (b) and (c) draw every potential interloper, the minor ones
+        (:attr:`minor_pairs`) as thin lines marked "minor" in the legend. For ``line="all"`` an interloper is a pair, its
+        colour the true line and its line style the line it would be taken for. Panel (b) gets a log axis when its
+        curves differ by more than 20 times in height. :meth:`plot_secondary` draws the most the interlopers can make against the secondary limit.
         A single-line proposal (:attr:`single_line`) has one panel: the true single-line share of its sample against
         redshift at each of ``secondary_ratios``. Returns the figure."""
         import matplotlib.pyplot as plt
@@ -1453,17 +1668,19 @@ class Proposal:
         ax1.set_ylim(bottom=0)
         ax1.set_xlabel("true redshift (z_rsd)")
         ax1.legend(fontsize=9)
-        pairs = self.major_pairs
-        style = {t: ("-", "--", ":", "-.")[j % 4] for j, t in enumerate(dict.fromkeys(t for _, t in pairs))}
+        pairs, minor = self.major_pairs, self.minor_pairs                # minor pairs: thin lines
+        drawn = [(x, t, False) for x, t in pairs] + [(x, t, True) for x, t in minor]
+        style = {t: ("-", "--", ":", "-.")[j % 4] for j, t in enumerate(dict.fromkeys(t for _, t, _ in drawn))}
 
-        def label(x, t):
-            return f"{feature_label(x)} as {feature_label(t)}" if self.all_lines else feature_label(x)
+        def label(x, t, thin=False):
+            text = f"{feature_label(x)} as {feature_label(t)}" if self.all_lines else feature_label(x)
+            return text + " (minor)" if thin else text
 
         peaks = []
-        for x, t in pairs:
+        for x, t, thin in drawn:
             z, f = self.fraction_interloper(x, t)
-            ax2.plot(z, 100 * f, color=feature_color(x), ls=style[t], lw=1.8, label=label(x, t),
-                     **({"marker": "o", "ms": 4} if z.size < 5 else {}))
+            ax2.plot(z, 100 * f, color=feature_color(x), ls=style[t], lw=0.9 if thin else 1.8, label=label(x, t, thin),
+                     **({"marker": "o", "ms": 3 if thin else 4} if z.size < 5 else {}))
             if np.any(f > 0):
                 peaks.append(100 * float(f.max()))
         if len(peaks) > 1 and max(peaks) > 20 * min(peaks):      # curves of very different heights: a log axis
@@ -1477,13 +1694,13 @@ class Proposal:
         ax2.set_ylabel("single-line galaxies [% of the detected]")
         where = "another line" if self.all_lines else feature_label(self.line)
         ax2.set_title(f"(b) potential interlopers: their line where {where} is", loc="left")
-        if pairs:
+        if drawn:
             ax2.legend(fontsize=9)
         z, f = self.contamination_at_most()
         ax3.plot(z, 100 * f, color=TEXT_PRIMARY, lw=2.0, label="all potential interlopers", **mark)
-        for x, t in pairs:
+        for x, t, thin in drawn:
             z, f = self.contamination_at_most(x, t)
-            ax3.plot(z, 100 * f, color=feature_color(x), ls=style[t], lw=1.6, label=label(x, t), **mark)
+            ax3.plot(z, 100 * f, color=feature_color(x), ls=style[t], lw=0.9 if thin else 1.6, label=label(x, t, thin), **mark)
         ax3.set_xlim(lo, hi)
         ax3.set_ylim(bottom=0)
         ax3.set_ylabel("[% of the catalog at that redshift]")
@@ -1523,6 +1740,42 @@ class Proposal:
             counts = {k[len("count_"):]: f[k] for k in f.files if k.startswith("count_")}
             edges = f["z_edges"]
         return cls(counts, edges, meta["settings"], meta["line_names"], meta["rest_waves"], meta["area_deg2"], base)
+
+
+def _z0(z_true) -> tuple[float, float]:
+    """A range of true redshifts as shown: from 0 at least (the window of a red line, e.g. Paα, reaches below it)."""
+    return max(float(z_true[0]), 0.0), float(z_true[1])
+
+
+def _asks_worst_case(confusion) -> bool:
+    """``"worst_case"``, or ``{"type": "worst_case"}`` without a redshift range (the proposal gives it, and the lines)."""
+    if isinstance(confusion, str):
+        return confusion == "worst_case"
+    return isinstance(confusion, Mapping) and confusion.get("type") == "worst_case" and "z_range" not in confusion
+
+
+def _worst_made(cat, worst: dict) -> dict:
+    """What the worst-case catalog holds, to compare with :meth:`Proposal.worst_case`: its size, its interlopers in all
+    and per pair, and its single-line galaxies with the right redshift (none)."""
+    comp = cat.components()
+    return {"n_catalog": len(cat), "n_interlopers": comp.get("interlopers", 0), "n_single_correct": comp.get("single_correct", 0),
+            "n_multi": comp.get("multi_line", 0),
+            "pairs": [{"line": r["line"], "as": r["as"], "n": comp.get(f"{r['line']}_as_{r['as']}", 0)} for r in worst["pairs"]]}
+
+
+def _worst_made_text(worst: dict, made: dict) -> str:
+    from .report import count, notes, section, table
+
+    out = [section("Worst case: expected and made")]
+    rows = [[r["line"], r["as"], count(r["n"]), count(m["n"])] for r, m in zip(worst["pairs"], made["pairs"])]
+    rows += [["interlopers", "", count(worst["n_interlopers"]), count(made["n_interlopers"])],
+             ["multi-line", "", count(worst["n_multi"]), count(made["n_multi"])],
+             ["catalog", "", count(worst["n_catalog"]), count(made["n_catalog"])]]
+    out += table([("line", "<"), ("taken for", "<"), ("expected", ">"), ("made", ">")], rows)
+    out += notes(f"{count(made['n_single_correct'])} single-line galaxies with their true redshift (the worst case keeps none); "
+                 "the expectation counts true and assigned redshifts in the proposal's bins of the range, the catalog cuts "
+                 "both ends inclusive, so a galaxy exactly on an end can differ")
+    return "\n".join(out)
 
 
 def _describe_doublets(cfg) -> str:

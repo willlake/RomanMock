@@ -453,6 +453,35 @@ def test_proposal_of_every_line_then_catalog(base, tmp_path, capsys):
     assert (~wrong).sum() == p.n_sample - p.counts["n_single"][p.inside, i].sum()
 
 
+def test_worst_case_catalog(base, tmp_path, capsys):
+    """The worst case: no single line keeps its redshift. At 0.33-0.40 only [S III] 9532 is single, and in these slices no
+    other single line falls where it would be inside the range: the catalog is the multi-line galaxies. Taken for
+    [S III] 9069 instead, the single 9532 lines of 0.27-0.33 come in and those of 0.330-0.332 stay inside with a wrong
+    redshift (the lines are 5.1 % apart, the range 5.3 % wide in 1 + z): exactly as many per pair as the proposal expects."""
+    import json
+
+    tmp, b = base
+    p = b.make_proposal((0.33, 0.40), line="all", rescaling=None, doublets=None, min_count=1, n_workers=1, verbose=False, **LIMITS)
+    w = p.worst_case()
+    assert w["taken_for"] == p.worst_case_lines() == ["SIII_9532"] and w["n_interlopers"] == 0 and w["lost"]["SIII_9532"] > 100
+    cat = p.make_catalog("worst_case", tmp_path / "worst", n_workers=1)
+    printed = capsys.readouterr().out
+    assert "Worst case · every galaxy" in printed and "Worst case: expected and made" in printed and "worst case:" in printed
+    comp = cat.components()
+    assert len(cat) == w["n_catalog"] == w["n_multi"] == comp["multi_line"] and comp.get("single_correct", 0) == 0
+    summary = json.loads((tmp_path / "worst" / f"{p.default_name()}_summary.json").read_text())
+    assert summary["worst_case"]["made"]["n_catalog"] == len(cat) and summary["settings"]["confusion"]["type"] == "worst_case"
+    w = p.worst_case(["SIII_9069"])
+    assert w["overlaps"] == [] and w["moved"]["SIII_9532"] > 0 and w["n_interlopers"] > 100
+    cat = p.make_catalog({"type": "worst_case", "taken_for": ["SIII_9069"]}, tmp_path / "worst2", n_workers=1, verbose=False)
+    comp = cat.components()
+    assert len(cat) == w["n_catalog"] and comp["interlopers"] == w["n_interlopers"] and comp.get("single_correct", 0) == 0
+    assert all(comp.get(f"{r['line']}_as_{r['as']}", 0) == r["n"] for r in w["pairs"])
+    wrong = np.asarray(cat["id_outcome"]) == 3
+    inside = (cat["redshift_rsd"] >= 0.33) & (cat["redshift_rsd"] < 0.40)
+    assert np.sum(wrong & inside) == w["moved"]["SIII_9532"]
+
+
 def test_catalog_by_design(base, tmp_path, capsys):
     """A catalog designed by its interloper fractions: the single [S III] 9532 lines taken for 9069 make the share of the
     catalog asked for (within their binomial scatter) and nothing else changes: the galaxies with a correct redshift are

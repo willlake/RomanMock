@@ -169,8 +169,15 @@ in step with the code.
   would get as target k; a target's own column lands on itself and is dropped wherever interlopers are summed),
   `n_doublet_both/merged`. Settings keep `targets` and `windows` (one per target).
   "Inside" = bins of the range; target sample `n_sample` = target detected inside. Minor lines: count < min_count or
-  share < min_share (of the detected galaxies inside / of n_sample), left out of `plot()` and `confusion_template()`
-  (`{interloper: {target: p}}` + `{target: {interloper: p}}`).
+  share < min_share (lines single inside: of the single-line galaxies inside, `single_lines_inside()[x]["share_single"]`;
+  potential interlopers: of n_sample), left out of the summary table and of `confusion_template()` (`{interloper:
+  {target: p}}` + `{target: {interloper: p}}`); minor lines are not drawn in `plot()` panel (a), but minor pairs
+  (`Proposal.minor_pairs`) are drawn in panels (b) and (c) as thin lines (lw 0.9) labelled "(minor)" (2026-11-13: the user
+  was confused that notebook 01's figure lacked [O III] -> Hα, 2,782 = 0.02 % of the sample, while 06's worst-case
+  catalog drew it; they chose thin lines over a 0.1 % cut in 06). Until 2026-11-13 the share of a line single inside was of the detected galaxies inside;
+  changed after the ShapeFit worst case showed that it hid [O III] at 1.0-1.2 (see the worst-case bullet below). The
+  summary's single-line table has both shares ("of all", "of single") and the potential interlopers end with the worst
+  case (`worst_case()`, one note).
 - `line="all"` (`proposal.ALL_LINES`, added 2026-11-09 with the hint, at the user's request): targets = every line in the
   bandpass for the range (`target_windows`); `n_sample` = every detected galaxy inside; interlopers are pairs
   (line, taken for) restricted to `Proposal.assignable` = targets that are `major_inside` (a line never single, e.g.
@@ -261,6 +268,32 @@ in step with the code.
   end of the scan; notebook 04), not single-line. Tests: `test_proposal.py::test_single_line_mode`,
   `test_catalog.py::test_single_line_catalog` (same gal_id with and without a secondary limit, single count = nq_single,
   refusals, the designer proposal without a secondary limit is single-tier).
+- Worst case (2026-11-12, the user: "for contaminated catalog, we should consider the worst case, i.e. single lines will
+  always be interlopers. (Check whether we are missing the cases, for example, Halpha is mistaken as OIII, but it is still
+  in the proposed redshift bin even after its redshift is wrong)"; asked while building roman-clustering's ShapeFit
+  catalogs): `confusion.WorstCaseConfusion` (`type: worst_case`, `z_range`, `taken_for`; deterministic): a single line is
+  taken for the first `taken_for` line other than its own whose redshift lambda/rest - 1 is inside the range (ends
+  included), else for the first other `taken_for` line (outside), else FAIL. `Proposal.worst_case_lines()` =
+  `assignable` sorted by count, most common first (`min_count=N` given: every line single inside with >= N galaxies, no
+  share cut, a harsher worst case). The finding (2026-11-12): at 1.0-1.2 with the user's settings (1.5e-16 / 6e-17, the
+  three-number LineFactors rescaling, per-galaxy doublet) [O III] is single in 5,106 galaxies, 0.04 % of the detected
+  but 1.36 % of the 375,059 single-line ones; with the share of detected galaxies `assignable` was [Ha], which dropped
+  the pair Hα 0.53-0.68 -> [O III] (721,584 = 5.1 % of the worst-case catalog; "at most" 0.23 % vs worst case 6.19 %).
+  The first fix made `worst_case_lines` count-only; on 2026-11-13 (the user: "Have you updated the RomanMock based on this
+  finding?") the share became one of the single-line galaxies, so `assignable` = [Ha, OIII_5007] and the proposal itself
+  lists the pair ("at most" 6.03 %, worst case 6.19 %). Count-only was rejected as the default because a single-tier
+  proposal (notebook 04, 1.6-2.0) has Hβ (207) and [O II] (136) of 5.47 M singles: they would become taken-for lines
+  (Hα of z ~ 1 as Hβ, 9.3 M) and the worst case would go from 74.6 % to 89 %. 1.6-2.0 (two tiers): both lines
+  assignable either way, worst case 9.02 %.
+  `Proposal.worst_case(taken_for)` (numbers from the counts: pairs with `n`, `n_inside`, `moved`, `lost`, `n_multi`,
+  `n_catalog`, `share`, `overlaps` = taken-for windows that overlap, counts then an upper bound),
+  `misidentifications()` (every pair over every target line in the band, with `n_inside` = single lines of the range that
+  stay inside with a wrong redshift), `worst_case_summary()`; `make_catalog("worst_case" | {"type": "worst_case",
+  "taken_for": [...]})` prints expected and made and keeps `worst_case` (with `made`) in the summary JSON. In-bin moves
+  need a wavelength ratio below (1+z_hi)/(1+z_lo) (1.10 / 1.154 here): only Hα->[S III] 6312, [O III]->4959/Hβ/4363,
+  [S III] 9532->9069, none of which are taken-for lines (never single). Tests: `test_proposal.py::test_worst_case`
+  (array level, incl. a wide range with overlapping windows and in-range moves), `test_catalog.py::test_worst_case_catalog`
+  (made == expected exactly; with taken_for [S III] 9069 the 9532 singles of 0.330-0.332 stay inside).
 - Tests: `pytest.approx` keeps an absolute tolerance of 1e-12 unless `abs=` is given, so comparisons of fluxes
   (1e-17) pass whatever the value: use `abs=0` (found 2026-11-10 when a wrong `secondary_for` passed).
 
@@ -274,7 +307,7 @@ in step with the code.
 | `sensitivity.py` | `SensitivityModel` + `DetectionModel` protocols and registries; two-tier rule (`apply_two_tier`); `RomanGrismSensitivity` (`type: roman_grism`, S/N thresholds, WFI grism tables vs wavelength and size); `limits_contained`, `nominal_flux_limit` |
 | `sizes.py` | `SizeSpec`: angular size of a galaxy, a number in arcsec or a column in proper kpc converted at `redshift_true` |
 | `detection.py` | `detect_lines`, `pack_bitmask`, `popcount`, `DetectionResult` |
-| `confusion.py` | `ConfusionMatrix` (fail column), `WavelengthBinnedConfusion`, `WindowedConfusion` (`type: windowed`: a line taken for another only inside a wavelength window; catalogs by design), `LineFractionTable` (`type: empirical`: the line mix of the single-line galaxies per observed wavelength and flux rank), `DEFAULT_CONFUSION_ROWS`, `build_confusion` |
+| `confusion.py` | `ConfusionMatrix` (fail column), `WavelengthBinnedConfusion`, `WindowedConfusion` (`type: windowed`: a line taken for another only inside a wavelength window; catalogs by design), `WorstCaseConfusion` (`type: worst_case`: every single line taken for another, inside the range wherever possible), `LineFractionTable` (`type: empirical`: the line mix of the single-line galaxies per observed wavelength and flux rank), `DEFAULT_CONFUSION_ROWS`, `build_confusion` |
 | `redshift.py` | `assign_redshifts`, `IdOutcome` codes, `MultiLineModel` hook |
 | `selection.py` | footprints, `SampleDefinition`, `sample_mask`, `TargetDNDZ`, thinning helpers, `sky_area_deg2` |
 | `samples.py` | slice-wise stage B: `process_slice`, `run_pass`, `thinning_keep`, `sample_keep` |
@@ -571,15 +604,27 @@ mock has 203 M galaxies with a line in 0.5 < z < 3.0 (74 % of all), against 59 M
 ## Working style
 
 - Plots (notebooks) use `romanmock.plotting` (fixed categorical order, single axis, thin marks).
-- `notebooks/` holds five examples (the user cleared the folder on 2026-11-09 and asked for 01-03; on 2026-11-10 for two
-  more on the new methods, keeping 01/02 as they were): `01_catalog_z1p0_1p2.ipynb` (Hα 1.0-1.2: flux / S/N / "all"
+- `notebooks/` holds six examples (the user cleared the folder on 2026-11-09 and asked for 01-03; on 2026-11-10 for two
+  more on the new methods, keeping 01/02 as they were; 06 added 2026-11-13): `01_catalog_z1p0_1p2.ipynb` (Hα 1.0-1.2: flux / S/N / "all"
   proposals, matrix and empirical catalogs, components, files), `02_catalog_z1p6_2p0.ipynb` (the same for every galaxy at
   1.6-2.0, `line="all"`), `03_randoms.ipynb` (randoms of the empirical catalog of 01 and of its parts with the
   data-catalog-only API, checks, reproducible / extensible / independent), `04_catalog_by_design.ipynb` (interloper
   fractions: the scan, `design`, a refused table, `fraction_template`, S/N scan, `line="all"` at 1.6-2.0) and
   `05_single_line_clean_catalogs.ipynb` (renamed from `05_single_line_catalogs` on 2026-11-10, the user: "no
   interlopers in this mode": the single-line table, the clean catalog with one line per galaxy and with a secondary
-  limit of 7.5e-17, checks against the proposal, S/N). They write to `$PSCRATCH/RomanMocks/examples/`
+  limit of 7.5e-17, checks against the proposal, S/N) and `06_worst_case.ipynb` (2026-11-13, the user asked to update
+  the notebooks after the worst-case finding: every galaxy at 1.0-1.2 and 1.6-2.0 with 1.5 / 0.6, `worst_case_summary`,
+  `misidentifications` with the in-range moves, catalogs made = expected, components, true z of the interlopers,
+  `taken_for` variants). Since 2026-11-12 (the user: "update the five notebooks ... if
+  they should use the new rescaled catalog") 01, 02, 04 and 05 pass `rescaling=RESCALING` to every `make_proposal`,
+  `RESCALING = LineFactors(log_offsets={"OII_3727": 0.25}, scatter={"OIII_5007": 0.19, "OIII_4959": 0.19,
+  "OII_3727": 0.11})` (first code cell; the package default stays `"galacticus_like"`, and the README's quoted numbers
+  are for the default); 03 reads the new catalog of 01. With it, at 1.0-1.2 and 1.5 / 0.6: 2.76 % single-line, nearly
+  all Hα; [O III] is 1.4 % of the single lines, so since 2026-11-13 `line="all"` has three pairs (Hα 0.53-0.68 ->
+  [O III] 721,584, [S III] 9532 0.05-0.16 -> [O III] 119,718, [S III] 9532 -> Hα 28,226; at most 6.03 %; before, only
+  the last, 0.23 %), and single [O III]
+  lines taken for Hα are scarce (at most 0.14 % of the catalog at a secondary limit of 7.5e-17), so the design of 04
+  (0.5 % [O III] + 0.5 % [S III]) moved from 7.5e-17 to 1e-16. They write to `$PSCRATCH/RomanMocks/examples/`
   and run with `sbatch scripts/run_notebook.sh <notebooks...>` (`scripts/run_notebook.py`, nbclient, kernel
   `$NOTEBOOK_KERNEL` or `roman`; in order, a failure stops the run). Built by a generator script kept outside the repo,
   so edit them as notebooks. The seven earlier production notebooks (01 dN/dz, ..., 07 Galacticus flux distribution)

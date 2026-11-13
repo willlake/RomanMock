@@ -42,7 +42,7 @@ import numpy as np
 import opencosmo as oc
 
 from ._version import __version__
-from .confusion import ConfusionMatrix, LineFractionTable, WindowedConfusion, build_confusion, default_confusion
+from .confusion import ConfusionMatrix, LineFractionTable, WindowedConfusion, WorstCaseConfusion, build_confusion, default_confusion
 from .detection import detect_lines
 from .doublets import build_doublets
 from .io import memory_budget_gb, read_manifest, suggest_n_workers
@@ -172,6 +172,10 @@ def _describe_identification(cfg, max_entries: int = 6) -> str | None:
             entries = [f"{x} → {t} {100 * f:.3g} % (P {p.get((x, t), 0):.3g})" for t, row in asked.items() for x, f in row.items()]
             return "by design, shares of the catalog: " + ", ".join(entries)
         return "inside the windows of the range: " + (", ".join(f"{r['line']} → {r['as']} {r['p']:.3g}" for r in pairs) or "none")
+    if kind == "worst_case":
+        lo, hi = cfg.get("z_range") or (None, None)
+        return (f"worst case: every single line taken for another line ({', '.join(cfg.get('taken_for') or [])}), one that "
+                f"puts it inside {lo:g}–{hi:g} wherever there is one")
     return {"wavelength_binned": "confusion matrices per wavelength bin", "default": "the default confusion matrix",
             "empirical": "the line mix of the mock (empirical)"}.get(kind, str(kind))
 
@@ -1187,8 +1191,9 @@ class BaseCatalog:
             wavelength - 1) inside ``z_range``: the line detected, alone or with other lines (a galaxy with Hα and
             [O III] belongs to the catalog of each), or a single line taken for it (the interlopers). ``"all"``: every
             galaxy with a redshift inside ``z_range``, whichever line gave it; its sample is every detected galaxy
-            inside the range, and its potential interlopers are the single lines that, taken for a line that is single
-            in a major share of the galaxies inside the range (:attr:`Proposal.assignable`), get a redshift inside it.
+            inside the range, and its potential interlopers are the single lines that, taken for a line that is the
+            single line of a major share of the single-line galaxies inside the range (:attr:`Proposal.assignable`),
+            get a redshift inside it.
             ``verbose`` prints this as a hint.
         flux_limit, secondary_flux_limit, snr, secondary_snr, size, exposure_time, background, sensitivity, wave_range
             The proposed thresholds, as in :meth:`make_catalog`: flux limits, or S/N in the Roman grism, or a
@@ -1212,9 +1217,11 @@ class BaseCatalog:
         dz : float
             Width of the redshift bins (``z_range`` is cut into equal bins of about ``dz``).
         min_count, min_share : int, float
-            A line counts when it is the single line of at least ``min_count`` galaxies and ``min_share`` of the
-            detected galaxies inside the range (single lines inside it), respectively of the target sample
-            (potential interlopers); the others are minor and left out of the figures and of the confusion template.
+            A line single inside the range counts when it is the single line of at least ``min_count`` galaxies and
+            ``min_share`` of the single-line galaxies there (for ``line="all"``, only those lines are taken for); a
+            potential interloper counts with at least ``min_count`` galaxies and ``min_share`` of the target sample.
+            The others are minor: left out of the summary table and of the confusion template, drawn as thin lines
+            in :meth:`Proposal.plot` (minor pairs, panels b and c).
         interloper_fraction : float
             The total interloper fraction expected in the catalog (a share of it, e.g. 0.01): the summary and
             ``plot_secondary()`` say from which secondary limit the potential interlopers can make it, and
@@ -1663,6 +1670,8 @@ def _probability_kind(model) -> str:
     probability inside the window of a pair."""
     if isinstance(model, LineFractionTable):
         return "expected"
+    if isinstance(model, WorstCaseConfusion):
+        return "worst_case"
     return "windowed" if isinstance(model, WindowedConfusion) else "matrix"
 
 
@@ -1784,6 +1793,9 @@ def format_line_report(report: dict | None) -> str:
         elif report.get("probability_kind") == "windowed":
             out += notes("the probability that a single line of the true line is taken for the other where that puts it "
                          "inside the range (elsewhere it keeps its line)", mark="¹ ")
+        elif report.get("probability_kind") == "worst_case":
+            out += notes("worst case: a single line is always taken for another line, for this one where that puts it "
+                         "inside the range (elsewhere for a line that puts it outside)", mark="¹ ")
         else:
             out += notes("the probability that a single line of the true line is taken for the other", mark="¹ ")
         if counted:
